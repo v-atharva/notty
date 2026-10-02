@@ -195,4 +195,25 @@ final class InkCodecTests: XCTestCase {
         XCTAssertEqual(serialized, 0)
     }
 
+    func testMaskChangeKeepsIdentityAndCreatesChangedArchive() async throws {
+        let original = stroke()
+        let codec = InkCodec()
+        let initial = try await codec.encode(PKDrawing(strokes: [original]))
+        var masked = original
+        #if canImport(UIKit)
+        let mask = UIBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #else
+        let mask = NSBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #endif
+        masked.mask = mask
+        let changed = try await codec.encode(PKDrawing(strokes: [masked]))
+        let count = await codec.serializedStrokeCount
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(changed[0].id, original.id)
+        XCTAssertNotEqual(changed[0].data, initial[0].data)
+        let reopened = try await InkCodec().decode(changed)
+        XCTAssertEqual(reopened.strokes[0].id, original.id)
+        XCTAssertEqual(reopened.strokes[0].mask?.bounds, mask.bounds)
+    }
+
 }
