@@ -369,6 +369,77 @@ final class NotebookRepositoryTests: XCTestCase {
         }
     }
 
+    func testRootReplacedBySymbolicLinkAfterInitializationRejectsReadsAndWrites() async throws {
+        let root = try makeRoot().resolvingSymlinksInPath()
+        let alternateRoot = try makeRoot().resolvingSymlinksInPath()
+        let movedRoot = root.deletingLastPathComponent()
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: movedRoot)
+            try? FileManager.default.removeItem(at: alternateRoot)
+        }
+
+        let id = UUID()
+        let originalRepository = try NotebookRepository(rootURL: root)
+        let original = try await originalRepository.save(
+            id: id,
+            content: content(
+                title: "Original",
+                strokes: [NotebookStroke(id: UUID(), data: Data("original archive".utf8))]
+            ),
+            expectedRevisionID: nil
+        )
+        let alternateRepository = try NotebookRepository(rootURL: alternateRoot)
+        let alternate = try await alternateRepository.save(
+            id: id,
+            content: content(
+                title: "Alternate",
+                strokes: [NotebookStroke(id: UUID(), data: Data("alternate archive".utf8))]
+            ),
+            expectedRevisionID: nil
+        )
+
+        try FileManager.default.moveItem(at: root, to: movedRoot)
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: alternateRoot)
+        let originalFiles = try fileSnapshot(root: movedRoot)
+        let alternateFiles = try fileSnapshot(root: alternateRoot)
+
+        do {
+            _ = try await originalRepository.load(id: id)
+            XCTFail("A replaced storage root was followed while loading.")
+        } catch {
+            guard case .unsafePath? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected replaced-root load error: \(error)")
+            }
+        }
+        do {
+            _ = try await originalRepository.save(
+                id: id,
+                content: content(
+                    title: "Unwanted write",
+                    strokes: [NotebookStroke(id: UUID(), data: Data("unwanted archive".utf8))]
+                ),
+                expectedRevisionID: original.revisionID
+            )
+            XCTFail("A replaced storage root was followed while saving.")
+        } catch {
+            guard case .unsafePath? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected replaced-root save error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(try fileSnapshot(root: movedRoot), originalFiles)
+        XCTAssertEqual(try fileSnapshot(root: alternateRoot), alternateFiles)
+        let movedRepository = try NotebookRepository(rootURL: movedRoot)
+        let recoveredOriginal = try await requiredNotebook(movedRepository, id: id)
+        let preservedAlternate = try await requiredNotebook(alternateRepository, id: id)
+        XCTAssertEqual(recoveredOriginal.revisionID, original.revisionID)
+        XCTAssertEqual(recoveredOriginal.content, original.content)
+        XCTAssertEqual(preservedAlternate.revisionID, alternate.revisionID)
+        XCTAssertEqual(preservedAlternate.content, alternate.content)
+    }
+
     func testSymbolicLinksAtRootHeadAssetAndRevisionDirectoryAreRejected() async throws {
         let parent = try makeRoot()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -618,6 +689,23 @@ final class NotebookRepositoryTests: XCTestCase {
             at: noteURL(root: root, id: id).appendingPathComponent(folder, isDirectory: true),
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == suffix }
+    }
+
+    private func fileSnapshot(root: URL) throws -> [String: Data] {
+        let enumerator = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey]
+            )
+        )
+        var snapshot: [String: Data] = [:]
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else { continue }
+            let relativePath = String(url.path.dropFirst(root.path.count + 1))
+            snapshot[relativePath] = try Data(contentsOf: url)
+        }
+        return snapshot
     }
 
     private func object(at url: URL) throws -> [String: Any] {
