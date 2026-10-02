@@ -31,6 +31,9 @@ public actor NotebookRepository {
     }
 
     public func load(id: UUID) throws -> StoredNotebook? {
+        guard try NotebookFileSystem.existingDirectory(rootURL) else {
+            throw NotebookRepositoryError.unsafePath("The notebook storage directory is missing.")
+        }
         let directory = notebookDirectory(id: id)
         guard try NotebookFileSystem.existingDirectory(directory) else { return nil }
         guard let head = try readHead(id: id, directory: directory) else { return nil }
@@ -185,7 +188,11 @@ public actor NotebookRepository {
               revision.strokes.count <= Self.maximumStrokeCount else {
             throw NotebookRepositoryError.corruptData("The committed revision exceeds the supported content bounds.")
         }
-        try validateEditStamp(revision.editStamp)
+        do {
+            try validateEditStamp(revision.editStamp)
+        } catch {
+            throw NotebookRepositoryError.corruptData("The committed edit timestamp is invalid.")
+        }
         var identifiers = Set<UUID>()
         for reference in revision.strokes {
             guard identifiers.insert(reference.id).inserted, Self.isDigest(reference.digest) else {

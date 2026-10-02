@@ -117,6 +117,9 @@ enum NotebookFileSystem {
     }
 
     static func acquireWriterLock(_ root: URL) throws -> Int32 {
+        guard try existingDirectory(root) else {
+            throw NotebookRepositoryError.unsafePath("The notebook storage directory is missing.")
+        }
         let descriptor = try openFile(
             root.appendingPathComponent(".writer.lock"),
             flags: O_RDWR | O_CREAT | O_NOFOLLOW

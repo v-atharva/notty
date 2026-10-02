@@ -110,6 +110,22 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.content.title, "Newer")
     }
 
+    func testConcurrentCreationAcrossRepositoriesPublishesExactlyOneHead() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let firstRepository = try NotebookRepository(rootURL: root)
+        let secondRepository = try NotebookRepository(rootURL: root)
+        async let first = Self.tryCreation(firstRepository, id: id)
+        async let second = Self.tryCreation(secondRepository, id: id)
+        let (firstSucceeded, secondSucceeded) = try await (first, second)
+
+        XCTAssertNotEqual(firstSucceeded, secondSucceeded)
+        let loaded = try await requiredNotebook(firstRepository, id: id)
+        XCTAssertEqual(loaded.sequence, 1)
+        XCTAssertEqual(try files(root: root, id: id, folder: "revisions", extension: "json").count, 1)
+    }
+
     func testEveryPrepublicationFaultPreservesThePreviousHeadAndAllowsRetry() async throws {
         for target in NotebookWriteStage.allCases {
             let root = try makeRoot()
@@ -365,6 +381,41 @@ final class NotebookRepositoryTests: XCTestCase {
         }
     }
 
+    func testCorruptedUnpublishedAssetCannotBeReusedDuringRetry() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("archive".utf8))
+        let faulty = try NotebookRepository(rootURL: root) { stage in
+            if stage == .assetPublished { throw InjectedFailure.stop }
+        }
+        do {
+            _ = try await faulty.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+            )
+            XCTFail("The injected failure did not occur.")
+        } catch {
+            XCTAssertTrue(error is InjectedFailure)
+        }
+        let asset = try XCTUnwrap(
+            files(root: root, id: id, folder: "assets", extension: "stroke").first
+        )
+        try Data("tampered".utf8).write(to: asset)
+        let healthy = try NotebookRepository(rootURL: root)
+        do {
+            _ = try await healthy.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+            )
+            XCTFail("A corrupted existing asset was reused.")
+        } catch {
+            guard case .corruptData? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected asset error: \(error)")
+            }
+        }
+        let loaded = try await healthy.load(id: id)
+        XCTAssertNil(loaded)
+    }
+
     func testOversizedMetadataIsRejectedBeforeDecoding() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -430,6 +481,22 @@ final class NotebookRepositoryTests: XCTestCase {
                     return XCTFail("Unexpected timestamp error: \(error)")
                 }
             }
+        }
+    }
+
+    private static func tryCreation(
+        _ repository: NotebookRepository,
+        id: UUID
+    ) async throws -> Bool {
+        do {
+            _ = try await repository.save(
+                id: id,
+                content: NotebookContent(title: "Concurrent", pageCount: 1, strokes: []),
+                expectedRevisionID: nil
+            )
+            return true
+        } catch NotebookRepositoryError.revisionConflict {
+            return false
         }
     }
 
