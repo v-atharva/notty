@@ -71,6 +71,8 @@ final class InkCodecTests: XCTestCase {
         let erased = try await codec.encode(PKDrawing(strokes: [moved]))
         let erasedCount = await codec.serializedStrokeCount
         XCTAssertEqual(erasedCount, 3)
+        let cacheCount = await codec.cachedStrokeCount
+        XCTAssertEqual(cacheCount, 1)
         XCTAssertEqual(erased[0].data, changed[1].data)
         let reopened = try await InkCodec().decode(erased)
         XCTAssertEqual(reopened.strokes[0].id, second.id)
@@ -116,4 +118,81 @@ final class InkCodecTests: XCTestCase {
             } catch {}
         }
     }
+
+    func testCountLimitRejectsBeforeSerializationOrDecoding() async throws {
+        let native = stroke()
+        let drawing = PKDrawing(strokes: [native, stroke(), stroke()])
+        let encoder = InkCodec(maximumStrokeCount: 2, maximumDrawingBytes: 1_000_000)
+        do {
+            _ = try await encoder.encode(drawing)
+            XCTFail("Excess count must fail before serialization.")
+        } catch InkCodec.CodecError.tooManyStrokes {}
+        let count = await encoder.serializedStrokeCount
+        let cacheCount = await encoder.cachedStrokeCount
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(cacheCount, 0)
+
+        let invalidAssets = (0..<3).map { _ in
+            NotebookStroke(id: UUID(), data: Data([0]))
+        }
+        do {
+            _ = try await encoder.decode(invalidAssets)
+            XCTFail("Excess count must fail before malformed data is decoded.")
+        } catch InkCodec.CodecError.tooManyStrokes {}
+    }
+
+    func testAggregateLimitStopsEncodingBeforeRemainingStrokes() async throws {
+        let first = stroke()
+        let second = stroke(x: 120)
+        let third = stroke(x: 220)
+        let firstBytes = PKDrawing(strokes: [first]).dataRepresentation().count
+        let secondBytes = PKDrawing(strokes: [second]).dataRepresentation().count
+        let codec = InkCodec(
+            maximumStrokeCount: 10,
+            maximumDrawingBytes: firstBytes + secondBytes - 1
+        )
+        do {
+            _ = try await codec.encode(PKDrawing(strokes: [first, second, third]))
+            XCTFail("Combined archives above the limit must fail.")
+        } catch InkCodec.CodecError.oversizedDrawingArchive {}
+        let serialized = await codec.serializedStrokeCount
+        let cached = await codec.cachedStrokeCount
+        XCTAssertEqual(serialized, 2)
+        XCTAssertEqual(cached, 0)
+    }
+
+    func testAggregateLimitRejectsBeforeDecodingOversizedTail() async throws {
+        let first = stroke()
+        let firstData = PKDrawing(strokes: [first]).dataRepresentation()
+        let codec = InkCodec(
+            maximumStrokeCount: 10,
+            maximumDrawingBytes: firstData.count
+        )
+        let assets = [
+            NotebookStroke(id: first.id, data: firstData),
+            NotebookStroke(id: UUID(), data: Data([0]))
+        ]
+        do {
+            _ = try await codec.decode(assets)
+            XCTFail("Aggregate limit must reject the second asset before decode.")
+        } catch InkCodec.CodecError.oversizedDrawingArchive {}
+        let cached = await codec.cachedStrokeCount
+        XCTAssertEqual(cached, 0)
+    }
+    func testProductionStrokeLimitRejectsSharedPathCopiesWithoutSerialization() async throws {
+        let template = stroke()
+        let strokes = (0...InkCodec.maximumStrokeCount).map { _ in
+            var copy = template
+            copy.id = UUID()
+            return copy
+        }
+        let codec = InkCodec()
+        do {
+            _ = try await codec.encode(PKDrawing(strokes: strokes))
+            XCTFail("The production count limit must reject excess strokes.")
+        } catch InkCodec.CodecError.tooManyStrokes {}
+        let serialized = await codec.serializedStrokeCount
+        XCTAssertEqual(serialized, 0)
+    }
+
 }
