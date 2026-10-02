@@ -1,0 +1,82 @@
+name: Native checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "Notty/**"
+      - "Notty.xcodeproj/**"
+      - "Packages/**"
+      - ".github/workflows/native-checks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-checks:
+    name: Core tests and unsigned iPad builds
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Report toolchain
+        run: |
+          xcodebuild -version
+          xcrun swift --version
+          xcodebuild -showsdks
+
+      - name: Test notebook core
+        run: |
+          xcrun swift test --package-path Packages/NottyCore --parallel --num-workers 2
+
+      - name: Compile unsigned iPad simulator app
+        run: |
+          xcodebuild \
+            -project Notty.xcodeproj \
+            -scheme Notty \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Compile unsigned iPad device app
+        run: |
+          xcodebuild \
+            -project Notty.xcodeproj \
+            -scheme Notty \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/NottyDevice" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Record result
+        if: always()
+        run: |
+          {
+            printf '### Native checks\n\n'
+            printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Job result: `%s`\n\n' "${{ job.status }}"
+            printf 'Unsigned simulator/device compilation and macOS geometry tests. Physical iPad acceptance is pending.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
