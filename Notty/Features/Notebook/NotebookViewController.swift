@@ -12,6 +12,13 @@ final class NotebookViewController: UIViewController {
     private let paper = PaperBackgroundView()
     private let toolPicker = PKToolPicker()
 
+    var onCompletedEdit: ((PKDrawing) -> Bool)?
+    var currentDrawing: PKDrawing { canvas.drawing }
+
+    private let initialDrawing: PKDrawing
+    private var lastDeliveredDrawing: PKDrawing
+    private var isUsingTool = false
+    private var editingEnabled = true
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
@@ -21,14 +28,16 @@ final class NotebookViewController: UIViewController {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
     }
 
-    init(pageCount: Int) {
+    init(pageCount: Int, initialDrawing: PKDrawing) {
+        self.initialDrawing = initialDrawing
+        self.lastDeliveredDrawing = initialDrawing
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
         super.init(nibName: nil, bundle: nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
-        fatalError("Use init(pageCount:).")
+        fatalError("Use init(pageCount:initialDrawing:).")
     }
 
     override func viewDidLoad() {
@@ -41,7 +50,9 @@ final class NotebookViewController: UIViewController {
         paper.isOpaque = true
         paper.contentMode = .redraw
 
+        canvas.drawing = initialDrawing
         canvas.delegate = self
+        canvas.isUserInteractionEnabled = editingEnabled
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.drawingPolicy = .pencilOnly
@@ -133,6 +144,22 @@ final class NotebookViewController: UIViewController {
         canvas.resignFirstResponder()
     }
 
+    func setEditingEnabled(_ enabled: Bool) {
+        editingEnabled = enabled
+        if isViewLoaded {
+            canvas.isUserInteractionEnabled = enabled
+        }
+    }
+
+    private func deliverCompletedDrawing() {
+        let drawing = canvas.drawing
+        guard drawing != lastDeliveredDrawing else { return }
+        lastDeliveredDrawing = drawing
+        if let onCompletedEdit {
+            setEditingEnabled(onCompletedEdit(drawing))
+        }
+    }
+
     func setPageCount(_ requestedCount: Int) {
         let boundedCount = min(max(requestedCount, 1), Self.maximumPageCount)
         // Reducing the paper extent could hide existing ink.
@@ -149,6 +176,7 @@ final class NotebookViewController: UIViewController {
     }
 
     func tearDown() {
+        deliverCompletedDrawing()
         guard observesToolPicker else { return }
         toolPicker.setVisible(false, forFirstResponder: canvas)
         toolPicker.removeObserver(canvas)
@@ -209,6 +237,21 @@ final class NotebookViewController: UIViewController {
 }
 
 extension NotebookViewController: PKCanvasViewDelegate {
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        isUsingTool = true
+    }
+
+    func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        if !isUsingTool {
+            deliverCompletedDrawing()
+        }
+    }
+
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        isUsingTool = false
+        deliverCompletedDrawing()
+    }
+
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard !isAdjustingLayout else { return }
         updatePaperViewport()

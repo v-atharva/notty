@@ -21,10 +21,10 @@ concurrency:
 jobs:
   native-checks:
     name: Core tests and unsigned iPad builds
-    runs-on: macos-15
+    runs-on: xcode-27
     timeout-minutes: 15
     env:
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     defaults:
       run:
         shell: bash
@@ -35,15 +35,24 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Report toolchain
+      - name: Verify native toolchain
         run: |
+          sw_vers
           xcodebuild -version
           xcrun swift --version
           xcodebuild -showsdks
+          case "$(sw_vers -productVersion)" in
+            27.*) ;;
+            *) printf 'macOS 27 is required for native stroke tests.\n' >&2; exit 1 ;;
+          esac
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          for sdk in macosx27.0 iphoneos27.0 iphonesimulator27.0; do
+            test "$(xcrun --sdk "$sdk" --show-sdk-version)" = "27.0"
+          done
 
-      - name: Test notebook core
+      - name: Test notebook core and native stroke archives
         run: |
-          xcrun swift test --package-path Packages/NottyCore --parallel --num-workers 2
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2
 
       - name: Compile unsigned iPad simulator app
         run: |
@@ -51,7 +60,7 @@ jobs:
             -project Notty.xcodeproj \
             -scheme Notty \
             -configuration Debug \
-            -sdk iphonesimulator \
+            -sdk iphonesimulator27.0 \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
             CODE_SIGNING_ALLOWED=NO \
@@ -64,7 +73,7 @@ jobs:
             -project Notty.xcodeproj \
             -scheme Notty \
             -configuration Release \
-            -sdk iphoneos \
+            -sdk iphoneos27.0 \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/NottyDevice" \
             CODE_SIGNING_ALLOWED=NO \
@@ -78,5 +87,5 @@ jobs:
             printf '### Native checks\n\n'
             printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
             printf 'Job result: `%s`\n\n' "${{ job.status }}"
-            printf 'Unsigned simulator/device compilation and macOS geometry tests. Physical iPad acceptance is pending.\n'
+            printf 'Unsigned simulator/device compilation and macOS storage, geometry, and native stroke tests. Physical iPad acceptance is pending.\n'
           } >> "$GITHUB_STEP_SUMMARY"

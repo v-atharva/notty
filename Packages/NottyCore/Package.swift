@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "NottyCore",
-    platforms: [.iOS(.v17), .macOS(.v14)],
+    platforms: [.iOS("27.0"), .macOS("27.0")],
     products: [.library(name: "NottyCore", targets: ["NottyCore"])],
     targets: [
         .target(name: "NottyCore"),
