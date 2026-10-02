@@ -47,6 +47,75 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.content.strokes.map(\.id), [stroke.id, secondStroke.id])
     }
 
+    func testSaveVerifiesEachCommittedDigestOnceWithoutRereadingUnchangedAssets() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let shared = Data("unchanged".utf8)
+        let retained = NotebookStroke(id: UUID(), data: shared)
+        let duplicateArchive = NotebookStroke(id: UUID(), data: shared)
+        let removed = NotebookStroke(id: UUID(), data: Data("removed".utf8))
+        let initial = try NotebookRepository(rootURL: root)
+        let first = try await initial.save(
+            id: id,
+            content: content(strokes: [retained, duplicateArchive, removed]),
+            expectedRevisionID: nil
+        )
+        let counter = NotebookAssetVerificationCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, assetVerificationObserver: { counter.record($0) }
+        )
+        let added = NotebookStroke(id: UUID(), data: Data("new archive".utf8))
+        let next = content(strokes: [retained, duplicateArchive, added])
+        let second = try await repository.save(
+            id: id, content: next, expectedRevisionID: first.revisionID
+        )
+
+        let counts = counter.snapshot()
+        XCTAssertEqual(counts.count, 2)
+        XCTAssertTrue(counts.values.allSatisfy { $0 == 1 })
+        XCTAssertEqual(counts[digest(shared)], 1)
+        XCTAssertEqual(counts[digest(removed.data)], 1)
+        XCTAssertNil(counts[digest(added.data)])
+        counter.reset()
+        _ = try await repository.save(
+            id: id, content: next, expectedRevisionID: second.revisionID
+        )
+        XCTAssertEqual(counter.snapshot().count, 2)
+        XCTAssertTrue(counter.snapshot().values.allSatisfy { $0 == 1 })
+    }
+
+    func testUnpublishedExistingDigestIsVerifiedOnceWhenSeveralStrokesReuseIt() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let data = Data("unpublished archive".utf8)
+        let stroke = NotebookStroke(id: UUID(), data: data)
+        let faulty = try NotebookRepository(rootURL: root) { stage in
+            if stage == .revisionStaged { throw InjectedFailure.stop }
+        }
+        do {
+            _ = try await faulty.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+            )
+            XCTFail("The injected fault did not occur.")
+        } catch {
+            XCTAssertTrue(error is InjectedFailure)
+        }
+        let counter = NotebookAssetVerificationCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, assetVerificationObserver: { counter.record($0) }
+        )
+        _ = try await repository.save(
+            id: id,
+            content: content(strokes: [
+                stroke, NotebookStroke(id: UUID(), data: data)
+            ]),
+            expectedRevisionID: nil
+        )
+        XCTAssertEqual(counter.snapshot(), [digest(data): 1])
+    }
+
     func testMoveAndEraseRetainEarlierAssetsAndOrderedRevisions() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -484,6 +553,10 @@ final class NotebookRepositoryTests: XCTestCase {
         }
     }
 
+    private func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     private static func tryCreation(
         _ repository: NotebookRepository,
         id: UUID
@@ -574,3 +647,27 @@ final class NotebookRepositoryTests: XCTestCase {
         try writeObject(head, to: headURL)
     }
 }
+
+private final class NotebookAssetVerificationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func record(_ digest: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[digest, default: 0] += 1
+    }
+
+    func snapshot() -> [String: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        counts.removeAll()
+    }
+}
+
