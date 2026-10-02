@@ -1,5 +1,12 @@
+import CoreGraphics
 import Foundation
 import PencilKit
+
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 @available(iOS 27.0, macOS 27.0, *)
 public actor InkCodec {
@@ -9,6 +16,7 @@ public actor InkCodec {
         case oversizedStrokeArchive
         case tooManyStrokes
         case oversizedDrawingArchive
+        case invalidMaskGeometry
     }
 
     public static let maximumStrokeBytes = 10 * 1_024 * 1_024
@@ -21,8 +29,74 @@ public actor InkCodec {
     var cachedStrokeCount: Int { cache.count }
 
     private struct CachedStroke {
-        let drawing: PKDrawing
+        let signature: StrokeSignature
         let data: Data
+    }
+
+    private struct StrokeSignature: Equatable {
+        let path: PKStrokePath
+        let transform: CGAffineTransform
+        let inkType: PKInk.InkType
+        let color: CGColor
+        let randomSeed: UInt32
+        let mask: CGPath?
+        let evenOddFill: Bool
+        let renderGroupID: UUID?
+        let renderState: PKStroke.RenderState?
+
+        init(_ stroke: PKStroke) throws {
+            path = stroke.path
+            transform = stroke.transform
+            inkType = stroke.ink.inkType
+            color = stroke.ink.color.cgColor
+            randomSeed = stroke.randomSeed
+            renderGroupID = stroke.renderGroupID
+            renderState = stroke.renderState
+
+            if let nativeMask = stroke.mask {
+                guard let copy = nativeMask.cgPath.copy() else {
+                    throw CodecError.invalidMaskGeometry
+                }
+                mask = copy
+                #if canImport(UIKit)
+                evenOddFill = nativeMask.usesEvenOddFillRule
+                #else
+                evenOddFill = nativeMask.windingRule == .evenOdd
+                #endif
+            } else {
+                mask = nil
+                evenOddFill = false
+            }
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            guard lhs.path.id == rhs.path.id,
+                  lhs.path.creationDate == rhs.path.creationDate,
+                  lhs.path.count == rhs.path.count,
+                  lhs.transform == rhs.transform,
+                  lhs.inkType == rhs.inkType,
+                  lhs.color == rhs.color,
+                  lhs.randomSeed == rhs.randomSeed,
+                  lhs.mask == rhs.mask,
+                  lhs.evenOddFill == rhs.evenOddFill,
+                  lhs.renderGroupID == rhs.renderGroupID,
+                  lhs.renderState == rhs.renderState else {
+                return false
+            }
+
+            return lhs.path.elementsEqual(rhs.path) { first, second in
+                first.location == second.location
+                    && first.timeOffset == second.timeOffset
+                    && first.size == second.size
+                    && first.opacity == second.opacity
+                    && first.force == second.force
+                    && first.azimuth == second.azimuth
+                    && first.altitude == second.altitude
+                    && first.secondaryScale == second.secondaryScale
+                    && first.threshold == second.threshold
+                    && first.lateralJitter == second.lateralJitter
+            }
+        }
     }
 
     private var cache: [UUID: CachedStroke] = [:]
@@ -55,12 +129,12 @@ public actor InkCodec {
         result.reserveCapacity(drawing.strokes.count)
 
         for stroke in drawing.strokes {
-            let single = PKDrawing(strokes: [stroke])
+            let signature = try StrokeSignature(stroke)
             let data: Data
-            if let existing = cache[stroke.id], existing.drawing == single {
+            if let existing = cache[stroke.id], existing.signature == signature {
                 data = existing.data
             } else {
-                data = single.dataRepresentation()
+                data = PKDrawing(strokes: [stroke]).dataRepresentation()
                 guard data.count <= Self.maximumStrokeBytes else {
                     throw CodecError.oversizedStrokeArchive
                 }
@@ -70,7 +144,7 @@ public actor InkCodec {
                 throw CodecError.oversizedDrawingArchive
             }
             totalBytes += data.count
-            nextCache[stroke.id] = CachedStroke(drawing: single, data: data)
+            nextCache[stroke.id] = CachedStroke(signature: signature, data: data)
             result.append(NotebookStroke(id: stroke.id, data: data))
         }
 
@@ -109,8 +183,8 @@ public actor InkCodec {
 
             // The manifest identity remains authoritative across archive versions.
             stroke.id = asset.id
-            let single = PKDrawing(strokes: [stroke])
-            nextCache[asset.id] = CachedStroke(drawing: single, data: asset.data)
+            let signature = try StrokeSignature(stroke)
+            nextCache[asset.id] = CachedStroke(signature: signature, data: asset.data)
             strokes.append(stroke)
         }
 

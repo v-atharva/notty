@@ -15,10 +15,12 @@ public actor NotebookRepository {
 
     private let rootURL: URL
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
+    private let assetVerificationObserver: (@Sendable (String) -> Void)?
 
     public init(rootURL: URL) throws {
         self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
         self.faultInjector = nil
+        self.assetVerificationObserver = nil
     }
 
     /// Creates a repository with deterministic publication faults for recovery tests.
@@ -28,6 +30,16 @@ public actor NotebookRepository {
     ) throws {
         self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
         self.faultInjector = faultInjector
+        self.assetVerificationObserver = nil
+    }
+
+    init(
+        rootURL: URL,
+        assetVerificationObserver: @escaping @Sendable (String) -> Void
+    ) throws {
+        self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
+        self.faultInjector = nil
+        self.assetVerificationObserver = assetVerificationObserver
     }
 
     public func load(id: UUID) throws -> StoredNotebook? {
@@ -48,6 +60,7 @@ public actor NotebookRepository {
         expectedRevisionID: UUID?
     ) throws -> StoredNotebook {
         try validateContent(content)
+        let prepared = try prepareAssets(content.strokes)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
 
@@ -64,35 +77,42 @@ public actor NotebookRepository {
         }
 
         var sequence = 1
+        // Verification receipts are valid only within this locked save.
+        var verifiedDigests = Set<String>()
         if let currentHead {
             let current = try readRevision(head: currentHead, directory: directory)
-            try verifyAssets(revision: current, directory: directory)
+            verifiedDigests = try verifyAssets(
+                revision: current, directory: directory, candidates: prepared.dataByDigest
+            )
             guard current.sequence < Int.max else {
                 throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
             }
             sequence = current.sequence + 1
         }
 
-        var references: [StrokeReference] = []
-        references.reserveCapacity(content.strokes.count)
-        for stroke in content.strokes {
-            let digest = Self.digest(stroke.data)
+        for reference in prepared.references {
+            let digest = reference.digest
+            guard !verifiedDigests.contains(digest) else { continue }
+            guard let candidate = prepared.dataByDigest[digest] else {
+                throw NotebookRepositoryError.corruptData("A prepared stroke asset is missing.")
+            }
             let destination = assetURL(digest: digest, directory: directory)
             if try NotebookFileSystem.kind(destination) != nil {
                 let existing = try NotebookFileSystem.read(
                     destination, maximumBytes: Self.maximumAssetBytes
                 )
-                guard Self.digest(existing) == digest, existing == stroke.data else {
+                guard Self.digest(existing) == digest, existing == candidate else {
                     throw NotebookRepositoryError.corruptData("A stored stroke asset failed integrity validation.")
                 }
+                assetVerificationObserver?(digest)
             } else {
                 let stage = assetsDirectory.appendingPathComponent(".\(UUID().uuidString).tmp")
-                try NotebookFileSystem.writeSynchronized(stroke.data, to: stage)
+                try NotebookFileSystem.writeSynchronized(candidate, to: stage)
                 try faultInjector?(.assetStaged)
                 try NotebookFileSystem.publishImmutable(stage, to: destination)
                 try faultInjector?(.assetPublished)
             }
-            references.append(StrokeReference(id: stroke.id, digest: digest))
+            verifiedDigests.insert(digest)
         }
 
         let revision = Revision(
@@ -103,7 +123,7 @@ public actor NotebookRepository {
             sequence: sequence,
             title: content.title,
             pageCount: content.pageCount,
-            strokes: references,
+            strokes: prepared.references,
             editStamp: content.editStamp,
             savedAt: Date()
         )
@@ -218,16 +238,48 @@ public actor NotebookRepository {
         return strokes
     }
 
-    private func verifyAssets(revision: Revision, directory: URL) throws {
+    private func verifyAssets(
+        revision: Revision,
+        directory: URL,
+        candidates: [String: Data]
+    ) throws -> Set<String> {
         try validateAssetsDirectory(revision: revision, directory: directory)
+        var byteCounts: [String: Int] = [:]
         var totalBytes = 0
         for reference in revision.strokes {
-            let data = try readAsset(reference: reference, directory: directory)
-            totalBytes += data.count
+            if byteCounts[reference.digest] == nil {
+                let data = try readAsset(reference: reference, directory: directory)
+                if let candidate = candidates[reference.digest], candidate != data {
+                    throw NotebookRepositoryError.corruptData("Stroke archives with the same digest have different bytes.")
+                }
+                byteCounts[reference.digest] = data.count
+            }
+            guard let byteCount = byteCounts[reference.digest] else {
+                throw NotebookRepositoryError.corruptData("A verified stroke asset is missing.")
+            }
+            totalBytes += byteCount
             guard totalBytes <= Self.maximumNotebookBytes else {
                 throw NotebookRepositoryError.sizeLimitExceeded("The notebook exceeds the prototype memory bound.")
             }
         }
+        return Set(byteCounts.keys)
+    }
+
+    private func prepareAssets(
+        _ strokes: [NotebookStroke]
+    ) throws -> (references: [StrokeReference], dataByDigest: [String: Data]) {
+        var references: [StrokeReference] = []
+        references.reserveCapacity(strokes.count)
+        var dataByDigest: [String: Data] = [:]
+        for stroke in strokes {
+            let digest = Self.digest(stroke.data)
+            if let existing = dataByDigest[digest], existing != stroke.data {
+                throw NotebookRepositoryError.invalidContent("Stroke archives with the same digest must have identical bytes.")
+            }
+            dataByDigest[digest] = stroke.data
+            references.append(StrokeReference(id: stroke.id, digest: digest))
+        }
+        return (references, dataByDigest)
     }
 
     private func validateAssetsDirectory(revision: Revision, directory: URL) throws {
@@ -247,6 +299,7 @@ public actor NotebookRepository {
         guard Self.digest(data) == reference.digest else {
             throw NotebookRepositoryError.corruptData("A committed stroke asset failed integrity validation.")
         }
+        assetVerificationObserver?(reference.digest)
         return data
     }
 

@@ -102,10 +102,13 @@ final class InkCodecTests: XCTestCase {
             XCTFail("Duplicate identities must fail.")
         } catch InkCodec.CodecError.duplicateStrokeID {}
 
-        do {
-            _ = try await codec.encode(PKDrawing(strokes: [native, native]))
-            XCTFail("Duplicate native identities must fail.")
-        } catch InkCodec.CodecError.duplicateStrokeID {}
+        let normalized = PKDrawing(strokes: [native, native])
+        let normalizedIDs = normalized.strokes.map(\.id)
+        XCTAssertFalse(normalizedIDs.isEmpty)
+        XCTAssertLessThanOrEqual(normalizedIDs.count, 2)
+        XCTAssertEqual(Set(normalizedIDs).count, normalizedIDs.count)
+        let normalizedAssets = try await codec.encode(normalized)
+        XCTAssertEqual(normalizedAssets.map(\.id), normalizedIDs)
 
         for data in [
             Data([0, 1, 2, 3]),
@@ -193,6 +196,78 @@ final class InkCodecTests: XCTestCase {
         } catch InkCodec.CodecError.tooManyStrokes {}
         let serialized = await codec.serializedStrokeCount
         XCTAssertEqual(serialized, 0)
+    }
+
+    func testMaskChangeKeepsIdentityAndCreatesChangedArchive() async throws {
+        let original = stroke()
+        let codec = InkCodec()
+        let initial = try await codec.encode(PKDrawing(strokes: [original]))
+        var masked = original
+        #if canImport(UIKit)
+        let mask = UIBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #else
+        let mask = NSBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #endif
+        masked.mask = mask
+        let changed = try await codec.encode(PKDrawing(strokes: [masked]))
+        let count = await codec.serializedStrokeCount
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(changed[0].id, original.id)
+        XCTAssertNotEqual(changed[0].data, initial[0].data)
+        let reopened = try await InkCodec().decode(changed)
+        XCTAssertEqual(reopened.strokes[0].id, original.id)
+        XCTAssertEqual(reopened.strokes[0].mask?.bounds, mask.bounds)
+    }
+
+    func testSameBoundsDifferentMaskGeometryInvalidatesCache() async throws {
+        var native = stroke()
+        let rect = CGRect(x: 10, y: 20, width: 40, height: 40)
+        #if canImport(UIKit)
+        native.mask = UIBezierPath(rect: rect)
+        #else
+        native.mask = NSBezierPath(rect: rect)
+        #endif
+        let codec = InkCodec()
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+
+        #if canImport(UIKit)
+        native.mask = UIBezierPath(ovalIn: rect)
+        #else
+        native.mask = NSBezierPath(ovalIn: rect)
+        #endif
+        let second = try await codec.encode(PKDrawing(strokes: [native]))
+        let count = await codec.serializedStrokeCount
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(second[0].id, first[0].id)
+        XCTAssertNotEqual(second[0].data, first[0].data)
+    }
+
+    func testRenderStateAndGroupInvalidateCache() async throws {
+        var native = stroke()
+        let codec = InkCodec()
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+        native.renderGroupID = UUID()
+        let grouped = try await codec.encode(PKDrawing(strokes: [native]))
+        native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        let rendered = try await codec.encode(PKDrawing(strokes: [native]))
+        let count = await codec.serializedStrokeCount
+        XCTAssertEqual(count, 3)
+        XCTAssertNotEqual(grouped[0].data, first[0].data)
+        XCTAssertNotEqual(rendered[0].data, grouped[0].data)
+        let reopened = try await InkCodec().decode(rendered)
+        XCTAssertEqual(reopened.strokes[0].renderState, native.renderState)
+        XCTAssertEqual(reopened.strokes[0].renderGroupID, native.renderGroupID)
+    }
+
+    func testDecodeThenEncodeReusesOriginalAsset() async throws {
+        let encoder = InkCodec()
+        let assets = try await encoder.encode(PKDrawing(strokes: [stroke()]))
+        let decoder = InkCodec()
+        let drawing = try await decoder.decode(assets)
+        let unchanged = try await decoder.encode(drawing)
+        let count = await decoder.serializedStrokeCount
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(unchanged, assets)
     }
 
 }

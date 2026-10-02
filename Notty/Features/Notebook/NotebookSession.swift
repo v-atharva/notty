@@ -4,6 +4,12 @@ import NottyCore
 import PencilKit
 import UIKit
 
+private struct NotebookDrawingSnapshot: Sendable, Equatable {
+    let drawing: PKDrawing
+    let pageCount: Int
+    let title: String
+}
+
 @MainActor
 final class NotebookSession: ObservableObject {
     enum LoadState: Equatable {
@@ -12,26 +18,10 @@ final class NotebookSession: ObservableObject {
         case failed
     }
 
-    enum SaveState: Equatable {
-        case idle
-        case saving
-        case saved(Date)
-        case failed
-    }
-
-    private struct PendingEdit {
-        let drawing: PKDrawing
-        let pageCount: Int
-        let stamp: NotebookEditStamp
-    }
-
-    static let maximumPendingEdits = 8
     let notebookID = UUID(uuidString: "E1E7AC14-D496-4893-B04B-A9169925D2A4")!
 
     @Published private(set) var loadState = LoadState.loading
-    @Published private(set) var saveState = SaveState.idle
     @Published private(set) var pageCount = 3
-    @Published private(set) var inputPaused = false
     @Published private(set) var title = "Personal notebook"
 
     private(set) var initialDrawing = PKDrawing()
@@ -39,16 +29,21 @@ final class NotebookSession: ObservableObject {
 
     private let codec = InkCodec()
     private let editSessionID = UUID()
-    private var repository: NotebookRepository?
-    private var revisionID: UUID?
     private var latestDrawing = PKDrawing()
-    private var pending: [PendingEdit] = []
-    private var writer: Task<Void, Never>?
+    private var coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>?
+    private var coordinatorObservation: AnyCancellable?
     private var loadStarted = false
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+    private var backgroundWaiter: Task<Void, Never>?
+
+    var saveState: NotebookSaveStatus { coordinator?.status ?? .idle }
+
+    var inputPaused: Bool {
+        coordinator.map { !$0.canAcceptInput } ?? false
+    }
 
     var canEdit: Bool {
-        loadState == .ready && !inputPaused && saveState != .failed
+        loadState == .ready && (coordinator?.canAcceptInput ?? false)
     }
 
     func load() async {
@@ -69,21 +64,48 @@ final class NotebookSession: ObservableObject {
                 drawing = try await codec.decode(stored.content.strokes)
                 pageCount = stored.content.pageCount
                 title = stored.content.title
-                revisionID = stored.revisionID
-                saveState = .saved(stored.savedAt)
             } else {
                 drawing = PKDrawing()
                 pageCount = 3
-                revisionID = nil
             }
 
-            self.repository = repository
             initialDrawing = drawing
             latestDrawing = drawing
+            let snapshot = NotebookDrawingSnapshot(
+                drawing: drawing, pageCount: pageCount, title: title
+            )
+            let codec = self.codec
+            let notebookID = self.notebookID
+            let coordinator = NotebookSaveCoordinator<NotebookDrawingSnapshot>(
+                initialSnapshot: stored == nil ? nil : snapshot,
+                expectedRevisionID: stored?.revisionID,
+                savedAt: stored?.savedAt
+            ) { snapshot, stamp, revisionID in
+                let strokes = try await codec.encode(snapshot.drawing)
+                let content = NotebookContent(
+                    title: snapshot.title,
+                    pageCount: snapshot.pageCount,
+                    strokes: strokes,
+                    editStamp: stamp
+                )
+                let receipt = try await repository.save(
+                    id: notebookID,
+                    content: content,
+                    expectedRevisionID: revisionID
+                )
+                return NotebookSaveReceipt(
+                    revisionID: receipt.revisionID,
+                    savedAt: receipt.savedAt
+                )
+            }
+            self.coordinator = coordinator
+            coordinatorObservation = coordinator.objectWillChange.sink { [weak self] in
+                self?.objectWillChange.send()
+            }
             loadState = .ready
 
             if stored == nil {
-                enqueue(drawing: drawing, pageCount: pageCount)
+                enqueue(drawing: drawing)
             }
         } catch {
             loadStarted = false
@@ -96,7 +118,7 @@ final class NotebookSession: ObservableObject {
         guard loadState == .ready else { return false }
         if drawing != latestDrawing {
             latestDrawing = drawing
-            enqueue(drawing: drawing, pageCount: pageCount)
+            enqueue(drawing: drawing)
         }
         return canEdit
     }
@@ -108,14 +130,11 @@ final class NotebookSession: ObservableObject {
         let drawing = snapshotProvider?() ?? latestDrawing
         latestDrawing = drawing
         pageCount += 1
-        enqueue(drawing: drawing, pageCount: pageCount)
+        enqueue(drawing: drawing)
     }
 
     func retrySave() {
-        guard loadState == .ready, saveState == .failed else { return }
-        saveState = .saving
-        inputPaused = pending.count >= Self.maximumPendingEdits
-        startWriter()
+        coordinator?.retry()
     }
 
     func flush() {
@@ -123,7 +142,7 @@ final class NotebookSession: ObservableObject {
         if let drawing = snapshotProvider?() {
             recordCompletedEdit(drawing)
         }
-        guard !pending.isEmpty else { return }
+        guard let coordinator, coordinator.pendingCount > 0 else { return }
 
         if backgroundTask == .invalid {
             backgroundTask = UIApplication.shared.beginBackgroundTask(
@@ -134,7 +153,12 @@ final class NotebookSession: ObservableObject {
                 }
             }
         }
-        startWriter()
+        guard backgroundWaiter == nil else { return }
+        backgroundWaiter = Task { [self] in
+            await coordinator.waitUntilSettled()
+            endBackgroundTask()
+            backgroundWaiter = nil
+        }
     }
 
     private static func makeRepository() async throws -> NotebookRepository {
@@ -149,63 +173,17 @@ final class NotebookSession: ObservableObject {
         }.value
     }
 
-    private func enqueue(drawing: PKDrawing, pageCount: Int) {
-        pending.append(PendingEdit(
-            drawing: drawing,
-            pageCount: pageCount,
+    private func enqueue(drawing: PKDrawing) {
+        coordinator?.enqueue(
+            snapshot: NotebookDrawingSnapshot(
+                drawing: drawing, pageCount: pageCount, title: title
+            ),
             stamp: NotebookEditStamp(
                 capturedAt: Date(),
                 uptime: ProcessInfo.processInfo.systemUptime,
                 sessionID: editSessionID
             )
-        ))
-        inputPaused = pending.count >= Self.maximumPendingEdits
-        if saveState != .failed {
-            saveState = .saving
-            startWriter()
-        }
-    }
-
-    private func startWriter() {
-        guard writer == nil, saveState != .failed, !pending.isEmpty else {
-            if pending.isEmpty { endBackgroundTask() }
-            return
-        }
-
-        writer = Task { [self] in
-            await drain()
-            writer = nil
-        }
-    }
-
-    private func drain() async {
-        guard let repository else { return }
-
-        while let edit = pending.first {
-            do {
-                let strokes = try await codec.encode(edit.drawing)
-                let content = NotebookContent(
-                    title: title,
-                    pageCount: edit.pageCount,
-                    strokes: strokes,
-                    editStamp: edit.stamp
-                )
-                let stored = try await repository.save(
-                    id: notebookID,
-                    content: content,
-                    expectedRevisionID: revisionID
-                )
-                revisionID = stored.revisionID
-                pending.removeFirst()
-                inputPaused = pending.count >= Self.maximumPendingEdits
-                saveState = pending.isEmpty ? .saved(stored.savedAt) : .saving
-            } catch {
-                saveState = .failed
-                inputPaused = true
-                break
-            }
-        }
-        endBackgroundTask()
+        )
     }
 
     private func endBackgroundTask() {
