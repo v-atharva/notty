@@ -64,6 +64,7 @@ final class NotebookViewController: UIViewController {
         view.addSubview(paper)
         view.addSubview(canvas)
         updatePaperGeometry()
+        updateContentExtent()
         toolPicker.addObserver(canvas)
         toolPicker.addObserver(self)
         observesToolPicker = true
