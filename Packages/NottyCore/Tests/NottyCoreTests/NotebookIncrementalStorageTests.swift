@@ -428,6 +428,48 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(historical.content, baseline.content)
     }
 
+    func testSuccessfulFullOpenSeedsFirstSaveWithOnlyHeadRead() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let saved = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content([stroke(1), stroke(2)]), expectedRevisionID: nil
+        )
+        let repository = try NotebookRepository(rootURL: root)
+        let loadedValue = try await repository.load(id: id)
+        let loaded = try XCTUnwrap(loadedValue)
+        XCTAssertEqual(loaded.revisionID, saved.revisionID)
+        XCTAssertTrue(loaded.content.strokes.allSatisfy { $0.cachedDigest != nil })
+        let before = await repository.storageMetrics()
+        _ = try await repository.save(id: id, content: loaded.content, expectedRevisionID: loaded.revisionID)
+        let after = await repository.storageMetrics()
+        XCTAssertEqual(after.assetReadCalls, before.assetReadCalls)
+        XCTAssertEqual(after.assetHashBytes, before.assetHashBytes)
+        XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
+    }
+
+    func testFailedFullOpenDiscardsPriorGenerationBeforeCandidateFreeSave() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let archive = stroke(1)
+        let repository = try NotebookRepository(rootURL: root)
+        let first = try await repository.save(id: id, content: content([archive]), expectedRevisionID: nil)
+        let asset = notebook(root, id).appendingPathComponent("assets/\(NotebookDigest.sha256(archive.data)).stroke")
+        try Data("damaged".utf8).write(to: asset)
+        do {
+            _ = try await repository.load(id: id)
+            XCTFail("Full open trusted cached verification.")
+        } catch NotebookRepositoryError.corruptData {}
+        let headURL = notebook(root, id).appendingPathComponent("HEAD.json")
+        let bytes = try Data(contentsOf: headURL)
+        do {
+            _ = try await repository.save(id: id, content: content([]), expectedRevisionID: first.revisionID)
+            XCTFail("Failed open left a cached generation available.")
+        } catch NotebookRepositoryError.corruptData {}
+        XCTAssertEqual(try Data(contentsOf: headURL), bytes)
+    }
+
     private func appendMetrics(strokeCount: Int) async throws -> [String: Int] {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

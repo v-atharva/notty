@@ -153,12 +153,23 @@ public actor NotebookRepository {
         let directory = notebookDirectory(id: id)
         guard try NotebookFileSystem.existingDirectory(directory) else { return nil }
         let history = historyStore(id: id, directory: directory)
-        guard let head = try history.readHead() else { throw NotebookRepositoryError.recoveryRequired }
-        _ = try history.audit(head)
-        try migrationStore(history).validateReceipt(head)
-        let current = try history.current(head)
-        let notebook = storedNotebook(current, id: id, strokes: try history.readAssets(current.state))
-        maintainNotebook(id: id, directory: directory, head: head)
+        guard let snapshot = try history.readHeadSnapshot() else {
+            throw NotebookRepositoryError.recoveryRequired
+        }
+        _ = try history.audit(snapshot.head)
+        try migrationStore(history).validateReceipt(snapshot.head)
+        let current = try history.current(snapshot.head)
+        let strokes = try history.readAssets(current.state)
+        let checkpointSize = try Format.CheckpointSize(title: current.state.title, metrics: metrics)
+        var sizes: [String: Int] = [:]
+        for (reference, stroke) in zip(current.state.strokes, strokes) {
+            sizes[reference.digest] = stroke.data.count
+        }
+        let notebook = storedNotebook(current, id: id, strokes: strokes)
+        validatedGenerations[id] = ValidatedGeneration(
+            snapshot: snapshot, current: current, verifiedSizes: sizes, checkpointSize: checkpointSize
+        )
+        maintainNotebook(id: id, directory: directory, head: snapshot.head)
         return notebook
     }
 
