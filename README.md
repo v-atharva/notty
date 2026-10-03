@@ -22,7 +22,7 @@ Recovery bounds are 32 edits per copy, 20,000 stroke identities per drawing, 128
 
 Individual stroke archives are shared across immutable revisions. Native stroke IDs, ordered asset references, original edit timestamps, and prior saved states are retained for future recording links and replay. Replay itself is not available.
 
-Notebook publication verifies hashes and schema versions, rejects stale revisions, and updates its head after assets and revision metadata are written. First creation publishes a complete notebook from a private transaction. Missing publication metadata in an existing notebook requires recovery and does not create a blank notebook. Failed writes clean up their stages; recovery maintenance removes validated internal temporary transactions under the writer lock.
+Notebook publication verifies hashes and schema versions, rejects stale revisions, and updates its head after assets and revision metadata are written. First creation publishes a complete notebook from a private transaction. Missing publication metadata in an existing notebook requires recovery and does not create a blank notebook. Failed writes clean up their stages; recovery maintenance removes validated internal temporary transactions under the writer lock. Notebook-stage cleanup follows successful content validation and skips temporary-looking directories and links without touching their targets. Cleanup errors retain the note for another maintenance attempt. Once maintenance succeeds, consecutive successful saves avoid directory scans; cleanup failures remain eligible for retry even after a successful publication.
 
 Normal bounds are 10,000 strokes, 10 MiB per stroke asset, 64 MiB aggregate current stroke data, and 2 MiB metadata. This increment requires iPadOS 27 for native stable PencilKit stroke identities. Twelve sections and the validation bounds are study limits.
 
@@ -34,7 +34,7 @@ Library organization, recording, PDF annotation, bookmarks, and export remain su
 
 ## Cloud checks
 
-The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
+The suite contains 80 core tests and 17 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
 
 The standard GitHub image is currently a preview; the workflow verifies actual host, toolchain and SDK versions and selects an available iPadOS 27.0 tablet simulator. A single job has a fifteen-minute limit and cancels superseded checks on the same pull request.
 
