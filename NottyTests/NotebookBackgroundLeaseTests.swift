@@ -93,4 +93,222 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         XCTAssertEqual(ended.map(\.rawValue), [51, 52])
     }
 
+    func testFailedFlushPreservesEveryEditOnceBeforeEndingLease() async throws {
+        let fixture = try await failedSession()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let pending = fixture.session.pendingEdits
+        fixture.session.flush()
+        await fixture.probe.waitForPreserve()
+        XCTAssertEqual(fixture.leases.started, 1)
+        XCTAssertTrue(fixture.leases.ended.isEmpty)
+        fixture.session.flush()
+        let calls = await fixture.probe.preserveCalls
+        XCTAssertEqual(calls, 1)
+        await fixture.probe.releasePreserve()
+        await fixture.session.waitUntilSettled()
+        XCTAssertEqual(fixture.leases.ended, [101])
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        let preserved = await fixture.probe.preservedBatch
+        let batch = try XCTUnwrap(preserved)
+        XCTAssertEqual(batch.edits.map(\.id), pending.map(\.id))
+        XCTAssertEqual(batch.edits.map(\.stamp), pending.map(\.stamp))
+        fixture.session.flush()
+        await fixture.session.waitUntilSettled()
+        await fixture.session.refreshRecoveryCopies()
+        XCTAssertEqual(fixture.session.recoveryCopies.count, 1)
+        XCTAssertEqual(fixture.leases.started, 1)
+        XCTAssertEqual(fixture.leases.ended, [101])
+    }
+
+    func testFailureDuringBackgroundDrainPreservesBeforeEndingLease() async throws {
+        let fixture = try await failedSession(suspendSave: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 1)
+        await fixture.probe.releaseSave()
+        await fixture.probe.waitForPreserve()
+        XCTAssertEqual(fixture.session.saveState, .failed(.contentLimit))
+        XCTAssertTrue(fixture.leases.ended.isEmpty)
+        await fixture.probe.releasePreserve()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.leases.ended, [101])
+        let calls = await fixture.probe.saveCalls
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testFailedBackgroundPreservationRetainsEditsAndCanRetryNextFlush() async throws {
+        let fixture = try await failedSession(suspendPreserve: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let pending = fixture.session.pendingEdits
+        await fixture.probe.setPreserveFailure(.storageFull)
+        fixture.session.flush()
+        await fixture.session.waitUntilSettled()
+        XCTAssertEqual(fixture.session.recoveryFailure, .storageFull)
+        XCTAssertNotNil(fixture.session.recoveryMessage)
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        XCTAssertFalse(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.leases.ended, [101])
+        let failedCalls = await fixture.probe.preserveCalls
+        XCTAssertEqual(failedCalls, 1)
+        await fixture.probe.setPreserveFailure(nil)
+        fixture.session.flush()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        XCTAssertEqual(fixture.leases.ended, [101, 102])
+    }
+
+    func testBackgroundPreservationCoversLateCompletedEditWithoutDroppingEarlierStates() async throws {
+        let fixture = try await failedSession()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let original = fixture.session.pendingEdits
+        fixture.session.flush()
+        await fixture.probe.waitForPreserve()
+        let seed = fixture.session.makeCanvasSeed()
+        fixture.session.recordCompletedEdit(PKDrawing(), ownerID: seed.ownerID)
+        let all = fixture.session.pendingEdits
+        XCTAssertEqual(all.count, original.count + 1)
+        XCTAssertEqual(Array(all.prefix(original.count)), original)
+        await fixture.probe.releasePreserve()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.session.pendingEdits, all)
+        let preserved = await fixture.probe.preservedBatch
+        let batch = try XCTUnwrap(preserved)
+        XCTAssertEqual(batch.edits.map(\.id), all.map(\.id))
+        XCTAssertEqual(batch.edits.map(\.stamp), all.map(\.stamp))
+        let calls = await fixture.probe.preserveCalls
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(fixture.leases.ended, [101])
+    }
+
+    func testManualPreservationAndRepeatedFlushShareWorkAcrossExpiryAndCallerCancellation() async throws {
+        let fixture = try await failedSession()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let manual = Task { await fixture.session.saveRecoveryCopy() }
+        await fixture.probe.waitForPreserve()
+        fixture.session.flush()
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 1)
+        fixture.leases.expirations[0]()
+        XCTAssertEqual(fixture.leases.ended, [101])
+        fixture.session.flush()
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 2)
+        manual.cancel()
+        fixture.leases.expirations[0]()
+        XCTAssertEqual(fixture.leases.ended, [101])
+        await fixture.probe.releasePreserve()
+        await manual.value
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.leases.ended, [101, 102])
+        fixture.leases.expirations[1]()
+        XCTAssertEqual(fixture.leases.ended, [101, 102])
+        let calls = await fixture.probe.preserveCalls
+        XCTAssertEqual(calls, 1)
+        await fixture.session.reopenSavedNotebook()
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 2)
+        XCTAssertTrue(fixture.session.pendingEdits.isEmpty)
+    }
+
+    func testFullNativeQueueBackgroundRecoveryRetainsEveryTenThousandStrokeState() async throws {
+        let fixture = try await failedSession(
+            suspendSave: true, suspendPreserve: false, enqueueDrawing: false
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let seed = fixture.session.makeCanvasSeed()
+        let template = NotebookTestFixtures.stroke()
+        let strokes = (0..<10_000).map { _ in
+            var copy = template
+            copy.id = UUID()
+            return copy
+        }
+        for index in 0..<8 {
+            var changed = strokes
+            changed[0].transform = CGAffineTransform(translationX: CGFloat(index), y: 0)
+            fixture.session.recordCompletedEdit(PKDrawing(strokes: changed), ownerID: seed.ownerID)
+        }
+        await fixture.probe.waitForSave()
+        let pending = fixture.session.pendingEdits
+        XCTAssertEqual(pending.count, 8)
+        XCTAssertEqual(fixture.session.inputGate, .capacity)
+        fixture.session.flush()
+        await fixture.probe.releaseSave()
+        await fixture.session.waitUntilSettled()
+        XCTAssertEqual(fixture.session.saveState, .failed(.contentLimit))
+        XCTAssertNil(fixture.session.recoveryFailure)
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        await fixture.session.refreshRecoveryCopies()
+        let receipt = try XCTUnwrap(fixture.session.recoveryCopies.first)
+        XCTAssertEqual(fixture.session.recoveryCopies.count, 1)
+        let batch = try await fixture.session.openRecoveryCopy(id: receipt.id)
+        XCTAssertEqual(batch.edits.map(\.id), pending.map(\.id))
+        XCTAssertEqual(batch.edits.map(\.stamp), pending.map(\.stamp))
+        XCTAssertEqual(batch.edits.map(\.strokeIDs), pending.map { $0.snapshot.drawing.strokes.map(\.id) })
+        let codec = NotebookRecoveryCodec()
+        for (edit, expected) in zip(batch.edits, pending) {
+            let decoded = try await codec.decode(edit)
+            XCTAssertEqual(decoded.strokes.map(\.id), expected.snapshot.drawing.strokes.map(\.id))
+            XCTAssertEqual(decoded.strokes[0].transform, expected.snapshot.drawing.strokes[0].transform)
+        }
+        XCTAssertEqual(fixture.leases.ended, [101])
+    }
+
+    private struct FailedSession {
+        let session: NotebookSession
+        let probe: NotebookStorageProbe
+        let leases: LeaseProbe
+        let root: URL
+    }
+
+    private final class LeaseProbe {
+        var expirations: [@MainActor @Sendable () -> Void] = []
+        var ended: [Int] = []
+        var started: Int { expirations.count }
+
+        func makeLease() -> NotebookBackgroundLease {
+            NotebookBackgroundLease(begin: { [self] expiration in
+                expirations.append(expiration)
+                return UIBackgroundTaskIdentifier(rawValue: 100 + expirations.count)
+            }, end: { [self] in ended.append($0.rawValue) })
+        }
+    }
+
+    private func failedSession(
+        suspendSave: Bool = false,
+        suspendPreserve: Bool = true,
+        enqueueDrawing: Bool = true
+    ) async throws -> FailedSession {
+        let root = NotebookTestFixtures.root()
+        let id = UUID()
+        let stored = try await NotebookTestFixtures.stored(id: id)
+        let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
+        await probe.setSaveFailure(.contentLimit)
+        if suspendSave { await probe.setSuspendSave() }
+        if suspendPreserve { await probe.setSuspendPreserve() }
+        let storage = await probe.storage(notebookID: id)
+        let leases = LeaseProbe()
+        let session = NotebookSession(
+            notebookID: id, backgroundLease: leases.makeLease(), openStorage: { storage }
+        )
+        await session.load()
+        if enqueueDrawing {
+            let seed = session.makeCanvasSeed()
+            session.recordCompletedEdit(
+                PKDrawing(strokes: [NotebookTestFixtures.stroke()]), ownerID: seed.ownerID
+            )
+            if suspendSave {
+                await probe.waitForSave()
+            } else {
+                await session.waitUntilSettled()
+            }
+        }
+        return FailedSession(session: session, probe: probe, leases: leases, root: root)
+    }
+
 }
