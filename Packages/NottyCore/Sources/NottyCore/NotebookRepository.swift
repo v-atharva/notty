@@ -272,7 +272,7 @@ public actor NotebookRepository {
             let current = try history.current(head)
             verifiedDigests = try history.verifyAssets(current.state, candidates: prepared.dataByDigest) {
                 reference, candidate in
-                try verifyCandidateAsset(reference, candidate: candidate, directory: directory)
+                try self.verifyCandidateAsset(reference, candidate: candidate, directory: directory)
             }
             guard current.sequence < Int.max else {
                 throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
