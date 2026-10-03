@@ -493,7 +493,7 @@ final class NotebookIncrementalStorageTests: XCTestCase {
     }
 
     func testObservedForeignHistoryHeadDiscardsReceiptsEvenWhenOriginalHeadReturns() async throws {
-        for targetLoad in [false, true] {
+        for operation in ["history", "target", "capture"] {
             let root = try makeRoot()
             defer { try? FileManager.default.removeItem(at: root) }
             let repository = try NotebookRepository(rootURL: root)
@@ -506,7 +506,10 @@ final class NotebookIncrementalStorageTests: XCTestCase {
             let foreign = try await NotebookRepository(rootURL: root).save(
                 id: id, content: content([archive], title: "Foreign"), expectedRevisionID: first.revisionID
             )
-            if targetLoad {
+            if operation == "capture" {
+                let pin = try await repository.captureHistoryPin(id: id, expectedRevisionID: foreign.revisionID)
+                XCTAssertEqual(pin.revisionID, foreign.revisionID)
+            } else if operation == "target" {
                 let selected = try await repository.loadRevision(id: id, revisionID: first.revisionID)
                 XCTAssertEqual(selected.content, first.content)
             } else {
