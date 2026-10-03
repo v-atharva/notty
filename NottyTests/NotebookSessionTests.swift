@@ -157,4 +157,33 @@ final class NotebookSessionTests: XCTestCase {
         XCTAssertEqual(reopened?.content.editStamp, captured)
         XCTAssertEqual(reopened?.content.strokes.map(\.id), drawing.strokes.map(\.id))
     }
+
+    func testCompletedEditDuringCommittedRereadPreventsDestructiveReopen() async throws {
+        let (session, probe, root) = try await setup()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        let first = NotebookTestFixtures.stroke()
+        session.recordCompletedEdit(PKDrawing(strokes: [first]), ownerID: seed.ownerID)
+        await session.waitUntilSettled()
+        await session.saveRecoveryCopy()
+        XCTAssertTrue(session.canReopenSaved)
+        let original = session.pendingEdits
+        await probe.setSuspendLoad()
+        let reopening = Task { await session.reopenSavedNotebook() }
+        await probe.waitForLoad()
+        let late = PKDrawing(strokes: [first, NotebookTestFixtures.stroke(x: 120)])
+        session.recordCompletedEdit(late, ownerID: seed.ownerID)
+        await probe.releaseLoad()
+        await reopening.value
+        XCTAssertEqual(session.loadState, .ready)
+        XCTAssertEqual(session.saveState, .failed(.contentLimit))
+        XCTAssertEqual(session.recoveryFailure, .invalidContent)
+        XCTAssertEqual(Array(session.pendingEdits.prefix(1)), original)
+        XCTAssertEqual(session.pendingEdits.count, 2)
+        XCTAssertEqual(session.workingDrawing.strokes.map(\.id), late.strokes.map(\.id))
+        XCTAssertFalse(session.canReopenSaved)
+        await session.refreshRecoveryCopies()
+        XCTAssertEqual(session.recoveryCopies.count, 1)
+    }
+
 }

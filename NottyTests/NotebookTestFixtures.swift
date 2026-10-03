@@ -51,6 +51,9 @@ actor NotebookStorageProbe {
     private var saveFailure: NotebookSaveFailure?
     private var loadFailure: NotebookSaveFailure?
     private var preserveFailure: NotebookSaveFailure?
+    private var suspendLoad = false
+    private var loadContinuation: CheckedContinuation<Void, Never>?
+    private var loadWaiters: [CheckedContinuation<Void, Never>] = []
     private var suspendPreserve = false
     private var preserveContinuation: CheckedContinuation<Void, Never>?
     private var preserveWaiters: [CheckedContinuation<Void, Never>] = []
@@ -65,6 +68,7 @@ actor NotebookStorageProbe {
     func setSaveFailure(_ failure: NotebookSaveFailure?) { saveFailure = failure }
     func setLoadFailure(_ failure: NotebookSaveFailure?) { loadFailure = failure }
     func setPreserveFailure(_ failure: NotebookSaveFailure?) { preserveFailure = failure }
+    func setSuspendLoad() { suspendLoad = true }
     func setSuspendPreserve() { suspendPreserve = true }
 
     func storage(notebookID: UUID) -> NotebookStorage {
@@ -77,9 +81,29 @@ actor NotebookStorageProbe {
         )
     }
 
-    private func load() throws -> StoredNotebook? {
+    private func load() async throws -> StoredNotebook? {
+        if suspendLoad {
+            await withCheckedContinuation { continuation in
+                loadContinuation = continuation
+                let waiters = loadWaiters
+                loadWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        }
         if let loadFailure { throw loadFailure }
         return stored
+    }
+
+    func waitForLoad() async {
+        if loadContinuation != nil { return }
+        await withCheckedContinuation { loadWaiters.append($0) }
+    }
+
+    func releaseLoad() {
+        suspendLoad = false
+        let continuation = loadContinuation
+        loadContinuation = nil
+        continuation?.resume()
     }
 
     private func save(_ content: NotebookContent, revision: UUID?, notebookID: UUID) throws -> StoredNotebook {
