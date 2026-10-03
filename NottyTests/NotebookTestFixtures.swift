@@ -61,6 +61,7 @@ actor NotebookStorageProbe {
     private var preserveContinuation: CheckedContinuation<Void, Never>?
     private var preserveWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var saveCalls = 0
+    private(set) var preserveCalls = 0
     private(set) var preservedBatch: NotebookRecoveryBatch?
 
     init(stored: StoredNotebook?, recoveryRoot: URL) throws {
@@ -142,6 +143,7 @@ actor NotebookStorageProbe {
     }
 
     private func preserve(_ batch: NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt {
+        preserveCalls += 1
         if let preserveFailure { throw preserveFailure }
         preservedBatch = batch
         if suspendPreserve {
