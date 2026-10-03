@@ -234,6 +234,27 @@ enum NotebookHistoryTestFixtures {
         }
     }
 
+    final class VerificationLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var digests: [String] = []
+
+        func record(_ digest: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            digests.append(digest)
+        }
+
+        func snapshot() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return digests
+        }
+    }
+
+    static func writeObject(_ object: [String: Any], to url: URL) throws {
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: url)
+    }
+
     private struct LegacyHead: Codable {
         let schemaVersion: Int
         let notebookID: UUID

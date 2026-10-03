@@ -11,7 +11,7 @@ final class NotebookHistoryTests: XCTestCase {
     }
 
     func testTwoThousandDistinctAssetsKeepAllMetadataBelowFourTimesAssets() async throws {
-        try await assertLinearHistory(strokeCount: 2_000, title: "Mechanics")
+        try await assertLinearHistory(strokeCount: 2_000, title: String(repeating: "t", count: 4_096))
     }
 
     private func assertLinearHistory(strokeCount: Int, title: String) async throws {
@@ -30,6 +30,20 @@ final class NotebookHistoryTests: XCTestCase {
                 ),
                 expectedRevisionID: latest?.revisionID
             )
+            if [500, 800, 1_000, 2_000].contains(index) {
+                let layout = try Fixtures.layout(root: root, id: id)
+                let eventBytes = try Fixtures.byteCount(in: layout.eventsDirectory)
+                let checkpointBytes = try Fixtures.byteCount(in: layout.checkpointsDirectory)
+                let assetBytes = try Fixtures.byteCount(
+                    in: layout.notebookDirectory.appendingPathComponent("assets", isDirectory: true)
+                )
+                let checkpoints = try Fixtures.regularFiles(in: layout.checkpointsDirectory).count
+                print(
+                    "History growth n=\(index) events=\(eventBytes) checkpoints=\(checkpointBytes) " +
+                    "assets=\(assetBytes) checkpointCount=\(checkpoints) " +
+                    "ratio=\(Double(eventBytes + checkpointBytes) / Double(assetBytes))"
+                )
+            }
         }
         let saved = try XCTUnwrap(latest)
         let layout = try Fixtures.layout(root: root, id: id)
@@ -213,8 +227,11 @@ final class NotebookHistoryTests: XCTestCase {
             id: id, content: NotebookContent(title: "Notes", pageCount: 3, strokes: atLimit),
             expectedRevisionID: nil
         )
-        let audit = try await repository.auditHistory(id: id)
+        let log = Fixtures.VerificationLog()
+        let auditor = try NotebookRepository(rootURL: root, assetVerificationObserver: { log.record($0) })
+        let audit = try await auditor.auditHistory(id: id)
         XCTAssertEqual(audit.verifiedAssetCount, 1)
+        XCTAssertEqual(log.snapshot(), [Fixtures.digest(shared)])
         let headURL = Fixtures.noteDirectory(root: root, id: id).appendingPathComponent("HEAD.json")
         let head = try Data(contentsOf: headURL)
         let overLimit = atLimit + [NotebookStroke(id: UUID(), data: shared)]
@@ -250,6 +267,96 @@ final class NotebookHistoryTests: XCTestCase {
             XCTFail("Migration must validate logical archive bytes in every old state.")
         } catch NotebookRepositoryError.corruptData(_) {}
         try Fixtures.assertOriginalFiles(fixture, root: root, includeHead: true)
+    }
+
+    func testCheckpointPublicationWaitsForEncodedByteCreditOnLargeUnchangedState() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let repository = try NotebookRepository(rootURL: root)
+        let strokes = (1...128).map { Fixtures.asset(index: $0) }
+        let title = String(repeating: "t", count: 4_096)
+        var saved = try await repository.save(
+            id: id,
+            content: NotebookContent(title: title, pageCount: 3, strokes: strokes, editStamp: Fixtures.stamp(0)),
+            expectedRevisionID: nil
+        )
+        let layout = try Fixtures.layout(root: root, id: id)
+        let firstEvent = try Fixtures.object(at: layout.eventURL(saved.revisionID))
+        let bootstrapDigest = try XCTUnwrap(firstEvent["checkpointDigest"] as? String)
+        let bootstrapBytes = try Data(contentsOf: layout.checkpointURL(bootstrapDigest)).count
+        var credit = 0
+        var checkpoints = 0
+        for index in 1...100 {
+            saved = try await repository.save(
+                id: id,
+                content: NotebookContent(
+                    title: title, pageCount: 3, strokes: strokes, editStamp: Fixtures.stamp(index)
+                ),
+                expectedRevisionID: saved.revisionID
+            )
+            let eventURL = layout.eventURL(saved.revisionID)
+            let object = try Fixtures.object(at: eventURL)
+            let delta = try XCTUnwrap(object["delta"] as? [String: Any])
+            XCTAssertNil(delta["titleChange"])
+            XCTAssertNil(delta["pageCountChange"])
+            XCTAssertNil(delta["upserts"])
+            XCTAssertNil(delta["replacementOrder"])
+            credit += try Data(contentsOf: eventURL).count
+            if let digest = object["checkpointDigest"] as? String {
+                let bytes = try Data(contentsOf: layout.checkpointURL(digest)).count
+                XCTAssertGreaterThanOrEqual(credit, bytes, "An emitted checkpoint must be funded by encoded events.")
+                checkpoints += 1
+                credit = 0
+            } else if credit < bootstrapBytes {
+                XCTAssertEqual(try Fixtures.regularFiles(in: layout.checkpointsDirectory).count, checkpoints + 1)
+            }
+            if index == 20 {
+                XCTAssertLessThan(credit, bootstrapBytes)
+                XCTAssertEqual(checkpoints, 0, "A fixed edit interval cannot fund this large checkpoint.")
+            }
+        }
+        XCTAssertGreaterThan(checkpoints, 0, "Enough real event bytes must eventually fund a checkpoint.")
+        let events = try Fixtures.regularFiles(in: layout.eventsDirectory)
+        let eventBytes = try Fixtures.byteCount(in: layout.eventsDirectory)
+        let checkpointBytes = try Fixtures.byteCount(in: layout.checkpointsDirectory)
+        XCTAssertEqual(events.count, 101)
+        XCTAssertLessThanOrEqual(checkpointBytes, eventBytes + bootstrapBytes)
+        let reopened = try NotebookRepository(rootURL: root)
+        let current = try await reopened.load(id: id)
+        Fixtures.assertSame(try XCTUnwrap(current), saved)
+    }
+
+    func testAuthenticatedCheckpointWithoutSufficientByteCreditFailsPublicOpen() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let repository = try NotebookRepository(rootURL: root)
+        let strokes = (1...128).map { Fixtures.asset(index: $0) }
+        let content = NotebookContent(title: String(repeating: "t", count: 4_096), pageCount: 3, strokes: strokes)
+        let initial = try await repository.save(id: id, content: content, expectedRevisionID: nil)
+        let latest = try await repository.save(id: id, content: content, expectedRevisionID: initial.revisionID)
+        let layout = try Fixtures.layout(root: root, id: id)
+        let initialObject = try Fixtures.object(at: layout.eventURL(initial.revisionID))
+        let initialDigest = try XCTUnwrap(initialObject["checkpointDigest"] as? String)
+        var checkpoint = try Fixtures.object(at: layout.checkpointURL(initialDigest))
+        checkpoint["revisionID"] = latest.revisionID.uuidString
+        checkpoint["sequence"] = latest.sequence
+        let checkpointData = try JSONSerialization.data(withJSONObject: checkpoint, options: [.sortedKeys])
+        let checkpointDigest = Fixtures.digest(checkpointData)
+        try checkpointData.write(to: layout.checkpointURL(checkpointDigest))
+        var event = try Fixtures.object(at: layout.eventURL(latest.revisionID))
+        XCTAssertNil(event["checkpointDigest"])
+        event["checkpointDigest"] = checkpointDigest
+        let eventData = try JSONSerialization.data(withJSONObject: event, options: [.sortedKeys])
+        XCTAssertLessThan(eventData.count, checkpointData.count)
+        try eventData.write(to: layout.eventURL(latest.revisionID))
+        let headURL = layout.notebookDirectory.appendingPathComponent("HEAD.json")
+        var head = try Fixtures.object(at: headURL)
+        head["revisionDigest"] = Fixtures.digest(eventData)
+        try Fixtures.writeObject(head, to: headURL)
+        let reopened = try NotebookRepository(rootURL: root)
+        await assertCorruptLoad(reopened, id: id)
     }
 
     private func assertCorruptLoad(_ repository: NotebookRepository, id: UUID) async {
