@@ -571,6 +571,8 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.content.strokes, [stroke])
         let history = try await healthy.auditHistory(id: id)
         XCTAssertEqual(history.revisionCount, 2)
+        let report = await healthy.maintenanceReport()
+        XCTAssertEqual(report[.repairedAsset], 1)
     }
 
     func testOversizedMetadataIsRejectedBeforeDecoding() async throws {
@@ -1155,6 +1157,8 @@ final class NotebookRepositoryTests: XCTestCase {
             let audit = try await repository.auditHistory(id: id)
             XCTAssertEqual(audit.revisionCount, 2)
             XCTAssertEqual(audit.verifiedAssetCount, 1)
+            let report = await repository.maintenanceReport()
+            XCTAssertEqual(report[.repairedAsset], 1)
         }
     }
 
@@ -1175,6 +1179,8 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.revisionID, second.revisionID)
         let audit = try await repository.auditHistory(id: id)
         XCTAssertEqual(audit.verifiedAssetCount, 1)
+        let report = await repository.maintenanceReport()
+        XCTAssertEqual(report[.repairedAsset], 1)
     }
 
     func testAssetRepairPublicationFaultsKeepHeadAndPermitRetry() async throws {

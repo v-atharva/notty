@@ -25,6 +25,7 @@ enum NotebookFileSystem {
         case skippedNonRegularStage
         case removedStage
         case limitReached
+        case repairedAsset
         case failed(MaintenanceFailure)
     }
 
@@ -189,17 +190,25 @@ enum NotebookFileSystem {
         guard prefixes.allSatisfy({ [".creation-", ".recovery-", ".migration-"].contains($0) }) else {
             throw NotebookRepositoryError.unsafePath("Unknown storage transaction namespace.")
         }
-        var removed = 0
-        try visitChildren(
-            in: root, limit: 2_048, location: .library, observer: observer
-        ) { entry in
-            guard let owner = prefixes.first(where: {
-                isTransactionName(entry.lastPathComponent, prefix: $0)
-            }) else { return true }
-            try removePrivateTransaction(entry, prefix: owner, observer: observer)
-            removed += 1
-            if removed == 16 { observer?(.limitReached) }
-            return removed < 16
+        var attempted = 0
+        do {
+            try visitChildren(
+                in: root, limit: 2_048, location: .library, observer: observer
+            ) { entry in
+                guard let owner = prefixes.first(where: {
+                    isTransactionName(entry.lastPathComponent, prefix: $0)
+                }) else { return true }
+                attempted += 1
+                do {
+                    try removePrivateTransaction(entry, prefix: owner, observer: observer)
+                } catch {
+                    observer?(.failed(maintenanceFailure(for: error)))
+                }
+                if attempted == 16 { observer?(.limitReached) }
+                return attempted < 16
+            }
+        } catch {
+            observer?(.failed(maintenanceFailure(for: error)))
         }
     }
 
