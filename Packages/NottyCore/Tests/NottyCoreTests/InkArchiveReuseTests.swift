@@ -309,6 +309,34 @@ final class InkArchiveReuseTests: XCTestCase {
         )
     }
 
+
+    func testRareWholeFallbackRejectsChangedIDsAndOrderBeforeNativeComparison() throws {
+        var first = stroke()
+        first.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        var second = stroke(x: 120)
+        second.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 30, y: 40))
+        let drawing = PKDrawing(strokes: [first, second])
+        let original = try InkDrawingSignature(
+            drawing, forceRenderStateEncodingFallback: false,
+            forceNativeDrawingEqualityFallback: true
+        )
+        var relabeled = first
+        relabeled.id = UUID()
+        for changed in [
+            PKDrawing(strokes: [relabeled, second]),
+            PKDrawing(strokes: [second, first]),
+            PKDrawing(strokes: [first])
+        ] {
+            let signature = try InkDrawingSignature(
+                changed, forceRenderStateEncodingFallback: false,
+                forceNativeDrawingEqualityFallback: true
+            )
+            let comparison = original.compared(to: signature)
+            XCTAssertFalse(comparison.isEqual)
+            XCTAssertEqual(comparison.work.nativeDrawingEqualityFallbacks, 0)
+        }
+    }
+
     func testOneStrokeChangeMetricsExposeExactFallbackWorkAtOneHundredAndTwoThousand() async throws {
         for count in [100, 2_000] {
             let strokes = (0..<count).map { stroke(x: CGFloat($0) * 10) }

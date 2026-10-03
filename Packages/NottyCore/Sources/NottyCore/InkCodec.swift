@@ -395,15 +395,21 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
         if captureID == other.captureID {
             return Comparison(isEqual: true, work: work)
         }
+        guard entries.count == other.entries.count else {
+            return Comparison(isEqual: false, work: work)
+        }
         if nativeDrawingFallback != nil || other.nativeDrawingFallback != nil {
+            for (first, second) in zip(entries, other.entries) {
+                work.signatureChecks += 1
+                guard first.id == second.id else {
+                    return Comparison(isEqual: false, work: work)
+                }
+            }
             guard let first = nativeDrawingFallback, let second = other.nativeDrawingFallback else {
                 return Comparison(isEqual: false, work: work)
             }
             work.nativeDrawingEqualityFallbacks += 1
             return Comparison(isEqual: first == second, work: work)
-        }
-        guard entries.count == other.entries.count else {
-            return Comparison(isEqual: false, work: work)
         }
         for (first, second) in zip(entries, other.entries) {
             guard first.id == second.id,
