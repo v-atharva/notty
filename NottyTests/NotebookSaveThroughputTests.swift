@@ -42,6 +42,13 @@ final class NotebookSaveThroughputTests: XCTestCase {
         let session = NotebookSession(notebookID: id, openStorage: { forwarded })
         await session.load()
         XCTAssertEqual(session.loadState, .ready)
+        XCTAssertNotNil(forwarded.openForEditing)
+        XCTAssertNotNil(forwarded.captureHistoryPin)
+        XCTAssertNotNil(forwarded.auditHistory)
+        try await requireReady {
+            if case .verified = session.integrityModel.state { return true }
+            return false
+        }
         let seed = session.makeCanvasSeed()
         let controller = NotebookViewController(
             pageCount: seed.pageCount, initialDrawing: seed.drawing
@@ -444,6 +451,9 @@ private actor ThroughputStorageTrace {
             load: storage.load, save: storage.save, preserve: storage.preserve,
             listRecovery: storage.listRecovery, loadRecovery: storage.loadRecovery,
             storageMetrics: storage.storageMetrics,
+            openForEditing: storage.openForEditing,
+            captureHistoryPin: storage.captureHistoryPin,
+            auditHistory: storage.auditHistory,
             saveBatch: { try await self.saveBatch($0, revision: $1) }
         )
     }

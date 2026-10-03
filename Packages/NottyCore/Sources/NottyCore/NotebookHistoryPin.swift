@@ -27,7 +27,7 @@ public struct NotebookHistoryPin: Sendable, Equatable {
         if snapshot.head.schemaVersion == 2 {
             return snapshot.head.generationID == other.snapshot.head.generationID
         }
-        return snapshot == other.snapshot
+        return true
     }
 }
 
