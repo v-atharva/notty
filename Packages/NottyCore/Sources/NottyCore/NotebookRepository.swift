@@ -203,6 +203,7 @@ public actor NotebookRepository {
             guard let snapshot = try history.readHeadSnapshot() else {
                 throw NotebookRepositoryError.recoveryRequired
             }
+            observeHistorySnapshot(snapshot, id: id)
             guard snapshot.head.revisionID == expectedRevisionID else {
                 throw NotebookRepositoryError.revisionConflict
             }
@@ -658,12 +659,16 @@ public actor NotebookRepository {
         guard let snapshot = try history.readHeadSnapshot() else {
             throw NotebookRepositoryError.recoveryRequired
         }
+        observeHistorySnapshot(snapshot, id: id)
+        return (history, snapshot)
+    }
+
+    private func observeHistorySnapshot(_ snapshot: NotebookHistory.HeadSnapshot, id: UUID) {
         if let cached = validatedGenerations[id] {
             if cached.snapshot != snapshot { invalidateValidation(id) }
         } else if let cached = metadataGenerations[id], cached.snapshot != snapshot {
             invalidateValidation(id)
         }
-        return (history, snapshot)
     }
 
     private func selectedHistory(id: UUID) throws -> (NotebookHistory, Format.Head) {
