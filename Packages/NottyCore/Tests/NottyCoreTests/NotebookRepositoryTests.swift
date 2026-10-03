@@ -1213,12 +1213,13 @@ final class NotebookRepositoryTests: XCTestCase {
                 XCTAssertEqual(try Data(contentsOf: headURL), headBytes)
                 XCTAssertEqual(try Data(contentsOf: asset), target == .assetStaged ? damaged : stroke.data)
                 XCTAssertFalse(try fileSnapshot(root: directory).keys.contains { $0.hasSuffix(".tmp") })
-                let second = try await healthy.save(
+                let retry = try NotebookRepository(rootURL: root)
+                let second = try await retry.save(
                     id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
                 )
                 XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
                 XCTAssertEqual(second.sequence, 2)
-                let audit = try await healthy.auditHistory(id: id)
+                let audit = try await retry.auditHistory(id: id)
                 XCTAssertEqual(audit.revisionCount, 2)
             }
         }

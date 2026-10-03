@@ -33,7 +33,7 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         let small = try await appendMetrics(strokeCount: 100)
         let large = try await appendMetrics(strokeCount: 2_000)
         for key in [
-            "assetHashBytes", "metadataHashBytes", "assetReadBytes", "metadataReadBytes",
+            "assetCopiedBytes", "assetHashBytes", "metadataHashBytes", "assetReadBytes", "metadataReadBytes",
             "assetWrittenBytes", "metadataWrittenBytes", "metadataEncodedBytes"
         ] {
             XCTAssertLessThanOrEqual(Double(large[key, default: 0]), Double(small[key, default: 0]) * 1.5, key)
@@ -67,10 +67,12 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertNil(publicStroke.cachedDigest)
         let first = try await repository.save(id: id, content: content([publicStroke]), expectedRevisionID: nil)
         let initial = await repository.storageMetrics()
+        XCTAssertEqual(initial.assetCopiedBytes, data.count)
         XCTAssertEqual(initial.assetHashCalls, 1)
         XCTAssertEqual(initial.assetHashBytes, data.count)
         _ = try await repository.save(id: id, content: content([trusted]), expectedRevisionID: first.revisionID)
         let after = await repository.storageMetrics()
+        XCTAssertEqual(after.assetCopiedBytes, initial.assetCopiedBytes)
         XCTAssertEqual(after.assetHashBytes, initial.assetHashBytes)
         XCTAssertEqual(after.assetReadCalls, initial.assetReadCalls)
     }
@@ -470,6 +472,74 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: headURL), bytes)
     }
 
+    func testPublicAliasedArchiveIsOwnedBeforeHashPublicationAndSingleReceipt() async throws {
+        for batch in [false, true] {
+            let root = try makeRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let id = UUID()
+            let original = Data(repeating: 27, count: 1_024)
+            let alias = AliasedArchive(original)
+            let input = NotebookStroke(id: UUID(), data: alias.data)
+            let repository = try NotebookRepository(rootURL: root, faultInjector: { stage in
+                if stage == .assetStaged { alias.mutate() }
+            })
+            let accepted: StoredNotebook?
+            if batch {
+                let result = try await repository.saveBatch(
+                    id: id, edits: [NotebookSaveEdit(id: UUID(), content: content([input]))],
+                    expectedRevisionID: nil
+                )
+                XCTAssertEqual(result.committed.count, 1)
+                accepted = nil
+            } else {
+                accepted = try await repository.save(id: id, content: content([input]), expectedRevisionID: nil)
+            }
+            XCTAssertNotEqual(input.data, original)
+            if let accepted {
+                XCTAssertEqual(accepted.content.strokes[0].data, original)
+                XCTAssertEqual(accepted.content.strokes[0].cachedDigest, NotebookDigest.sha256(original))
+            }
+            let metrics = await repository.storageMetrics()
+            XCTAssertEqual(metrics.assetCopiedBytes, original.count)
+            XCTAssertEqual(metrics.assetHashCalls, 1)
+            XCTAssertEqual(metrics.assetHashBytes, original.count)
+            let loadedValue = try await repository.load(id: id)
+            let loaded = try XCTUnwrap(loadedValue)
+            XCTAssertEqual(loaded.content.strokes[0].data, original)
+            XCTAssertEqual(loaded.content.strokes[0].cachedDigest, NotebookDigest.sha256(original))
+        }
+    }
+
+    func testSameRepositoryPublicationFailureDiscardsReceiptsBeforeRepairRetry() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let original = stroke(1)
+        let added = stroke(2)
+        let fault = PublicationFault(stage: .assetStaged, occurrence: 2)
+        let repository = try NotebookRepository(rootURL: root, faultInjector: { try fault.visit($0) })
+        let first = try await repository.save(id: id, content: content([original]), expectedRevisionID: nil)
+        do {
+            _ = try await repository.save(id: id, content: content([original, added]), expectedRevisionID: first.revisionID)
+            XCTFail("The publication fault did not occur.")
+        } catch {
+            XCTAssertTrue(error is PublicationFailure)
+        }
+        let asset = notebook(root, id).appendingPathComponent("assets/\(NotebookDigest.sha256(original.data)).stroke")
+        try Data("damaged after failed attempt".utf8).write(to: asset)
+        fault.disable()
+        let before = await repository.storageMetrics()
+        let retried = try await repository.save(
+            id: id, content: content([original, added]), expectedRevisionID: first.revisionID
+        )
+        let after = await repository.storageMetrics()
+        XCTAssertGreaterThan(after.assetReadCalls, before.assetReadCalls)
+        XCTAssertEqual(try Data(contentsOf: asset), original.data)
+        XCTAssertEqual(retried.sequence, 2)
+        let audit = try await repository.auditHistory(id: id)
+        XCTAssertEqual(audit.revisionCount, 2)
+    }
+
     private func appendMetrics(strokeCount: Int) async throws -> [String: Int] {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -488,6 +558,8 @@ final class NotebookIncrementalStorageTests: XCTestCase {
 
     private func difference(_ before: NotebookStorageMetrics, _ after: NotebookStorageMetrics) -> [String: Int] {
         [
+            "assetCopiedBytes": after.assetCopiedBytes - before.assetCopiedBytes,
+            "inputReferenceVisits": after.inputReferenceVisits - before.inputReferenceVisits,
             "assetHashBytes": after.assetHashBytes - before.assetHashBytes,
             "metadataHashBytes": after.metadataHashBytes - before.metadataHashBytes,
             "assetReadCalls": after.assetReadCalls - before.assetReadCalls,
@@ -557,4 +629,21 @@ private final class PublicationFault: @unchecked Sendable {
         defer { lock.unlock() }
         enabled = false
     }
+}
+
+private final class AliasedArchive: @unchecked Sendable {
+    private let pointer: UnsafeMutableRawPointer
+    let data: Data
+
+    init(_ original: Data) {
+        pointer = UnsafeMutableRawPointer.allocate(byteCount: original.count, alignment: 1)
+        original.copyBytes(to: pointer.assumingMemoryBound(to: UInt8.self), count: original.count)
+        data = Data(bytesNoCopy: pointer, count: original.count, deallocator: .none)
+    }
+
+    func mutate() {
+        pointer.initializeMemory(as: UInt8.self, repeating: 0, count: data.count)
+    }
+
+    deinit { pointer.deallocate() }
 }
