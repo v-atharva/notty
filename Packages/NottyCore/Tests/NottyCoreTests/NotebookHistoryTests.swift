@@ -151,6 +151,50 @@ final class NotebookHistoryTests: XCTestCase {
         }
     }
 
+    func testOversizedReachableHistoricalFilesFailAsCorruptionWithoutChangingHead() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let repository = try NotebookRepository(rootURL: root)
+        var saved: [StoredNotebook] = []
+        for content in Fixtures.contents() {
+            saved.append(try await repository.save(
+                id: id, content: content, expectedRevisionID: saved.last?.revisionID
+            ))
+        }
+        let layout = try Fixtures.layout(root: root, id: id)
+        let first = try XCTUnwrap(saved.first)
+        let oldEvent = layout.eventURL(first.revisionID)
+        let eventObject = try Fixtures.object(at: oldEvent)
+        let checkpointDigest = try XCTUnwrap(eventObject["checkpointDigest"] as? String)
+        let oldCheckpoint = layout.checkpointURL(checkpointDigest)
+        let historicalStroke = saved[1].content.strokes[0]
+        XCTAssertFalse(saved.last!.content.strokes.contains { $0.data == historicalStroke.data })
+        let historicalAsset = layout.notebookDirectory.appendingPathComponent(
+            "assets/\(Fixtures.digest(historicalStroke.data)).stroke"
+        )
+        let headURL = layout.notebookDirectory.appendingPathComponent("HEAD.json")
+        let originalHead = try Data(contentsOf: headURL)
+        for (url, bytes) in [
+            (oldEvent, 2 * 1_024 * 1_024 + 1),
+            (oldCheckpoint, 2 * 1_024 * 1_024 + 1),
+            (historicalAsset, 10 * 1_024 * 1_024 + 1)
+        ] {
+            let original = try Data(contentsOf: url)
+            try Data(repeating: 0, count: bytes).write(to: url)
+            let reader = try NotebookRepository(rootURL: root)
+            await assertCorruptLoad(reader, id: id)
+            do {
+                _ = try await reader.auditHistory(id: id)
+                XCTFail("Oversized retained history is corrupt committed data.")
+            } catch NotebookRepositoryError.corruptData(_) {}
+            XCTAssertEqual(try Data(contentsOf: headURL), originalHead)
+            try original.write(to: url)
+        }
+        let restored = try await repository.load(id: id)
+        Fixtures.assertSame(try XCTUnwrap(restored), try XCTUnwrap(saved.last))
+    }
+
     func testMalformedUnreferencedEventsCheckpointsAssetsAndGenerationsRemainIrrelevant() async throws {
         let root = try Fixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
