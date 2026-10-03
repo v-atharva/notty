@@ -397,7 +397,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         canvas.drawing = PKDrawing(strokes: [moved])
         events.removeAll()
         controller.tearDown()
-        XCTAssertEqual(events, ["observed", "detached"])
+        XCTAssertEqual(events, ["observed", "interrupted", "detached"])
         XCTAssertFalse(canvas.isDrawingEnabled)
     }
 

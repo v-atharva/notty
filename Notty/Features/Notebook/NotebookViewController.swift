@@ -262,6 +262,7 @@ final class NotebookViewController: UIViewController {
     }
 
     private func refreshUndoManager() {
+        guard !isTornDown else { return }
         guard let manager = canvas.nativeUndoManager, manager !== retainedUndoManager else { return }
         for observer in undoObservers { NotificationCenter.default.removeObserver(observer) }
         undoObservers.removeAll()
@@ -376,12 +377,13 @@ final class NotebookViewController: UIViewController {
         undoObservers.removeAll()
         retainedUndoManager?.removeAllActions()
         retainedUndoManager = nil
-        onDetach?()
-        onDetach = nil
+        onInteractionInterrupted?()
         inputGate = .readOnly
         canvas.permitsMutation = false
         canvas.permitsHistoryAccess = false
         resetActiveTool()
+        onDetach?()
+        onDetach = nil
         if let scenePickerOwner {
             scenePickerOwner.detach(self)
         } else if observesToolPicker {
