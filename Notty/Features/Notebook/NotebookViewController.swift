@@ -8,11 +8,13 @@ final class NotebookViewController: UIViewController {
 
     private let geometry = PaperGeometry(pageWidth: 794)
     private let logicalWidth: CGFloat = 794
-    private let canvas = PKCanvasView()
+    private let canvas = NotebookCanvasView()
     private let paper = PaperBackgroundView()
     private let toolPicker = PKToolPicker()
 
     var onCompletedEdit: ((PKDrawing) -> Bool)?
+    var onDetach: (() -> Void)?
+    var canvasView: PKCanvasView { canvas }
     var currentDrawing: PKDrawing { canvas.drawing }
 
     private let initialDrawing: PKDrawing
@@ -52,7 +54,7 @@ final class NotebookViewController: UIViewController {
 
         canvas.drawing = initialDrawing
         canvas.delegate = self
-        canvas.isUserInteractionEnabled = editingEnabled
+        canvas.permitsMutation = editingEnabled
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.drawingPolicy = .pencilOnly
@@ -132,8 +134,8 @@ final class NotebookViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         guard observesToolPicker else { return }
-        toolPicker.setVisible(true, forFirstResponder: canvas)
-        canvas.becomeFirstResponder()
+        toolPicker.setVisible(editingEnabled, forFirstResponder: canvas)
+        if editingEnabled { canvas.becomeFirstResponder() }
         updateInsets()
         updatePaperViewport()
     }
@@ -147,7 +149,14 @@ final class NotebookViewController: UIViewController {
     func setEditingEnabled(_ enabled: Bool) {
         editingEnabled = enabled
         if isViewLoaded {
-            canvas.isUserInteractionEnabled = enabled
+            canvas.permitsMutation = enabled
+            toolPicker.setVisible(enabled && view.window != nil, forFirstResponder: canvas)
+            if enabled && view.window != nil {
+                canvas.becomeFirstResponder()
+            } else if !enabled {
+                canvas.resignFirstResponder()
+            }
+            updateInsets()
         }
     }
 
@@ -177,6 +186,9 @@ final class NotebookViewController: UIViewController {
 
     func tearDown() {
         deliverCompletedDrawing()
+        onDetach?()
+        onDetach = nil
+        onCompletedEdit = nil
         guard observesToolPicker else { return }
         toolPicker.setVisible(false, forFirstResponder: canvas)
         toolPicker.removeObserver(canvas)
@@ -328,4 +340,56 @@ private final class PaperBackgroundView: UIView {
         context.strokePath()
         context.restoreGState()
     }
+}
+
+@MainActor
+private final class NotebookCanvasView: PKCanvasView {
+    var permitsMutation = true {
+        didSet {
+            isDrawingEnabled = permitsMutation
+            drawingGestureRecognizer.isEnabled = permitsMutation
+        }
+    }
+
+    override func paste(_ sender: Any?) {
+        guard permitsMutation else { return }
+        super.paste(sender)
+    }
+
+    override func cut(_ sender: Any?) {
+        guard permitsMutation else { return }
+        super.cut(sender)
+    }
+
+    override func delete(_ sender: Any?) {
+        guard permitsMutation else { return }
+        super.delete(sender)
+    }
+
+    override func paste(itemProviders: [NSItemProvider]) {
+        guard permitsMutation else { return }
+        super.paste(itemProviders: itemProviders)
+    }
+
+    override func canPaste(_ itemProviders: [NSItemProvider]) -> Bool {
+        permitsMutation && super.canPaste(itemProviders)
+    }
+
+    override var undoManager: UndoManager? {
+        permitsMutation ? super.undoManager : nil
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if !permitsMutation && Self.mutationActions.contains(action) { return false }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func target(forAction action: Selector, withSender sender: Any?) -> Any? {
+        if !permitsMutation && Self.mutationActions.contains(action) { return nil }
+        return super.target(forAction: action, withSender: sender)
+    }
+
+    private static let mutationActions: Set<Selector> = Set([
+        "cut:", "paste:", "delete:", "undo:", "redo:", "duplicate:"
+    ].map(NSSelectorFromString))
 }

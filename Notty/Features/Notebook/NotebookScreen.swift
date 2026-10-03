@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 struct NotebookScreen: View {
     @StateObject private var session = NotebookSession()
+    @State private var showsRecoveryCopies = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -12,21 +13,18 @@ struct NotebookScreen: View {
                 case .loading:
                     ProgressView("Opening notebook")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .failed:
+                case .failed(let failure):
                     ContentUnavailableView {
                         Label("Couldn't open notebook", systemImage: "exclamationmark.triangle")
                     } description: {
-                        Text("Your saved files have not been replaced.")
+                        Text(failure.message)
                     } actions: {
-                        Button("Retry") {
-                            Task { await session.load() }
-                        }
+                        Button("Try opening again") { Task { await session.load() } }
                     }
                 case .ready:
                     NotebookCanvas(session: session)
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            saveStatus
-                        }
+                        .id(session.canvasGeneration)
+                        .safeAreaInset(edge: .bottom, spacing: 0) { saveStatus }
                 }
             }
             .background(Color(red: 0.98, green: 0.96, blue: 0.91))
@@ -39,7 +37,12 @@ struct NotebookScreen: View {
                         .foregroundStyle(Color(red: 0.28, green: 0.23, blue: 0.18))
                         .accessibilityLabel("Notty")
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showsRecoveryCopies = true
+                    } label: {
+                        Label("Recovery copies", systemImage: "clock.arrow.circlepath")
+                    }
                     Button {
                         session.extendPaper()
                     } label: {
@@ -54,6 +57,7 @@ struct NotebookScreen: View {
         }
         .tint(Color(red: 0.36, green: 0.29, blue: 0.22))
         .preferredColorScheme(.light)
+        .sheet(isPresented: $showsRecoveryCopies) { NotebookRecoveryView(session: session) }
         .task { await session.load() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { session.flush() }
@@ -63,25 +67,44 @@ struct NotebookScreen: View {
 
     @ViewBuilder
     private var saveStatus: some View {
-        HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             switch session.saveState {
             case .idle:
                 Text("Ready")
             case .saving:
-                ProgressView()
-                    .controlSize(.small)
-                Text(session.inputPaused ? "Catching up on saves…" : "Saving…")
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(session.inputPaused ? "Catching up on saves…" : "Saving…")
+                }
             case .saved(let date):
-                Image(systemName: "checkmark.circle")
-                Text("Saved \(date.formatted(date: .omitted, time: .shortened))")
-            case .failed:
-                Image(systemName: "exclamationmark.triangle")
-                Text("Changes are waiting to save.")
-                Spacer(minLength: 8)
-                Button("Retry", action: session.retrySave)
+                Label("Saved \(date.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+            case .failed(let cause):
+                Label(cause.title, systemImage: "exclamationmark.triangle").fontWeight(.semibold)
+                Text(cause.message)
+                Text("Writing is paused. You can scroll and zoom.")
+                HStack(spacing: 16) {
+                    if cause.canRetry {
+                        Button("Retry save", action: session.retrySave)
+                            .disabled(session.isPerformingRecovery)
+                    }
+                    Button("Preserve recovery copy") {
+                        Task { await session.saveRecoveryCopy() }
+                    }
+                    .disabled(!session.canPreserveRecovery)
+                    if session.canReopenSaved {
+                        Button("Reopen saved notebook") {
+                            Task { await session.reopenSavedNotebook() }
+                        }
+                    }
+                }
             }
-            Spacer(minLength: 0)
+            if session.isPerformingRecovery {
+                ProgressView("Preserving or opening notebook")
+            }
+            if let message = session.recoveryMessage { Text(message) }
+            if let failure = session.recoveryFailure { Text(failure.title).fontWeight(.semibold) }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.footnote)
         .foregroundStyle(Color(red: 0.28, green: 0.23, blue: 0.18))
         .padding(.horizontal, 16)

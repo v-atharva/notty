@@ -8,6 +8,7 @@ on:
     paths:
       - "Notty/**"
       - "Notty.xcodeproj/**"
+      - "NottyTests/**"
       - "Packages/**"
       - ".github/workflows/native-checks.yml"
 
@@ -20,7 +21,7 @@ concurrency:
 
 jobs:
   native-checks:
-    name: Core tests and unsigned iPad builds
+    name: Core and iPad tests, unsigned builds
     runs-on: xcode-27
     timeout-minutes: 15
     env:
@@ -54,6 +55,11 @@ jobs:
         run: |
           xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2
 
+      - name: Prepare iPad test simulator
+        run: |
+          NOTTY_SIMULATOR_ID=$(xcrun simctl list devices available --json | jq -er '.devices | to_entries | map(select(.key | endswith(".iOS-27-0"))) | map(.value[]) | map(select(.isAvailable and (.name | startswith("iPad")))) | sort_by(.name) | .[0].udid // error("No iPadOS 27.0 simulator is available")')
+          printf 'NOTTY_SIMULATOR_ID=%s\n' "$NOTTY_SIMULATOR_ID" >> "$GITHUB_ENV"
+          xcrun simctl bootstatus "$NOTTY_SIMULATOR_ID" -b
       - name: Compile unsigned iPad simulator app
         run: |
           xcodebuild \
@@ -80,6 +86,25 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
+      - name: Test native notebook session and canvas
+        run: |
+          xcodebuild \
+            -project Notty.xcodeproj \
+            -scheme Notty \
+            -configuration Debug \
+            -sdk iphonesimulator27.0 \
+            -destination "platform=iOS Simulator,id=$NOTTY_SIMULATOR_ID" \
+            -parallel-testing-enabled NO \
+            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
+            -resultBundlePath "$RUNNER_TEMP/NottyNativeTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            test
+          xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/NottyNativeTests.xcresult"
+
+      - name: Shut down test simulator
+        if: always() && env.NOTTY_SIMULATOR_ID != ''
+        run: xcrun simctl shutdown "$NOTTY_SIMULATOR_ID" || true
       - name: Record result
         if: always()
         run: |
@@ -87,5 +112,5 @@ jobs:
             printf '### Native checks\n\n'
             printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
             printf 'Job result: `%s`\n\n' "${{ job.status }}"
-            printf 'Unsigned simulator/device compilation and macOS storage, geometry, and native stroke tests. Physical iPad acceptance is pending.\n'
+            printf 'Unsigned simulator/device compilation, macOS core tests and hosted iPad simulator tests. Physical iPad acceptance is pending.\n'
           } >> "$GITHUB_STEP_SUMMARY"
