@@ -3,10 +3,22 @@ import Foundation
 public struct NotebookStroke: Sendable, Equatable {
     public let id: UUID
     public let data: Data
+    let cachedDigest: String?
 
     public init(id: UUID, data: Data) {
         self.id = id
         self.data = data
+        self.cachedDigest = nil
+    }
+
+    init(id: UUID, data: Data, validatedDigest: String) {
+        self.id = id
+        self.data = data
+        self.cachedDigest = validatedDigest
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.data == rhs.data
     }
 }
 
