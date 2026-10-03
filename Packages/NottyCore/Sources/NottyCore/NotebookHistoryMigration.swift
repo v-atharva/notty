@@ -46,13 +46,14 @@ struct NotebookHistoryMigration {
         try NotebookFileSystem.writeSynchronized(
             oldHeadData, to: generation.appendingPathComponent("legacy-head.json")
         )
+        history.metrics?.record(\.metadataWrittenBytes, oldHeadData.count)
         try fault?(.legacyHeadPreserved)
         var parent: Format.Head?
         var previous = Format.State.empty
         var credit = 0
         let writer = NotebookHistoryWriter(
             notebookID: history.notebookID, generationID: generationID, generation: generation,
-            writeFault: nil, migrationFault: fault
+            writeFault: nil, migrationFault: fault, metrics: history.metrics
         )
         for link in links {
             let legacy = try history.readLegacy(link)
@@ -79,7 +80,7 @@ struct NotebookHistoryMigration {
         try NotebookFileSystem.publishImmutable(generation, to: stagedGeneration)
         let staged = NotebookHistory(
             directory: stagedDirectory, notebookID: history.notebookID, assetVerificationObserver: nil,
-            assetDirectory: history.directory.appendingPathComponent("assets", isDirectory: true)
+            assetDirectory: history.directory.appendingPathComponent("assets", isDirectory: true), metrics: history.metrics
         )
         var state = Format.State.empty
         for link in links {
@@ -112,14 +113,15 @@ struct NotebookHistoryMigration {
         )
         let record = Record(
             schemaVersion: 1, receipt: publicReceipt,
-            legacyHeadDigest: Format.digest(oldHeadData), anchor: anchor,
+            legacyHeadDigest: Format.digest(oldHeadData, metrics: history.metrics), anchor: anchor,
             legacyChainDigest: chainDigest(links)
         )
-        let recordData = try Format.encode(record)
+        let recordData = try Format.encode(record, metrics: history.metrics)
         try NotebookFileSystem.writeSynchronized(
             recordData, to: stagedGeneration.appendingPathComponent("migration.json")
         )
-        let selected = selectedHead(record, digest: Format.digest(recordData))
+        history.metrics?.record(\.metadataWrittenBytes, recordData.count)
+        let selected = selectedHead(record, digest: Format.digest(recordData, metrics: history.metrics))
         let destinationRoot = history.directory.appendingPathComponent("history", isDirectory: true)
         try NotebookFileSystem.ensureDirectory(destinationRoot)
         let destination = destinationRoot.appendingPathComponent(
@@ -132,12 +134,15 @@ struct NotebookHistoryMigration {
               try history.readMetadata(oldHeadURL) == oldHeadData else {
             throw NotebookRepositoryError.revisionConflict
         }
+        let selectedData = try Format.encode(selected, metrics: history.metrics)
         try NotebookFileSystem.withSynchronizedStage(
-            try Format.encode(selected), in: history.directory, head: true
+            selectedData, in: history.directory, head: true
         ) { stage in
+            history.metrics?.record(\.metadataWrittenBytes, selectedData.count)
             try fault?(.headStaged)
             try fault?(.beforeHeadPublication)
             try NotebookFileSystem.replaceAtomically(stage, destination: oldHeadURL)
+            history.metrics?.record(\.headPublications)
         }
         return (selected, publicReceipt)
     }
@@ -164,11 +169,13 @@ struct NotebookHistoryMigration {
         try NotebookFileSystem.withSynchronizedStage(
             stored.legacyHeadData, in: history.directory, head: true
         ) { stage in
+            history.metrics?.record(\.metadataWrittenBytes, stored.legacyHeadData.count)
             try fault?(.headStaged)
             try fault?(.beforeHeadPublication)
             try NotebookFileSystem.replaceAtomically(
                 stage, destination: history.directory.appendingPathComponent("HEAD.json")
             )
+            history.metrics?.record(\.headPublications)
         }
         return StoredNotebook(
             id: history.notebookID, revisionID: current.revisionID, sequence: current.sequence,
@@ -192,7 +199,7 @@ struct NotebookHistoryMigration {
         }
         let generation = try history.generationDirectory(head)
         let data = try history.readMetadata(generation.appendingPathComponent("migration.json"))
-        guard Format.digest(data) == digest else {
+        guard Format.digest(data, metrics: history.metrics) == digest else {
             throw NotebookRepositoryError.corruptData("The migration receipt failed integrity validation.")
         }
         let record: Record = try Format.decode(data)
@@ -209,7 +216,7 @@ struct NotebookHistoryMigration {
             throw NotebookRepositoryError.corruptData("The migration receipt has invalid anchor metadata.")
         }
         let legacyData = try history.readMetadata(generation.appendingPathComponent("legacy-head.json"))
-        guard Format.digest(legacyData) == record.legacyHeadDigest else {
+        guard Format.digest(legacyData, metrics: history.metrics) == record.legacyHeadDigest else {
             throw NotebookRepositoryError.corruptData("The preserved legacy HEAD failed integrity validation.")
         }
         let legacy: Format.Head = try Format.decode(legacyData)
@@ -231,10 +238,13 @@ struct NotebookHistoryMigration {
 
     private func chainDigest(_ links: [NotebookHistory.Link]) -> String {
         var hash = SHA256()
+        history.metrics?.record(\.metadataHashCalls)
         for link in links {
-            hash.update(data: Data("\(link.revisionID.uuidString.lowercased()):\(link.digest)\n".utf8))
+            let data = Data("\(link.revisionID.uuidString.lowercased()):\(link.digest)\n".utf8)
+            history.metrics?.record(\.metadataHashBytes, data.count)
+            hash.update(data: data)
         }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        return NotebookDigest.lowercaseHex(hash.finalize())
     }
 
     private func selectedHead(_ record: Record, digest: String) -> Format.Head {

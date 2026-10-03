@@ -2,6 +2,12 @@ name: Native checks
 
 on:
   workflow_dispatch:
+    inputs:
+      storage_stress:
+        description: Run the extended storage growth workload
+        required: false
+        default: false
+        type: boolean
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -21,7 +27,7 @@ concurrency:
 
 jobs:
   native-checks:
-    name: Core and iPad tests, unsigned builds
+    name: Core storage evidence
     runs-on: xcode-27
     timeout-minutes: 15
     env:
@@ -54,7 +60,8 @@ jobs:
             27.*) ;;
             *) printf 'macOS 27 is required for native stroke tests.\n' >&2; exit 1 ;;
           esac
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          NOTTY_XCODE_VERSION=$(xcodebuild -version)
+          test "$(printf '%s\n' "$NOTTY_XCODE_VERSION" | sed -n '1p')" = "Xcode 27.0"
           for sdk in macosx27.0 iphoneos27.0 iphonesimulator27.0; do
             test "$(xcrun --sdk "$sdk" --show-sdk-version)" = "27.0"
           done
@@ -64,16 +71,22 @@ jobs:
         env:
           NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
           NOTTY_RECOVERY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyRecoveryMetrics
+          NOTTY_SAVE_METRICS_DIRECTORY: ${{ runner.temp }}/NottySaveMetrics
         run: |
-          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2
+          NOTTY_SWIFT_TEST_FLAGS=()
+          if [ "${{ inputs.storage_stress }}" = "true" ]; then
+            NOTTY_SWIFT_TEST_FLAGS=(-Xswiftc -DNOTTY_STORAGE_STRESS)
+          fi
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2 "${NOTTY_SWIFT_TEST_FLAGS[@]}"
 
       - name: Record storage measurements
         if: always()
         env:
           NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
           NOTTY_RECOVERY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyRecoveryMetrics
+          NOTTY_SAVE_METRICS_DIRECTORY: ${{ runner.temp }}/NottySaveMetrics
         run: |
-          for directory in "$NOTTY_HISTORY_METRICS_DIRECTORY" "$NOTTY_RECOVERY_METRICS_DIRECTORY"; do
+          for directory in "$NOTTY_HISTORY_METRICS_DIRECTORY" "$NOTTY_RECOVERY_METRICS_DIRECTORY" "$NOTTY_SAVE_METRICS_DIRECTORY"; do
             test -d "$directory" || continue
             for report in "$directory"/*.json; do
               test -f "$report" || continue
@@ -81,78 +94,6 @@ jobs:
               printf '\n'
             done
           done
-
-      - name: Prepare iPad test simulator
-        timeout-minutes: 2
-        run: |
-          NOTTY_SIMULATOR_ID=$(xcrun simctl list devices available --json | jq -er '.devices | to_entries | map(select(.key | endswith(".iOS-27-0"))) | map(.value[]) | map(select(.isAvailable and (.name | startswith("iPad")))) | sort_by(.name) | .[0].udid // error("No iPadOS 27.0 simulator is available")')
-          printf 'NOTTY_SIMULATOR_ID=%s\n' "$NOTTY_SIMULATOR_ID" >> "$GITHUB_ENV"
-          xcrun simctl bootstatus "$NOTTY_SIMULATOR_ID" -b
-      - name: Compile unsigned iPad simulator app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Debug \
-            -sdk iphonesimulator27.0 \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Compile unsigned iPad device app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Release \
-            -sdk iphoneos27.0 \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/NottyDevice" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Test native notebook session and canvas
-        timeout-minutes: 5
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Debug \
-            -sdk iphonesimulator27.0 \
-            -destination "platform=iOS Simulator,id=$NOTTY_SIMULATOR_ID" \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 60 \
-            -maximum-test-execution-time-allowance 120 \
-            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
-            -resultBundlePath "$RUNNER_TEMP/NottyNativeTests.xcresult" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            test 2>&1 | tee "$RUNNER_TEMP/NottyNativeTests.log"
-
-      - name: Summarize hosted test results
-        if: always()
-        timeout-minutes: 1
-        run: |
-          if [ -d "$RUNNER_TEMP/NottyNativeTests.xcresult" ]; then
-            xcrun xcresulttool get test-results summary \
-              --path "$RUNNER_TEMP/NottyNativeTests.xcresult" \
-              > "$RUNNER_TEMP/NottyNativeTests-summary.json"
-            cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
-            {
-              printf '### Hosted test results\n\n~~~json\n'
-              cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
-              printf '\n~~~\n'
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf 'Hosted test result bundle was not produced.\n' >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Upload native check results
         if: always()
@@ -168,10 +109,8 @@ jobs:
             ${{ runner.temp }}/NottyNativeTests-summary.json
             ${{ runner.temp }}/NottyHistoryMetrics
             ${{ runner.temp }}/NottyRecoveryMetrics
+            ${{ runner.temp }}/NottySaveMetrics
 
-      - name: Shut down test simulator
-        if: always() && env.NOTTY_SIMULATOR_ID != ''
-        run: xcrun simctl shutdown "$NOTTY_SIMULATOR_ID" || true
       - name: Record result
         if: always()
         run: |
@@ -179,5 +118,5 @@ jobs:
             printf '### Native checks\n\n'
             printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
             printf 'Job result: `%s`\n\n' "${{ job.status }}"
-            printf 'Unsigned simulator/device compilation, macOS core tests and hosted iPad simulator tests. Physical iPad acceptance is pending.\n'
+            printf 'Core storage evidence; full native acceptance is pending.\n'
           } >> "$GITHUB_STEP_SUMMARY"

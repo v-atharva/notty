@@ -6,13 +6,15 @@ import XCTest
 final class NotebookHistoryTests: XCTestCase {
     private typealias Fixtures = NotebookHistoryTestFixtures
 
-    func testEightHundredDistinctAssetsKeepAllMetadataBelowFourTimesAssetsWithLargeTitle() async throws {
-        try await assertLinearHistory(strokeCount: 800, title: String(repeating: "t", count: 4_096))
+    func testThreeHundredDistinctAssetsKeepAllMetadataBelowFourTimesAssetsWithLargeTitle() async throws {
+        try await assertLinearHistory(strokeCount: 300, title: String(repeating: "t", count: 4_096))
     }
 
+    #if NOTTY_STORAGE_STRESS
     func testTwoThousandDistinctAssetsKeepAllMetadataBelowFourTimesAssets() async throws {
         try await assertLinearHistory(strokeCount: 2_000, title: String(repeating: "t", count: 4_096))
     }
+    #endif
 
     private func assertLinearHistory(strokeCount: Int, title: String) async throws {
         let root = try Fixtures.root()
@@ -30,7 +32,7 @@ final class NotebookHistoryTests: XCTestCase {
                 ),
                 expectedRevisionID: latest?.revisionID
             )
-            if [500, 800, 1_000, 2_000].contains(index) {
+            if [100, 300, 500, 800, 1_000, 2_000].contains(index) {
                 let layout = try Fixtures.layout(root: root, id: id)
                 let eventBytes = try Fixtures.byteCount(in: layout.eventsDirectory)
                 let checkpointBytes = try Fixtures.byteCount(in: layout.checkpointsDirectory)

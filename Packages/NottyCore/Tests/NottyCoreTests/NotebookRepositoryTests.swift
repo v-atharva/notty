@@ -82,8 +82,7 @@ final class NotebookRepositoryTests: XCTestCase {
         _ = try await repository.save(
             id: id, content: next, expectedRevisionID: second.revisionID
         )
-        XCTAssertEqual(counter.snapshot().count, 2)
-        XCTAssertTrue(counter.snapshot().values.allSatisfy { $0 == 1 })
+        XCTAssertTrue(counter.snapshot().isEmpty)
     }
 
     func testUnpublishedExistingDigestIsVerifiedOnceWhenSeveralStrokesReuseIt() async throws {
@@ -1249,8 +1248,9 @@ final class NotebookRepositoryTests: XCTestCase {
                     try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: false)
                     try Data("untouched".utf8).write(to: asset.appendingPathComponent("child"))
                 }
+                let refreshed = try NotebookRepository(rootURL: root)
                 do {
-                    _ = try await repository.save(
+                    _ = try await refreshed.save(
                         id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
                     )
                     XCTFail("An unsafe asset entry was repaired.")

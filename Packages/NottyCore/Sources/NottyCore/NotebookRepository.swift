@@ -13,6 +13,21 @@ public actor NotebookRepository {
     static let maximumNotebookBytes = 64 * 1_024 * 1_024
     static let maximumTitleBytes = 4_096
 
+    private struct ValidatedGeneration {
+        let snapshot: NotebookHistory.HeadSnapshot
+        let current: Format.Materialized
+        let verifiedSizes: [String: Int]
+        let checkpointSize: Format.CheckpointSize
+    }
+
+    private struct PreparedContent {
+        let edit: NotebookSaveEdit
+        let references: [Format.Reference]
+        let dataByDigest: [String: Data]
+    }
+
+    private let metrics = NotebookStorageMetricsRecorder()
+    private var validatedGenerations: [UUID: ValidatedGeneration] = [:]
     private let rootURL: URL
     private let migrationFaultInjector: (@Sendable (NotebookMigrationStage) throws -> Void)?
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
@@ -101,6 +116,8 @@ public actor NotebookRepository {
         self.maintenanceFaultInjector = nil
     }
 
+    public func storageMetrics() -> NotebookStorageMetrics { metrics.snapshot() }
+
     func maintenanceReport() -> [NotebookFileSystem.MaintenanceEvent: Int] {
         maintenanceDiagnostics.snapshot()
     }
@@ -130,23 +147,36 @@ public actor NotebookRepository {
 
     /// Audits all selected historical metadata and assets before returning current content.
     public func load(id: UUID) throws -> StoredNotebook? {
+        validatedGenerations.removeValue(forKey: id)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         let directory = notebookDirectory(id: id)
         guard try NotebookFileSystem.existingDirectory(directory) else { return nil }
         let history = historyStore(id: id, directory: directory)
-        guard let head = try history.readHead() else { throw NotebookRepositoryError.recoveryRequired }
-        _ = try history.audit(head)
-        try migrationStore(history).validateReceipt(head)
-        let current = try history.current(head)
-        let notebook = storedNotebook(current, id: id, strokes: try history.readAssets(current.state))
-        maintainNotebook(id: id, directory: directory, head: head)
+        guard let snapshot = try history.readHeadSnapshot() else {
+            throw NotebookRepositoryError.recoveryRequired
+        }
+        _ = try history.audit(snapshot.head)
+        try migrationStore(history).validateReceipt(snapshot.head)
+        let current = try history.current(snapshot.head)
+        let strokes = try history.readAssets(current.state)
+        let checkpointSize = try Format.CheckpointSize(title: current.state.title, metrics: metrics)
+        var sizes: [String: Int] = [:]
+        for (reference, stroke) in zip(current.state.strokes, strokes) {
+            sizes[reference.digest] = stroke.data.count
+        }
+        let notebook = storedNotebook(current, id: id, strokes: strokes)
+        validatedGenerations[id] = ValidatedGeneration(
+            snapshot: snapshot, current: current, verifiedSizes: sizes, checkpointSize: checkpointSize
+        )
+        maintainNotebook(id: id, directory: directory, head: snapshot.head)
         return notebook
     }
 
     public func history(
         id: UUID, beforeRevisionID: UUID? = nil, limit: Int = 50
     ) throws -> [NotebookRevisionSummary] {
+        validatedGenerations.removeValue(forKey: id)
         guard (1...200).contains(limit) else {
             throw NotebookRepositoryError.invalidContent("History limits must be between 1 and 200.")
         }
@@ -159,6 +189,7 @@ public actor NotebookRepository {
     }
 
     public func loadRevision(id: UUID, revisionID: UUID) throws -> StoredNotebook {
+        validatedGenerations.removeValue(forKey: id)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         let (history, head) = try selectedHistory(id: id)
@@ -169,6 +200,7 @@ public actor NotebookRepository {
     }
 
     public func auditHistory(id: UUID) throws -> NotebookHistoryAudit {
+        validatedGenerations.removeValue(forKey: id)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         let (history, head) = try selectedHistory(id: id)
@@ -180,6 +212,7 @@ public actor NotebookRepository {
     public func migrateHistory(
         id: UUID, expectedRevisionID: UUID
     ) throws -> NotebookMigrationReceipt {
+        validatedGenerations.removeValue(forKey: id)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         let (history, head) = try selectedHistory(id: id)
@@ -191,6 +224,7 @@ public actor NotebookRepository {
     public func rollbackMigration(
         id: UUID, expectedRevisionID: UUID
     ) throws -> StoredNotebook {
+        validatedGenerations.removeValue(forKey: id)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         let (history, head) = try selectedHistory(id: id)
@@ -202,15 +236,58 @@ public actor NotebookRepository {
     public func save(
         id: UUID, content: NotebookContent, expectedRevisionID: UUID?
     ) throws -> StoredNotebook {
+        let result = try saveBatch(
+            id: id, edits: [NotebookSaveEdit(id: UUID(), content: content)],
+            expectedRevisionID: expectedRevisionID
+        )
+        guard let committed = result.committed.first else {
+            throw result.rejection?.error ?? NotebookRepositoryError.invalidContent("No notebook edit was accepted.")
+        }
+        return StoredNotebook(
+            id: id, revisionID: committed.revisionID, sequence: committed.sequence,
+            content: content, savedAt: committed.savedAt
+        )
+    }
+
+    /// Publishes an ordered prefix of at most eight edits beneath one atomic HEAD.
+    ///
+    /// Content rejection acknowledges the valid prefix. Transaction errors before
+    /// HEAD publication acknowledge none. A byte-budget boundary leaves a healthy tail.
+    public func saveBatch(
+        id: UUID, edits: [NotebookSaveEdit], expectedRevisionID: UUID?
+    ) throws -> NotebookBatchSaveResult {
         var published = false
         defer {
             if !published {
+                validatedGenerations.removeValue(forKey: id)
                 maintainedNotebookIDs.remove(id)
                 privateMaintenanceRequired = true
             }
         }
-        try validateContent(content)
-        let prepared = try prepareAssets(content.strokes)
+        guard !edits.isEmpty else {
+            throw NotebookRepositoryError.invalidContent("A save batch must contain an edit.")
+        }
+        var candidates: [PreparedContent] = []
+        var rejection: NotebookBatchFailure?
+        var editIDs = Set<UUID>()
+        for (index, edit) in edits.prefix(8).enumerated() {
+            do {
+                guard editIDs.insert(edit.id).inserted else {
+                    throw NotebookRepositoryError.invalidContent("Save edit identifiers must be unique.")
+                }
+                try validateContent(edit.content)
+                let prepared = try prepareAssets(edit.content.strokes)
+                candidates.append(PreparedContent(
+                    edit: edit, references: prepared.references, dataByDigest: prepared.dataByDigest
+                ))
+            } catch let error as NotebookRepositoryError {
+                rejection = NotebookBatchFailure(index: index, editID: edit.id, error: error)
+                break
+            }
+        }
+        guard !candidates.isEmpty else {
+            return NotebookBatchSaveResult(committed: [], rejection: rejection)
+        }
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
         if privateMaintenanceRequired {
@@ -223,23 +300,20 @@ public actor NotebookRepository {
         let destination = notebookDirectory(id: id)
         let isCreating = try NotebookFileSystem.kind(destination) == nil
         let directory: URL
-        var currentHead: Format.Head?
+        var snapshot: NotebookHistory.HeadSnapshot?
         if isCreating {
             guard expectedRevisionID == nil else { throw NotebookRepositoryError.revisionConflict }
             directory = rootURL.appendingPathComponent(
                 ".creation-\(UUID().uuidString.lowercased())", isDirectory: true
             )
             try NotebookFileSystem.ensureDirectory(directory)
-            currentHead = nil
         } else {
             guard try NotebookFileSystem.existingDirectory(destination) else {
                 throw NotebookRepositoryError.unsafePath("The notebook directory is missing.")
             }
             directory = destination
-            guard let head = try historyStore(id: id, directory: directory).readHead() else {
-                throw NotebookRepositoryError.recoveryRequired
-            }
-            currentHead = head
+            snapshot = try historyStore(id: id, directory: directory).readHeadSnapshot()
+            guard snapshot != nil else { throw NotebookRepositoryError.recoveryRequired }
         }
         defer {
             if isCreating {
@@ -252,74 +326,167 @@ public actor NotebookRepository {
                 }
             }
         }
-        guard currentHead?.revisionID == expectedRevisionID else {
+        guard snapshot?.head.revisionID == expectedRevisionID else {
             throw NotebookRepositoryError.revisionConflict
         }
         let history = historyStore(id: id, directory: directory)
-        if let head = currentHead, head.schemaVersion == 1 {
-            currentHead = try migrationStore(history).migrate(head).0
+        if let head = snapshot?.head, head.schemaVersion == 1 {
+            _ = try migrationStore(history).migrate(head)
+            validatedGenerations.removeValue(forKey: id)
             maintainedNotebookIDs.remove(id)
+            guard let migratedSnapshot = try history.readHeadSnapshot() else {
+                throw NotebookRepositoryError.recoveryRequired
+            }
+            snapshot = migratedSnapshot
         }
-        let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
-        try NotebookFileSystem.ensureDirectory(assetsDirectory)
-        var previous = Format.State.empty
-        var sequence = 1
-        var credit = 0
-        // These verification receipts apply only to this locked publication.
-        var verifiedDigests = Set<String>()
-        if let head = currentHead {
+        let cached = validatedGenerations[id]
+        let canReuse = snapshot.map {
+            cached?.snapshot.head == $0.head && cached?.snapshot.digest == $0.digest
+        } ?? false
+        if !canReuse { validatedGenerations.removeValue(forKey: id) }
+        var previous: Format.State
+        var sequence: Int
+        var credit: Int
+        var verifiedSizes: [String: Int]
+        var checkpointSize: Format.CheckpointSize
+        if canReuse, let cached {
+            previous = cached.current.state
+            sequence = cached.current.sequence
+            credit = cached.current.checkpointCredit
+            verifiedSizes = cached.verifiedSizes
+            checkpointSize = cached.checkpointSize
+        } else if let head = snapshot?.head {
             try migrationStore(history).validateReceipt(head)
             let current = try history.current(head)
-            verifiedDigests = try history.verifyAssets(current.state, candidates: prepared.dataByDigest) {
-                reference, candidate in
-                try self.verifyCandidateAsset(reference, candidate: candidate, directory: directory)
-            }
-            guard current.sequence < Int.max else {
-                throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
-            }
             previous = current.state
-            sequence = current.sequence + 1
+            sequence = current.sequence
             credit = current.checkpointCredit
-            maintainNotebook(id: id, directory: directory, head: head)
+            verifiedSizes = [:]
+            checkpointSize = try Format.CheckpointSize(title: previous.title, metrics: metrics)
+        } else {
+            previous = .empty
+            sequence = 0
+            credit = 0
+            verifiedSizes = [:]
+            checkpointSize = try Format.CheckpointSize(title: previous.title, metrics: metrics)
         }
-        for reference in prepared.references {
-            guard !verifiedDigests.contains(reference.digest) else { continue }
-            guard let candidate = prepared.dataByDigest[reference.digest] else {
-                throw NotebookRepositoryError.corruptData("A prepared stroke asset is missing.")
-            }
-            let asset = assetsDirectory.appendingPathComponent("\(reference.digest).stroke")
-            if try NotebookFileSystem.kind(asset) != nil {
-                _ = try verifyCandidateAsset(reference, candidate: candidate, directory: directory)
-            } else {
-                try NotebookFileSystem.withSynchronizedStage(candidate, in: assetsDirectory) { stage in
-                    try faultInjector?(.assetStaged)
-                    try NotebookFileSystem.publishImmutable(stage, to: asset)
-                    try faultInjector?(.assetPublished)
-                }
-            }
-            verifiedDigests.insert(reference.digest)
-        }
-        let generationID = currentHead?.generationID ?? UUID()
+
+        let baselineState = previous
+        let generationID = snapshot?.head.generationID ?? UUID()
         let historyDirectory = directory.appendingPathComponent("history", isDirectory: true)
         try NotebookFileSystem.ensureDirectory(historyDirectory)
         let generation = historyDirectory.appendingPathComponent(
             generationID.uuidString.lowercased(), isDirectory: true
         )
         try NotebookFileSystem.ensureDirectory(generation)
-        let state = Format.State(title: content.title, pageCount: content.pageCount, strokes: prepared.references)
-        let revisionID = UUID()
-        let savedAt = Date()
         let writer = NotebookHistoryWriter(
             notebookID: id, generationID: generationID, generation: generation,
-            writeFault: faultInjector, migrationFault: nil
+            writeFault: faultInjector, migrationFault: nil, metrics: metrics
         )
-        let head = try writer.append(
-            state: state, previous: previous, parent: currentHead, revisionID: revisionID,
-            sequence: sequence, stamp: content.editStamp, savedAt: savedAt, credit: credit
-        ).head
-        try NotebookFileSystem.withSynchronizedStage(
-            try Format.encode(head), in: directory, head: true
-        ) { stage in
+        var parent = snapshot?.head
+        var publications: [NotebookHistoryWriter.Prepared] = []
+        var receipts: [NotebookCommittedEdit] = []
+        var acceptedCandidates: [String: Data] = [:]
+        var introducedBytes = 0
+        var finalStamp: NotebookEditStamp?
+        var finalSavedAt = Date()
+        for (index, candidate) in candidates.enumerated() {
+            var newBytes = 0
+            for (digest, data) in candidate.dataByDigest
+                where verifiedSizes[digest] == nil && acceptedCandidates[digest] == nil {
+                newBytes += data.count
+            }
+            // Every individual state is bounded; additional states may require another transaction.
+            if !publications.isEmpty, introducedBytes + newBytes > Self.maximumNotebookBytes {
+                rejection = nil
+                break
+            }
+            guard sequence < Int.max else {
+                throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
+            }
+            let state = Format.State(
+                title: candidate.edit.content.title, pageCount: candidate.edit.content.pageCount,
+                strokes: candidate.references
+            )
+            do {
+                for (digest, data) in candidate.dataByDigest {
+                    if let existing = acceptedCandidates[digest], existing != data {
+                        throw NotebookRepositoryError.invalidContent("Equal stroke digests must have identical bytes.")
+                    }
+                }
+                let size = previous.title == state.title
+                    ? checkpointSize : try Format.CheckpointSize(title: state.title, metrics: metrics)
+                let savedAt = Date()
+                let prepared = try writer.prepare(
+                    state: state, previous: previous, parent: parent, revisionID: UUID(),
+                    sequence: sequence + 1, stamp: candidate.edit.content.editStamp,
+                    savedAt: savedAt, credit: credit, checkpointSize: size
+                )
+                publications.append(prepared)
+                receipts.append(NotebookCommittedEdit(
+                    editID: candidate.edit.id, revisionID: prepared.head.revisionID,
+                    sequence: sequence + 1, savedAt: savedAt
+                ))
+                for (digest, data) in candidate.dataByDigest {
+                    acceptedCandidates[digest] = data
+                }
+                introducedBytes += newBytes
+                previous = state
+                sequence += 1
+                credit = prepared.credit
+                parent = prepared.head
+                checkpointSize = size
+                finalStamp = candidate.edit.content.editStamp
+                finalSavedAt = savedAt
+            } catch let error as NotebookRepositoryError {
+                switch error {
+                case .invalidContent, .sizeLimitExceeded:
+                    rejection = NotebookBatchFailure(index: index, editID: candidate.edit.id, error: error)
+                default:
+                    throw error
+                }
+                break
+            }
+        }
+        guard let finalPublication = publications.last else {
+            return NotebookBatchSaveResult(committed: [], rejection: rejection)
+        }
+
+        let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
+        try NotebookFileSystem.ensureDirectory(assetsDirectory)
+        if !canReuse, snapshot != nil {
+            verifiedSizes = try history.verifiedAssetSizes(
+                baselineState, candidates: acceptedCandidates
+            ) { reference, candidate in
+                try self.verifyCandidateAsset(reference, candidate: candidate, directory: directory)
+            }
+        }
+        for (digest, candidate) in acceptedCandidates {
+            guard verifiedSizes[digest] == nil else { continue }
+            let reference = Format.Reference(id: UUID(), digest: digest)
+            _ = try verifyCandidateAsset(
+                reference, candidate: candidate, directory: directory, repairMissing: false
+            )
+            verifiedSizes[digest] = candidate.count
+        }
+        if let head = snapshot?.head { maintainNotebook(id: id, directory: directory, head: head) }
+        for publication in publications { try writer.publish(publication) }
+
+        let headData = try Format.encode(finalPublication.head, metrics: metrics)
+        let finalSnapshot = NotebookHistory.HeadSnapshot(
+            head: finalPublication.head, digest: Format.digest(headData, metrics: metrics)
+        )
+        let finalGeneration = ValidatedGeneration(
+            snapshot: finalSnapshot,
+            current: Format.Materialized(
+                revisionID: finalPublication.head.revisionID, sequence: sequence,
+                editStamp: finalStamp, savedAt: finalSavedAt, state: previous, checkpointCredit: credit
+            ),
+            verifiedSizes: verifiedSizes, checkpointSize: checkpointSize
+        )
+        let outcome = NotebookBatchSaveResult(committed: receipts, rejection: rejection)
+        try NotebookFileSystem.withSynchronizedStage(headData, in: directory, head: true) { stage in
+            metrics.record(\.metadataWrittenBytes, headData.count)
             try faultInjector?(.headStaged)
             try faultInjector?(.beforeHeadPublication)
             try NotebookFileSystem.replaceAtomically(
@@ -331,10 +498,11 @@ public actor NotebookRepository {
             try NotebookFileSystem.publishImmutable(directory, to: destination)
             maintainedNotebookIDs.insert(id)
         }
+        metrics.record(\.headPublications)
+        if rejection == nil { validatedGenerations[id] = finalGeneration }
+        else { validatedGenerations.removeValue(forKey: id) }
         published = true
-        return StoredNotebook(
-            id: id, revisionID: revisionID, sequence: sequence, content: content, savedAt: savedAt
-        )
+        return outcome
     }
 
     private func maintainNotebook(id: UUID, directory: URL, head: Format.Head) {
@@ -375,7 +543,8 @@ public actor NotebookRepository {
 
     private func historyStore(id: UUID, directory: URL) -> NotebookHistory {
         NotebookHistory(
-            directory: directory, notebookID: id, assetVerificationObserver: assetVerificationObserver
+            directory: directory, notebookID: id, assetVerificationObserver: assetVerificationObserver,
+            metrics: metrics
         )
     }
 
@@ -387,9 +556,9 @@ public actor NotebookRepository {
     }
 
     private func verifyCandidateAsset(
-        _ reference: Format.Reference, candidate: Data, directory: URL
+        _ reference: Format.Reference, candidate: Data, directory: URL, repairMissing: Bool = true
     ) throws -> Data {
-        guard candidate.count <= Self.maximumAssetBytes, Format.digest(candidate) == reference.digest else {
+        guard candidate.count <= Self.maximumAssetBytes else {
             throw NotebookRepositoryError.invalidContent("Candidate archive bytes do not match their digest.")
         }
         let assets = directory.appendingPathComponent("assets", isDirectory: true)
@@ -403,7 +572,9 @@ public actor NotebookRepository {
         }
         if existingKind == .regularFile {
             do {
+                metrics.record(\.assetReadCalls)
                 let existing = try NotebookFileSystem.read(asset, maximumBytes: Self.maximumAssetBytes)
+                metrics.record(\.assetReadBytes, existing.count)
                 if existing == candidate {
                     assetVerificationObserver?(reference.digest)
                     return existing
@@ -412,8 +583,10 @@ public actor NotebookRepository {
                 guard case .sizeLimitExceeded = error else { throw error }
             }
         }
-        // A verified candidate restores every reference to this content-addressed asset.
+        // Preparation binds immutable candidate bytes to this digest before repair.
+        // Replacing an asset restores every reference to its content address.
         try NotebookFileSystem.withSynchronizedStage(candidate, in: assets) { stage in
+            metrics.record(\.assetWrittenBytes, candidate.count)
             try faultInjector?(.assetStaged)
             if let kind = try NotebookFileSystem.kind(asset) {
                 guard kind == .regularFile else {
@@ -423,10 +596,10 @@ public actor NotebookRepository {
             } else {
                 try NotebookFileSystem.publishImmutable(stage, to: asset)
             }
-            maintenanceObserver(.repairedAsset)
+            if existingKind != nil || repairMissing { maintenanceObserver(.repairedAsset) }
             try faultInjector?(.assetPublished)
         }
-        assetVerificationObserver?(reference.digest)
+        if existingKind != nil || repairMissing { assetVerificationObserver?(reference.digest) }
         return candidate
     }
 
@@ -437,7 +610,10 @@ public actor NotebookRepository {
         references.reserveCapacity(strokes.count)
         var dataByDigest: [String: Data] = [:]
         for stroke in strokes {
-            let digest = Format.digest(stroke.data)
+            let digest = stroke.cachedDigest ?? metrics.assetDigest(stroke.data)
+            guard Format.isDigest(digest) else {
+                throw NotebookRepositoryError.invalidContent("A stroke archive has invalid digest metadata.")
+            }
             if let existing = dataByDigest[digest], existing != stroke.data {
                 throw NotebookRepositoryError.invalidContent("Equal stroke digests must have identical bytes.")
             }
