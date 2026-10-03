@@ -42,7 +42,7 @@ final class NativeArchiveReuseTests: XCTestCase {
         XCTAssertEqual(result.prefix(assets.count).map(\.cachedDigest), assets.map(\.cachedDigest))
         XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1)
         XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, result.last?.data.count)
-        XCTAssertEqual(after.comparedPoints - before.comparedPoints, 12)
+        XCTAssertEqual(after.comparedPoints - before.comparedPoints, 0)
         try report(name: "canvas-add-one", values: [
             "strokeCount": result.count,
             "serializations": after.serializedStrokes - before.serializedStrokes,
@@ -87,6 +87,121 @@ final class NativeArchiveReuseTests: XCTestCase {
                 XCTAssertEqual(actual.force, expected.force)
             }
         }
+    }
+
+    func testLiveCanvasEveryPublicPointFieldUsesDistinctNativePathIdentity() async throws {
+        let original = NativeArchiveFixtures.stroke()
+        let untouched = NativeArchiveFixtures.stroke(x: 120)
+        let live = NativeArchiveCanvas()
+        defer { live.close() }
+        var pathIDs: Set<UUID> = [original.path.id]
+        for field in NativeArchiveFixtures.PointField.allCases {
+            let changed = field.changed(original)
+            XCTAssertEqual(changed.id, original.id, field.rawValue)
+            XCTAssertTrue(pathIDs.insert(changed.path.id).inserted, field.rawValue)
+            XCTAssertNotEqual(field.value(changed.path[0]), field.value(original.path[0]), field.rawValue)
+            let codec = InkCodec()
+            let assets = try await codec.encode(PKDrawing(strokes: [original, untouched]))
+            await live.assign(PKDrawing(strokes: [changed, untouched]))
+            let observed = live.canvas.drawing
+            XCTAssertEqual(observed.strokes.map(\.id), [original.id, untouched.id], field.rawValue)
+            XCTAssertEqual(observed.strokes[0].path.id, changed.path.id, field.rawValue)
+            XCTAssertEqual(
+                field.value(observed.strokes[0].path[0]), field.value(changed.path[0]), field.rawValue
+            )
+            XCTAssertNotEqual(
+                try InkDrawingSignature(PKDrawing(strokes: [original, untouched])),
+                try InkDrawingSignature(observed), field.rawValue
+            )
+            let before = await codec.workMetrics
+            let result = try await codec.encode(observed)
+            let after = await codec.workMetrics
+            XCTAssertEqual(result[1], assets[1], field.rawValue)
+            XCTAssertEqual(result[1].cachedDigest, assets[1].cachedDigest, field.rawValue)
+            XCTAssertNotEqual(result[0].data, assets[0].data, field.rawValue)
+            XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1, field.rawValue)
+            XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, result[0].data.count, field.rawValue)
+            XCTAssertEqual(after.comparedPoints - before.comparedPoints, 0, field.rawValue)
+            let restored = try await InkCodec().decode(result)
+            XCTAssertEqual(restored.strokes.map(\.id), result.map(\.id), field.rawValue)
+            XCTAssertEqual(restored.strokes[0].path.id, changed.path.id, field.rawValue)
+            try report(name: "point-field-\(field.rawValue)", values: [
+                "distinctNativePath": changed.path.id == original.path.id ? 0 : 1,
+                "serializations": after.serializedStrokes - before.serializedStrokes,
+                "pointComparisons": after.comparedPoints - before.comparedPoints,
+                "assetSHABytes": after.hashedArchiveBytes - before.hashedArchiveBytes
+            ])
+        }
+    }
+
+    func testLiveCanvasNativeWorkRemainsBoundedAtOneHundredAndTwoThousand() async throws {
+        let live = NativeArchiveCanvas()
+        defer { live.close() }
+        var samples: [[String: Int]] = []
+        for count in [100, 2_000] {
+            let strokes = (0..<count).map {
+                NativeArchiveFixtures.stroke(x: 20 + CGFloat($0 % 60) * 10)
+            }
+            let codec = InkCodec()
+            let original = try await codec.encode(PKDrawing(strokes: strokes))
+            var changed = strokes
+            changed[0].transform = CGAffineTransform(translationX: 3, y: 5)
+            await live.assign(PKDrawing(strokes: changed))
+            let observed = live.canvas.drawing
+            let native = try InkDrawingSignature(observed)
+            let anotherNative = try InkDrawingSignature(observed)
+            let nativeComparison = native.compared(to: anotherNative)
+            XCTAssertTrue(nativeComparison.isEqual)
+            XCTAssertEqual(nativeComparison.work.comparedPoints, 0)
+            XCTAssertEqual(nativeComparison.work.signatureChecks, count)
+            let exact = try InkDrawingSignature(observed, comparisonMode: .exact)
+            for comparison in [native.compared(to: exact), exact.compared(to: native)] {
+                XCTAssertTrue(comparison.isEqual)
+                XCTAssertEqual(comparison.work.comparedPoints, count * 4)
+            }
+            let before = await codec.workMetrics
+            let result = try await codec.encode(observed)
+            let after = await codec.workMetrics
+            XCTAssertEqual(Array(result.dropFirst()), Array(original.dropFirst()))
+            XCTAssertEqual(
+                result.dropFirst().map(\.cachedDigest), original.dropFirst().map(\.cachedDigest)
+            )
+            let sample: [String: Int] = [
+                "strokeCount": count,
+                "serializations": after.serializedStrokes - before.serializedStrokes,
+                "pointComparisons": after.comparedPoints - before.comparedPoints,
+                "signatureChecks": after.signatureChecks - before.signatureChecks,
+                "assetSHABytes": after.hashedArchiveBytes - before.hashedArchiveBytes,
+                "copiedArchiveBytes": after.copiedArchiveBytes - before.copiedArchiveBytes,
+                "maskSnapshots": after.maskSnapshots - before.maskSnapshots,
+                "renderStateBytes": after.renderStateBytes - before.renderStateBytes,
+                "nativeDrawingEqualityFallbacks":
+                    after.nativeDrawingEqualityFallbacks - before.nativeDrawingEqualityFallbacks,
+                "barrierPointComparisons": nativeComparison.work.comparedPoints,
+                "barrierSignatureChecks": nativeComparison.work.signatureChecks
+            ]
+            samples.append(sample)
+            XCTAssertEqual(sample["serializations"], 1)
+            XCTAssertEqual(sample["pointComparisons"], 0)
+            XCTAssertEqual(sample["assetSHABytes"], result[0].data.count)
+            XCTAssertEqual(sample["copiedArchiveBytes"], result[0].data.count)
+            try report(name: "bounded-work-\(count)", values: sample)
+        }
+        for key in [
+            "serializations", "pointComparisons", "assetSHABytes", "copiedArchiveBytes",
+            "maskSnapshots", "renderStateBytes", "nativeDrawingEqualityFallbacks",
+            "barrierPointComparisons"
+        ] {
+            let small = try XCTUnwrap(samples[0][key])
+            let large = try XCTUnwrap(samples[1][key])
+            if small == 0 {
+                XCTAssertEqual(large, 0, key)
+            } else {
+                XCTAssertLessThanOrEqual(Double(large), Double(small) * 1.5, key)
+            }
+        }
+        XCTAssertEqual(samples[0]["signatureChecks"], 200)
+        XCTAssertEqual(samples[1]["signatureChecks"], 4_000)
     }
 
     func testLiveCanvasFieldChangesSerializeOnlyTheChangedNativeStroke() async throws {

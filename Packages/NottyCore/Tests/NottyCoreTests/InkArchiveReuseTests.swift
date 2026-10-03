@@ -40,6 +40,64 @@ final class InkArchiveReuseTests: XCTestCase {
         )
     }
 
+    private enum PointField: String, CaseIterable {
+        case location, timeOffset, size, opacity, force, azimuth, altitude
+        case secondaryScale, threshold, lateralJitter
+
+        func value(_ point: PKStrokePoint) -> Double {
+            switch self {
+            case .location: return Double(point.location.x)
+            case .timeOffset: return point.timeOffset
+            case .size: return Double(point.size.width)
+            case .opacity: return Double(point.opacity)
+            case .force: return Double(point.force)
+            case .azimuth: return Double(point.azimuth)
+            case .altitude: return Double(point.altitude)
+            case .secondaryScale: return Double(point.secondaryScale)
+            case .threshold: return Double(point.threshold)
+            case .lateralJitter: return Double(point.lateralJitter)
+            }
+        }
+
+        func changed(_ stroke: PKStroke) -> PKStroke {
+            let points = stroke.path.enumerated().map { index, point in
+                guard index == 0 else { return point }
+                var location = point.location
+                var timeOffset = point.timeOffset
+                var size = point.size
+                var opacity = point.opacity
+                var force = point.force
+                var azimuth = point.azimuth
+                var altitude = point.altitude
+                var secondaryScale = point.secondaryScale
+                var threshold = point.threshold
+                var lateralJitter = point.lateralJitter
+                switch self {
+                case .location: location.x += 7
+                case .timeOffset: timeOffset += 0.005
+                case .size: size.width += 2
+                case .opacity: opacity = 0.5
+                case .force: force = 0.5
+                case .azimuth: azimuth = 0.5
+                case .altitude: altitude = 0.7
+                case .secondaryScale: secondaryScale = 0.75
+                case .threshold: threshold = 0.25
+                case .lateralJitter: lateralJitter = 0.25
+                }
+                return PKStrokePoint(
+                    location: location, timeOffset: timeOffset, size: size, opacity: opacity,
+                    force: force, azimuth: azimuth, altitude: altitude,
+                    secondaryScale: secondaryScale, threshold: threshold, lateralJitter: lateralJitter
+                )
+            }
+            var result = stroke
+            result.path = PKStrokePath(
+                controlPoints: points, creationDate: stroke.path.creationDate
+            )
+            return result
+        }
+    }
+
     func testArchiveBytesAndTrustedDigestsRemainPairedAcrossCacheHits() async throws {
         let native = stroke()
         let ownedDrawing = PKDrawing(strokes: [native])
@@ -56,7 +114,7 @@ final class InkArchiveReuseTests: XCTestCase {
         let diagnosticData = try JSONSerialization.data(withJSONObject: diagnostics, options: [.sortedKeys])
         print("NOTTY_SAVE_METRIC archive-stability \(String(decoding: diagnosticData, as: UTF8.self))")
         XCTAssertEqual(firstArchive, secondArchive)
-        let codec = InkCodec()
+        let codec = InkCodec(comparisonMode: .exact)
         let first = try await codec.encode(PKDrawing(strokes: [native]))
         let before = await codec.workMetrics
         let second = try await codec.encode(PKDrawing(strokes: [native]))
@@ -187,8 +245,8 @@ final class InkArchiveReuseTests: XCTestCase {
         let first = stroke()
         let second = stroke(x: 120)
         let original = PKDrawing(strokes: [first, second])
-        let signature = try InkDrawingSignature(original)
-        let same = try InkDrawingSignature(original)
+        let signature = try InkDrawingSignature(original, comparisonMode: .exact)
+        let same = try InkDrawingSignature(original, comparisonMode: .exact)
         let comparison = signature.compared(to: same)
         XCTAssertTrue(comparison.isEqual)
         XCTAssertEqual(comparison.work.comparedPoints, 8)
@@ -337,7 +395,55 @@ final class InkArchiveReuseTests: XCTestCase {
         }
     }
 
-    func testOneStrokeChangeMetricsExposeExactFallbackWorkAtOneHundredAndTwoThousand() async throws {
+
+    func testEveryPublicPointFieldUsesNewNativePathAndInvalidatesOnlyChangedArchive() async throws {
+        let original = stroke()
+        let untouched = stroke(x: 120)
+        var pathIDs: Set<UUID> = [original.path.id]
+        for field in PointField.allCases {
+            let changed = field.changed(original)
+            XCTAssertEqual(changed.id, original.id, field.rawValue)
+            XCTAssertEqual(changed.path.count, original.path.count, field.rawValue)
+            XCTAssertEqual(changed.path.creationDate, original.path.creationDate, field.rawValue)
+            XCTAssertTrue(pathIDs.insert(changed.path.id).inserted, field.rawValue)
+            XCTAssertNotEqual(field.value(changed.path[0]), field.value(original.path[0]), field.rawValue)
+            let originalSignature = try InkDrawingSignature(PKDrawing(strokes: [original, untouched]))
+            let changedSignature = try InkDrawingSignature(PKDrawing(strokes: [changed, untouched]))
+            XCTAssertNotEqual(originalSignature, changedSignature, field.rawValue)
+            let codec = InkCodec()
+            let assets = try await codec.encode(PKDrawing(strokes: [original, untouched]))
+            let before = await codec.workMetrics
+            let result = try await codec.encode(PKDrawing(strokes: [changed, untouched]))
+            let after = await codec.workMetrics
+            XCTAssertEqual(result.map(\.id), assets.map(\.id), field.rawValue)
+            XCTAssertEqual(result[1], assets[1], field.rawValue)
+            XCTAssertEqual(result[1].cachedDigest, assets[1].cachedDigest, field.rawValue)
+            XCTAssertNotEqual(result[0].data, assets[0].data, field.rawValue)
+            XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1, field.rawValue)
+            XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, result[0].data.count, field.rawValue)
+            XCTAssertEqual(after.comparedPoints - before.comparedPoints, 0, field.rawValue)
+            let restored = try await InkCodec().decode(result)
+            XCTAssertEqual(restored.strokes.map(\.id), result.map(\.id), field.rawValue)
+            XCTAssertEqual(restored.strokes[0].path.id, changed.path.id, field.rawValue)
+        }
+    }
+
+    func testMixedSignatureModesKeepExplicitFullPointComparison() throws {
+        let drawing = PKDrawing(strokes: [stroke(), stroke(x: 120)])
+        let native = try InkDrawingSignature(drawing)
+        let exact = try InkDrawingSignature(drawing, comparisonMode: .exact)
+        for comparison in [native.compared(to: exact), exact.compared(to: native)] {
+            XCTAssertTrue(comparison.isEqual)
+            XCTAssertEqual(comparison.work.comparedPoints, 8)
+        }
+        let anotherNative = try InkDrawingSignature(drawing)
+        let cheap = native.compared(to: anotherNative)
+        XCTAssertTrue(cheap.isEqual)
+        XCTAssertEqual(cheap.work.comparedPoints, 0)
+    }
+
+    func testOneStrokeNativeWorkRemainsBoundedAtOneHundredAndTwoThousand() async throws {
+        var samples: [[String: Int]] = []
         for count in [100, 2_000] {
             let strokes = (0..<count).map { stroke(x: CGFloat($0) * 10) }
             let codec = InkCodec()
@@ -349,9 +455,65 @@ final class InkArchiveReuseTests: XCTestCase {
             let after = await codec.workMetrics
             XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1)
             XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, encoded[0].data.count)
+            XCTAssertEqual(after.copiedArchiveBytes - before.copiedArchiveBytes, encoded[0].data.count)
+            XCTAssertEqual(after.comparedPoints - before.comparedPoints, 0)
+            XCTAssertEqual(Array(encoded.dropFirst()), Array(initial.dropFirst()))
+            let sample: [String: Int] = [
+                "strokeCount": count,
+                "serializations": after.serializedStrokes - before.serializedStrokes,
+                "pointComparisons": after.comparedPoints - before.comparedPoints,
+                "signatureChecks": after.signatureChecks - before.signatureChecks,
+                "assetSHABytes": after.hashedArchiveBytes - before.hashedArchiveBytes,
+                "copiedArchiveBytes": after.copiedArchiveBytes - before.copiedArchiveBytes,
+                "maskSnapshots": after.maskSnapshots - before.maskSnapshots,
+                "renderStateBytes": after.renderStateBytes - before.renderStateBytes,
+                "nativeDrawingEqualityFallbacks":
+                    after.nativeDrawingEqualityFallbacks - before.nativeDrawingEqualityFallbacks
+            ]
+            samples.append(sample)
+            let data = try JSONSerialization.data(withJSONObject: sample, options: [.sortedKeys])
+            print("NOTTY_SAVE_METRIC \(String(decoding: data, as: UTF8.self))")
+            if let path = ProcessInfo.processInfo.environment["NOTTY_SAVE_METRICS_DIRECTORY"] {
+                let directory = URL(fileURLWithPath: path, isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try data.write(
+                    to: directory.appendingPathComponent("codec-native-strokes-\(count).json"),
+                    options: .atomic
+                )
+            }
+        }
+        for key in [
+            "serializations", "pointComparisons", "assetSHABytes", "copiedArchiveBytes",
+            "maskSnapshots", "renderStateBytes", "nativeDrawingEqualityFallbacks"
+        ] {
+            let small = try XCTUnwrap(samples[0][key])
+            let large = try XCTUnwrap(samples[1][key])
+            if small == 0 {
+                XCTAssertEqual(large, 0, key)
+            } else {
+                XCTAssertLessThanOrEqual(Double(large), Double(small) * 1.5, key)
+            }
+        }
+        XCTAssertEqual(samples[0]["signatureChecks"], 200)
+        XCTAssertEqual(samples[1]["signatureChecks"], 4_000)
+    }
+
+    func testOneStrokeChangeMetricsExposeExactFallbackWorkAtOneHundredAndTwoThousand() async throws {
+        for count in [100, 2_000] {
+            let strokes = (0..<count).map { stroke(x: CGFloat($0) * 10) }
+            let codec = InkCodec(comparisonMode: .exact)
+            let initial = try await codec.encode(PKDrawing(strokes: strokes))
+            let before = await codec.workMetrics
+            var changed = strokes
+            changed[0].transform = CGAffineTransform(translationX: 3, y: 5)
+            let encoded = try await codec.encode(PKDrawing(strokes: changed))
+            let after = await codec.workMetrics
+            XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1)
+            XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, encoded[0].data.count)
             XCTAssertEqual(after.comparedPoints - before.comparedPoints, (count - 1) * 4)
             XCTAssertEqual(Array(encoded.dropFirst()), Array(initial.dropFirst()))
             let metrics: [String: Int] = [
+                "comparisonModeExact": 1,
                 "strokeCount": count,
                 "serializations": after.serializedStrokes - before.serializedStrokes,
                 "pointComparisons": after.comparedPoints - before.comparedPoints,
@@ -365,7 +527,7 @@ final class InkArchiveReuseTests: XCTestCase {
                 let directory = URL(fileURLWithPath: path, isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 try data.write(
-                    to: directory.appendingPathComponent("codec-native-strokes-\(count).json"),
+                    to: directory.appendingPathComponent("codec-native-exact-strokes-\(count).json"),
                     options: .atomic
                 )
             }
