@@ -776,20 +776,44 @@ final class NotebookWritingStatusTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         await probe.setSuspendSave()
         let seed = session.makeCanvasSeed()
-        let controls = WritingCanvasControlsProbe()
-        var nativeGate = NotebookInputGate.open
+        let picker = PKToolPicker()
+        picker.stateAutosaveName = nil
+        let controller = NotebookViewController(
+            pageCount: seed.pageCount, initialDrawing: seed.drawing, toolPicker: picker
+        )
+        let window = makeWindow(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        // This fixture controls session states and exercises the real native command stack.
+        controller.canvasView.delegate = nil
+        controller.onUndoAvailabilityChange = { [weak session] in
+            session?.updateUndoAvailability($0, ownerID: seed.ownerID)
+        }
+        controller.canPerformHistoryAction = { [weak session] in
+            session?.canPerformHistoryAction(ownerID: seed.ownerID) ?? false
+        }
+        controller.reserveHistoryAction = { [weak session] in
+            session?.reserveHistoryAction(ownerID: seed.ownerID) ?? false
+        }
+        controller.onDetach = { [weak session] in session?.detachCanvas(ownerID: seed.ownerID) }
         session.attachCanvas(
             ownerID: seed.ownerID, observations: { nil },
-            applyInputGate: { gate in
-                nativeGate = gate
-                if gate == .open {
-                    controls.availability = NotebookUndoAvailability(
-                        canUndo: true, canRedo: true, isUsingTool: false
-                    )
-                    session.updateUndoAvailability(controls.availability, ownerID: seed.ownerID)
-                }
-            }, controls: controls.controls
+            applyInputGate: { [weak controller] in controller?.setInputGate($0) },
+            controls: NotebookCanvasControls(
+                undo: { [weak controller] in controller?.performUndo() },
+                redo: { [weak controller] in controller?.performRedo() },
+                setPaletteSuppressed: { [weak controller] in controller?.setPaletteSuppressed($0) },
+                applyPageCount: { [weak controller] in controller?.setPageCount($0) },
+                currentAvailability: { [weak controller] in controller?.currentUndoAvailability ?? .unavailable }
+            )
         )
+        let manager = try XCTUnwrap(controller.canvasView.undoManager)
+        manager.removeAllActions()
+        let target = WritingUndoTarget(manager: manager)
+        target.register()
         XCTAssertTrue(session.commandModel.state.canUndo)
         for index in 1...8 {
             session.recordObservation(
@@ -799,20 +823,24 @@ final class NotebookWritingStatusTests: XCTestCase {
             )
         }
         try await waitForSuspendedSave(probe, after: 0, session: session)
-        XCTAssertEqual(nativeGate, .capacity)
-        // A used native capacity reservation disables both commands until genuine open admission.
-        controls.availability = .unavailable
-        session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+        XCTAssertEqual(controller.inputGate, .capacity)
+        let original = session.pendingEdits
+        session.undo()
+        XCTAssertEqual(target.calls, 1)
+        XCTAssertTrue(manager.canRedo)
+        XCTAssertFalse(controller.currentUndoAvailability.canUndo)
+        XCTAssertFalse(controller.currentUndoAvailability.canRedo)
         XCTAssertFalse(session.commandModel.state.canUndo)
         XCTAssertFalse(session.commandModel.state.canRedo)
-        let original = session.pendingEdits
+        XCTAssertEqual(session.pendingEdits, original)
         let canvasBefore = session.renderDiagnostics.canvasUpdateCount
         await probe.releaseSave()
         await session.waitUntilSettled()
-        XCTAssertEqual(nativeGate, .open)
+        XCTAssertEqual(controller.inputGate, .open)
         XCTAssertEqual(session.inputGate, .open)
-        XCTAssertTrue(session.commandModel.state.canUndo)
+        XCTAssertTrue(controller.currentUndoAvailability.canRedo)
         XCTAssertTrue(session.commandModel.state.canRedo)
+        XCTAssertEqual(session.commandModel.state.canUndo, controller.currentUndoAvailability.canUndo)
         XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
         XCTAssertTrue(session.pendingEdits.isEmpty)
         let storage = await probe.storage(notebookID: session.notebookID)
@@ -1017,5 +1045,24 @@ private actor WritingAuditGate {
         let continuation = continuation
         self.continuation = nil
         continuation?.resume()
+    }
+}
+
+@MainActor
+private final class WritingUndoTarget {
+    private weak var manager: UndoManager?
+    private(set) var calls = 0
+
+    init(manager: UndoManager) { self.manager = manager }
+
+    func register() {
+        manager?.beginUndoGrouping()
+        manager?.registerUndo(withTarget: self) { $0.change() }
+        manager?.endUndoGrouping()
+    }
+
+    private func change() {
+        manager?.registerUndo(withTarget: self) { $0.change() }
+        calls += 1
     }
 }
