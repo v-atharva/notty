@@ -62,6 +62,13 @@ final class NotebookSession: ObservableObject {
     private var workingSignature: InkDrawingSignature?
     let gateModel = NotebookCanvasGateModel()
     let statusModel = NotebookSavePresentationModel()
+    let integrityModel = NotebookIntegrityPresentationModel()
+    private var installationID = UUID()
+    private var openingPin: NotebookHistoryPin?
+    private var requiresPinRefresh = false
+    private var integrityFailure: NotebookSaveFailure?
+    private var auditID = UUID()
+    private var auditTask: Task<Void, Never>?
     let renderDiagnostics = NotebookRenderDiagnostics()
     private var presentationObservation: AnyCancellable?
     private var preservedState: PreservedState?
@@ -86,6 +93,7 @@ final class NotebookSession: ObservableObject {
         guard loadState == .ready else { return .failed }
         if isPerformingRecovery { return .recovering }
         guard let coordinator, coordinator.failure == nil else { return .failed }
+        if integrityFailure != nil { return .readOnly }
         return coordinator.canAcceptInput ? .open : .capacity
     }
     var inputPaused: Bool { !inputGate.allowsMutation }
@@ -95,7 +103,8 @@ final class NotebookSession: ObservableObject {
         activeCanvasOwner == ownerID ? inputGate : .readOnly
     }
     var canPreserveRecovery: Bool {
-        coordinator?.failure != nil && !pendingEdits.isEmpty && !isPerformingRecovery
+        (coordinator?.failure != nil || integrityFailure != nil)
+            && !pendingEdits.isEmpty && !isPerformingRecovery
     }
     var canReopenSaved: Bool {
         guard !isPerformingRecovery, let preservedState else { return false }
@@ -128,7 +137,8 @@ final class NotebookSession: ObservableObject {
         do {
             let opened = try await openStorage()
             storage = opened
-            let stored = try await opened.load()
+            let opening = try await readOpening(opened)
+            let stored = opening.notebook
             let drawing: PKDrawing
             if let stored {
                 try validateExtent(stored.content.pageCount)
@@ -136,7 +146,7 @@ final class NotebookSession: ObservableObject {
             } else {
                 drawing = PKDrawing()
             }
-            install(stored: stored, drawing: drawing)
+            install(opening: opening, drawing: drawing)
             if stored == nil { enqueueCurrentDrawing() }
         } catch {
             loadState = .failed(NotebookSaveFailure.classify(error))
@@ -383,7 +393,9 @@ final class NotebookSession: ObservableObject {
                 throw NotebookSaveFailure.corruptData
             }
             recoveryVerified = true
-            let stored = try await storage.load()
+            retireAudit()
+            let opening = try await readOpening(storage)
+            let stored = opening.notebook
             captureWorkingInk()
             guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
             guard let stored else { throw NotebookSaveFailure.corruptData }
@@ -486,9 +498,17 @@ final class NotebookSession: ObservableObject {
         }
     }
 
-    private func install(stored: StoredNotebook?, drawing: PKDrawing) {
+    private func install(opening: NotebookOpening, drawing: PKDrawing) {
+        let stored = opening.notebook
         guard let storage else { return }
         if let active = backgroundFlush { finishBackgroundFlush(id: active.id) }
+        retireAudit()
+        installationID = UUID()
+        openingPin = opening.historyPin
+        requiresPinRefresh = storage.auditHistory != nil && opening.requiresFirstPublicationRefresh
+        integrityFailure = nil
+        integrityModel.update(nil)
+        let installedID = installationID
         workingDrawing = drawing
         workingSignature = try? InkDrawingSignature(drawing)
         latestCanvasGeneration = 0
@@ -502,7 +522,7 @@ final class NotebookSession: ObservableObject {
         let coordinator = NotebookSaveCoordinator(
             initialSnapshot: stored == nil ? nil : initial,
             expectedRevisionID: stored?.revisionID, savedAt: stored?.savedAt,
-            saveBatch: { edits, revision in
+            saveBatch: { [weak self] edits, revision in
                 var encoded: [NotebookSaveEdit] = []
                 var codecFailure: NotebookPendingFailure?
                 for (index, edit) in edits.enumerated() {
@@ -523,9 +543,25 @@ final class NotebookSession: ObservableObject {
                     }
                 }
                 if encoded.isEmpty {
+                    await self?.refreshHistoryPin(
+                        installation: installedID, expectedRevisionID: revision, published: false
+                    )
                     return NotebookSaveBatchOutcome(committed: [], rejection: codecFailure)
                 }
-                let result = try await storage.saveBatch(encoded, revision)
+                let result: NotebookBatchSaveResult
+                do {
+                    result = try await storage.saveBatch(encoded, revision)
+                } catch {
+                    await self?.refreshHistoryPin(
+                        installation: installedID, expectedRevisionID: revision, published: false
+                    )
+                    throw error
+                }
+                await self?.refreshHistoryPin(
+                    installation: installedID,
+                    expectedRevisionID: result.committed.last?.revisionID ?? revision,
+                    published: !result.committed.isEmpty
+                )
                 let rejection = result.rejection.map {
                     NotebookPendingFailure(
                         index: $0.index, editID: $0.editID, cause: NotebookSaveFailure.classify($0.error)
@@ -546,8 +582,105 @@ final class NotebookSession: ObservableObject {
         self.coordinator = coordinator
         canvasGeneration = UUID()
         loadState = .ready
+        if let pin = openingPin {
+            startAudit(pin: pin)
+        } else if storage.auditHistory != nil {
+            integrityModel.update(stored == nil ? .checking : .incomplete(.storageUnavailable))
+        }
         refreshPresentation()
     }
+
+
+    private func readOpening(_ storage: NotebookStorage) async throws -> NotebookOpening {
+        let opening: NotebookOpening
+        if let open = storage.openForEditing {
+            opening = try await open()
+        } else {
+            opening = NotebookOpening(notebook: try await storage.load(), historyPin: nil)
+        }
+        if let pin = opening.historyPin {
+            guard pin.notebookID == notebookID,
+                  pin.revisionID == opening.notebook?.revisionID,
+                  pin.sequence == opening.notebook?.sequence else {
+                throw NotebookSaveFailure.corruptData
+            }
+        }
+        return opening
+    }
+
+    private func retireAudit() {
+        auditID = UUID()
+        auditTask?.cancel()
+        auditTask = nil
+        if integrityModel.state == .checking { integrityModel.update(nil) }
+    }
+
+    private func startAudit(pin: NotebookHistoryPin) {
+        guard let audit = storage?.auditHistory else { return }
+        retireAudit()
+        let id = auditID
+        let installation = installationID
+        if integrityFailure == nil { integrityModel.update(.checking) }
+        auditTask = Task { [weak self] in
+            let outcome = await audit(pin)
+            guard !Task.isCancelled, let self,
+                  self.installationID == installation, self.auditID == id else { return }
+            self.auditTask = nil
+            switch outcome {
+            case .verified(let report):
+                guard report.notebookID == pin.notebookID,
+                      report.headRevisionID == pin.revisionID, report.revisionCount > 0 else {
+                    self.integrityFailure = .corruptData
+                    self.integrityModel.update(.damaged(.corruptData))
+                    self.refreshPresentation()
+                    return
+                }
+                if self.integrityFailure == nil {
+                    self.integrityModel.update(.verified(revisions: report.revisionCount))
+                }
+            case .damaged(let failure):
+                self.integrityFailure = failure
+                self.integrityModel.update(.damaged(failure))
+            case .incomplete(let failure):
+                if self.integrityFailure == nil { self.integrityModel.update(.incomplete(failure)) }
+            case .cancelled:
+                if self.integrityFailure == nil { self.integrityModel.update(nil) }
+            }
+            self.refreshPresentation()
+        }
+    }
+
+    private func refreshHistoryPin(
+        installation: UUID, expectedRevisionID: UUID?, published: Bool
+    ) async {
+        guard installationID == installation, requiresPinRefresh, let storage else { return }
+        // Migration may select its equivalent anchor even when the following save fails.
+        retireAudit()
+        if published { requiresPinRefresh = false }
+        guard let revision = expectedRevisionID, let capture = storage.captureHistoryPin else {
+            if integrityFailure == nil { integrityModel.update(.incomplete(.storageUnavailable)) }
+            refreshPresentation()
+            return
+        }
+        do {
+            let pin = try await capture(revision)
+            guard installationID == installation else { return }
+            guard pin.notebookID == notebookID, pin.revisionID == revision else {
+                throw NotebookSaveFailure.revisionConflict
+            }
+            requiresPinRefresh = pin.requiresFirstPublicationRefresh
+            openingPin = pin
+            startAudit(pin: pin)
+        } catch {
+            guard installationID == installation else { return }
+            if integrityFailure == nil {
+                integrityModel.update(.incomplete(NotebookSaveFailure.classify(error)))
+            }
+        }
+        refreshPresentation()
+    }
+
+    deinit { auditTask?.cancel() }
 
     private func refreshPresentation() {
         if activeCanvasOwner != nil, let canvasGateSink, lastPushedCanvasGate != inputGate {
@@ -675,5 +808,43 @@ struct NotebookObservationWork {
             "renderStateBytes": renderStateBytes, "renderStateFallbacks": renderStateFallbacks,
             "uncacheableStrokeSignatures": uncacheableStrokeSignatures
         ]
+    }
+}
+
+enum NotebookIntegrityState: Equatable {
+    case checking
+    case verified(revisions: Int)
+    case damaged(NotebookSaveFailure)
+    case incomplete(NotebookSaveFailure)
+
+    var label: String {
+        switch self {
+        case .checking: "Checking notebook history"
+        case .verified: "Notebook history verified"
+        case .damaged: "Notebook history is damaged"
+        case .incomplete: "Notebook history check is incomplete"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .checking:
+            "You can keep writing while older edits are checked."
+        case .verified(let count):
+            "\(count) saved revisions were verified."
+        case .damaged:
+            "New writing is paused. You can read, scroll and zoom. Waiting edits continue saving; unsaved edits can be preserved in a recovery copy."
+        case .incomplete:
+            "Older edits could not be fully checked. You can keep writing and check again when you reopen the notebook."
+        }
+    }
+}
+
+@MainActor
+final class NotebookIntegrityPresentationModel: ObservableObject {
+    @Published private(set) var state: NotebookIntegrityState?
+
+    func update(_ next: NotebookIntegrityState?) {
+        if next != state { state = next }
     }
 }
