@@ -29,9 +29,6 @@ struct NotebookScreen: View {
                 case .ready:
                     NotebookCanvas(session: session)
                         .id(session.canvasGeneration)
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            NotebookSaveStatusView(session: session, model: session.statusModel)
-                        }
                 }
             }
             .background(Color(red: 0.98, green: 0.96, blue: 0.91))
@@ -45,11 +42,11 @@ struct NotebookScreen: View {
                         .accessibilityLabel("Notty")
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
+                    NotebookHistoryButtons(session: session, model: session.commandModel)
+                    NotebookRecoveryCopiesButton(session: session, model: session.commandModel) {
                         showsRecoveryCopies = true
-                    } label: {
-                        Label("Recovery copies", systemImage: "clock.arrow.circlepath")
                     }
+                    NotebookSaveStatusView(session: session, model: session.statusModel)
                     NotebookIntegrityIndicator(session: session, model: session.integrityModel)
                     NotebookExtendPaperButton(session: session, model: session.gateModel)
                 }
@@ -57,7 +54,9 @@ struct NotebookScreen: View {
         }
         .tint(Color(red: 0.36, green: 0.29, blue: 0.22))
         .preferredColorScheme(.light)
-        .sheet(isPresented: $showsRecoveryCopies) { NotebookRecoveryView(session: session) }
+        .sheet(isPresented: $showsRecoveryCopies, onDismiss: session.endRecoveryCopiesPresentation) {
+            NotebookRecoveryView(session: session)
+        }
         .task { await session.load() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { session.flush() }
@@ -84,54 +83,129 @@ private struct NotebookExtendPaperButton: View {
 }
 
 @MainActor
+private struct NotebookHistoryButtons: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookCanvasCommandModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: session.undo) {
+                Label("Undo", systemImage: "arrow.uturn.backward")
+            }
+            .disabled(!model.state.canUndo)
+            Button(action: session.redo) {
+                Label("Redo", systemImage: "arrow.uturn.forward")
+            }
+            .disabled(!model.state.canRedo)
+        }
+    }
+}
+
+@MainActor
+private struct NotebookRecoveryCopiesButton: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookCanvasCommandModel
+    let present: () -> Void
+
+    var body: some View {
+        Button {
+            guard session.beginRecoveryCopiesPresentation() else { return }
+            present()
+        } label: {
+            Label("Recovery copies", systemImage: "clock.arrow.circlepath")
+        }
+        .disabled(!model.state.canOpenRecoveryCopies)
+    }
+}
+
+@MainActor
 private struct NotebookSaveStatusView: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookSavePresentationModel
+    @State private var showsDetails = false
+
+    private var caption: String {
+        guard model.state.isReady else { return "Not ready" }
+        if model.state.performingRecovery { return "Recovery" }
+        if model.state.recoveryFailure != nil { return "Recovery failed" }
+        switch model.displayedStatus {
+        case .idle: return "Ready"
+        case .saving: return "Saving"
+        case .saved: return "Saved"
+        case .failed: return "Save failed"
+        }
+    }
+
+    private var symbol: String {
+        if model.state.recoveryFailure != nil { return "exclamationmark.triangle" }
+        switch model.displayedStatus {
+        case .idle: return "doc"
+        case .saving: return "arrow.up.doc"
+        case .saved: return "checkmark.circle"
+        case .failed: return "exclamationmark.triangle"
+        }
+    }
+
+    var body: some View {
+        Button { showsDetails = true } label: {
+            HStack(spacing: 5) {
+                Image(systemName: symbol)
+                    .frame(width: 18)
+                Text(caption).lineLimit(1)
+            }
+            .font(.caption)
+            .frame(width: 112, height: 28, alignment: .leading)
+        }
+        .accessibilityLabel(caption + ". Notebook save details")
+        .popover(isPresented: $showsDetails) {
+            NotebookSaveDetails(session: session, model: model)
+        }
+    }
+}
+
+@MainActor
+private struct NotebookSaveDetails: View {
     let session: NotebookSession
     @ObservedObject var model: NotebookSavePresentationModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             switch model.state.status {
             case .idle:
-                Text("Ready")
+                Text("Ready").font(.headline)
             case .saving:
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text(model.state.inputPaused ? "Catching up on saves…" : "Saving…")
-                }
+                Text(model.state.inputPaused ? "Catching up on saves" : "Saving").font(.headline)
             case .saved(let date):
-                Label("Saved \(date.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+                Text("Saved").font(.headline)
+                Text(date.formatted(date: .abbreviated, time: .standard))
             case .failed(let cause):
-                Label(cause.title, systemImage: "exclamationmark.triangle").fontWeight(.semibold)
+                Text(cause.title).font(.headline)
                 Text(cause.message)
                 Text("Writing is paused. You can scroll and zoom.")
-                HStack(spacing: 16) {
-                    if cause.canRetry {
-                        Button("Retry save", action: session.retrySave)
-                            .disabled(model.state.performingRecovery)
-                    }
-                    Button("Preserve recovery copy") {
-                        Task { await session.saveRecoveryCopy() }
-                    }
-                    .disabled(!model.state.canPreserveRecovery)
-                    if model.state.canReopenSaved {
-                        Button("Reopen saved notebook") {
-                            Task { await session.reopenSavedNotebook() }
-                        }
+                if cause.canRetry {
+                    Button("Retry save", action: session.retrySave)
+                        .disabled(model.state.performingRecovery)
+                }
+                Button("Preserve recovery copy") {
+                    Task { await session.saveRecoveryCopy() }
+                }
+                .disabled(!model.state.canPreserveRecovery)
+                if model.state.canReopenSaved {
+                    Button("Reopen saved notebook") {
+                        Task { await session.reopenSavedNotebook() }
                     }
                 }
             }
-            if model.state.performingRecovery {
-                ProgressView("Preserving or opening notebook")
-            }
+            if model.state.performingRecovery { Text("Preserving or opening notebook") }
             if let message = model.state.recoveryMessage { Text(message) }
-            if let failure = model.state.recoveryFailure { Text(failure.title).fontWeight(.semibold) }
+            if let failure = model.state.recoveryFailure {
+                Text(failure.title).fontWeight(.semibold)
+                Text(failure.message)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.footnote)
-        .foregroundStyle(Color(red: 0.28, green: 0.23, blue: 0.18))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(Color(red: 0.98, green: 0.96, blue: 0.91))
+        .padding(20)
+        .frame(idealWidth: 320, alignment: .leading)
         .accessibilityElement(children: .contain)
     }
 }

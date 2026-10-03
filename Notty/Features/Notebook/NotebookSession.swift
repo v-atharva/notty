@@ -37,8 +37,8 @@ final class NotebookSession: ObservableObject {
     @Published private(set) var title = "Personal notebook"
     @Published private(set) var canvasGeneration = UUID()
     @Published private(set) var isPerformingRecovery = false
-    @Published private(set) var recoveryMessage: String?
-    @Published private(set) var recoveryFailure: NotebookSaveFailure?
+    private(set) var recoveryMessage: String?
+    private(set) var recoveryFailure: NotebookSaveFailure?
     @Published private(set) var recoveryCopies: [NotebookRecoveryReceipt] = []
     @Published private(set) var unavailableRecoveryCopyIDs: [UUID] = []
     @Published private(set) var isLoadingRecoveryCopies = false
@@ -61,7 +61,21 @@ final class NotebookSession: ObservableObject {
     private var latestCanvasGeneration: UInt64 = 0
     private var workingSignature: InkDrawingSignature?
     let gateModel = NotebookCanvasGateModel()
-    let statusModel = NotebookSavePresentationModel()
+    let statusModel: NotebookSavePresentationModel
+    let commandModel = NotebookCanvasCommandModel()
+    private var canvasControls: NotebookCanvasControls?
+    private var undoAvailability = NotebookUndoAvailability.unavailable
+    private var paletteSuppressed = false
+    private var isRefreshingPresentation = false
+    private struct ExtentIntent {
+        let installation: UUID
+        let ownerID: UUID
+        let completion: NotebookToolCompletion
+    }
+    private var extentIntent: ExtentIntent?
+    private let feedbackDelay: @Sendable (Duration) async throws -> Void
+    private var feedbackID = UUID()
+    private var feedbackTask: Task<Void, Never>?
     let integrityModel = NotebookIntegrityPresentationModel()
     private var installationID = UUID()
     private var openingPin: NotebookHistoryPin?
@@ -107,7 +121,8 @@ final class NotebookSession: ObservableObject {
             && !pendingEdits.isEmpty && !isPerformingRecovery
     }
     var canReopenSaved: Bool {
-        guard !isPerformingRecovery, let preservedState else { return false }
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard !isPerformingRecovery, !availability.isUsingTool, let preservedState else { return false }
         return matches(preservedState.coverage)
     }
 
@@ -116,9 +131,12 @@ final class NotebookSession: ObservableObject {
         libraryRoot: URL? = nil,
         recoveryRoot: URL? = nil,
         backgroundLease: NotebookBackgroundLease? = nil,
-        openStorage: (@Sendable () async throws -> NotebookStorage)? = nil
+        openStorage: (@Sendable () async throws -> NotebookStorage)? = nil,
+        feedbackDelay: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.notebookID = notebookID
+        self.feedbackDelay = feedbackDelay
+        self.statusModel = NotebookSavePresentationModel(delay: feedbackDelay)
         self.backgroundLease = backgroundLease ?? NotebookBackgroundLease()
         self.openStorage = openStorage ?? {
             try await NotebookStorage.open(
@@ -163,6 +181,7 @@ final class NotebookSession: ObservableObject {
         canvasGateSink = nil
         lastPushedCanvasGate = nil
         latestCanvasGeneration = 0
+        resetCanvasCommands()
         return CanvasSeed(ownerID: owner, drawing: workingDrawing, pageCount: pageCount)
     }
 
@@ -172,17 +191,22 @@ final class NotebookSession: ObservableObject {
         canvasGateSink = nil
         lastPushedCanvasGate = nil
         snapshotProvider = snapshot
+        resetCanvasCommands()
     }
 
     func attachCanvas(
         ownerID: UUID, observations: @escaping () -> NotebookCanvasObservation?,
-        applyInputGate: @escaping (NotebookInputGate) -> Void = { _ in }
+        applyInputGate: @escaping (NotebookInputGate) -> Void = { _ in },
+        controls: NotebookCanvasControls? = nil
     ) {
         guard activeCanvasOwner == ownerID else { return }
         observationProvider = observations
         snapshotProvider = nil
         canvasGateSink = applyInputGate
+        canvasControls = controls
         lastPushedCanvasGate = nil
+        controls?.setPaletteSuppressed(paletteSuppressed)
+        if let controls { undoAvailability = controls.currentAvailability() }
         refreshPresentation()
     }
 
@@ -194,6 +218,8 @@ final class NotebookSession: ObservableObject {
         observationProvider = nil
         canvasGateSink = nil
         lastPushedCanvasGate = nil
+        resetCanvasCommands()
+        refreshPresentation()
     }
 
     @discardableResult
@@ -225,13 +251,159 @@ final class NotebookSession: ObservableObject {
         guard canEdit, pageCount < NotebookViewController.maximumPageCount else { return }
         captureWorkingInk()
         guard canEdit else { return }
+        extentIntent = nil
         pageCount += 1
+        canvasControls?.applyPageCount(pageCount)
         enqueueCurrentDrawing()
     }
 
+
+    func updateUndoAvailability(_ availability: NotebookUndoAvailability, ownerID: UUID) {
+        guard activeCanvasOwner == ownerID else { return }
+        undoAvailability = availability
+        refreshPresentation()
+    }
+
+    func canPerformHistoryAction(ownerID: UUID) -> Bool {
+        guard activeCanvasOwner == ownerID, !paletteSuppressed,
+              inputGate == .open || inputGate == .capacity else { return false }
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        return !availability.isUsingTool
+    }
+
+    // The native controller owns the capacity reservation; the session checks admission.
+    func reserveHistoryAction(ownerID: UUID) -> Bool {
+        canPerformHistoryAction(ownerID: ownerID)
+    }
+
+    func undo() {
+        guard let owner = activeCanvasOwner, canPerformHistoryAction(ownerID: owner) else { return }
+        canvasControls?.undo()
+    }
+
+    func redo() {
+        guard let owner = activeCanvasOwner, canPerformHistoryAction(ownerID: owner) else { return }
+        canvasControls?.redo()
+    }
+
+    @discardableResult
+    func beginRecoveryCopiesPresentation() -> Bool {
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard !availability.isUsingTool else { return false }
+        paletteSuppressed = true
+        canvasControls?.setPaletteSuppressed(true)
+        refreshPresentation()
+        return true
+    }
+
+    func endRecoveryCopiesPresentation() {
+        paletteSuppressed = false
+        canvasControls?.setPaletteSuppressed(false)
+        refreshPresentation()
+    }
+
+    func cancelCanvasToolCompletion(ownerID: UUID) {
+        guard activeCanvasOwner == ownerID else { return }
+        extentIntent = nil
+    }
+
+    func completedTool(_ completion: NotebookToolCompletion, ownerID: UUID) {
+        guard activeCanvasOwner == ownerID,
+              completion.pageCount == pageCount,
+              completion.generation > 0,
+              completion.generation <= latestCanvasGeneration,
+              completion.nearPaperEnd,
+              completion.capturedAt.timeIntervalSince1970.isFinite,
+              completion.uptime.isFinite, completion.uptime >= 0,
+              pageCount < NotebookViewController.maximumPageCount,
+              inputGate == .open || inputGate == .capacity else { return }
+        guard extentIntent == nil else { return }
+        extentIntent = ExtentIntent(
+            installation: installationID, ownerID: ownerID, completion: completion
+        )
+        refreshPresentation()
+    }
+
+    private func applyExtentIntentIfReady() {
+        guard let intent = extentIntent else { return }
+        guard intent.installation == installationID, intent.ownerID == activeCanvasOwner,
+              intent.completion.pageCount == pageCount,
+              latestCanvasGeneration >= intent.completion.generation,
+              pageCount < NotebookViewController.maximumPageCount else {
+            extentIntent = nil
+            return
+        }
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard !availability.isUsingTool else { return }
+        guard NotebookPaperMetrics.isNearPaperEnd(workingDrawing, pageCount: pageCount) else {
+            extentIntent = nil
+            return
+        }
+        // The request is conditional on current content, not on later callback provenance.
+        extentIntent = nil
+        pageCount += 1
+        canvasControls?.applyPageCount(pageCount)
+        enqueueCurrentDrawing(stamp: NotebookEditStamp(
+            capturedAt: intent.completion.capturedAt, uptime: intent.completion.uptime,
+            sessionID: editSessionID
+        ))
+    }
+
+    private func resetCanvasCommands() {
+        canvasControls = nil
+        undoAvailability = .unavailable
+        extentIntent = nil
+        commandModel.update(NotebookCanvasCommandModel.State(
+            canUndo: false, canRedo: false, isUsingTool: false, canOpenRecoveryCopies: true
+        ))
+    }
+
+    private func refreshCommandAvailability() {
+        if let canvasControls { undoAvailability = canvasControls.currentAvailability() }
+        let canAct = activeCanvasOwner.map { canPerformHistoryAction(ownerID: $0) } ?? false
+        commandModel.update(NotebookCanvasCommandModel.State(
+            canUndo: canAct && undoAvailability.canUndo,
+            canRedo: canAct && undoAvailability.canRedo,
+            isUsingTool: undoAvailability.isUsingTool,
+            canOpenRecoveryCopies: !undoAvailability.isUsingTool
+        ))
+    }
+
+    private func clearRecoveryFeedback() {
+        feedbackTask?.cancel()
+        feedbackTask = nil
+        feedbackID = UUID()
+        recoveryMessage = nil
+        recoveryFailure = nil
+        refreshPresentation()
+    }
+
+    private func setRecoveryFeedback(_ message: String, failure: NotebookSaveFailure? = nil) {
+        clearRecoveryFeedback()
+        recoveryMessage = message
+        recoveryFailure = failure
+        refreshPresentation()
+        guard failure == nil else { return }
+        let installation = installationID
+        let id = feedbackID
+        let delay = feedbackDelay
+        feedbackTask = Task { @MainActor [weak self] in
+            guard !Task.isCancelled else { return }
+            do { try await delay(.seconds(5)) } catch { return }
+            guard !Task.isCancelled, let self,
+                  self.installationID == installation, self.feedbackID == id,
+                  self.recoveryFailure == nil else { return }
+            self.recoveryMessage = nil
+            self.feedbackTask = nil
+            self.refreshPresentation()
+        }
+    }
+
     func retrySave() {
-        guard !isPerformingRecovery else { return }
-        coordinator?.retry()
+        guard !isPerformingRecovery, let coordinator,
+              coordinator.failure?.canRetry == true, coordinator.pendingCount > 0 else { return }
+        clearRecoveryFeedback()
+        coordinator.retry()
     }
 
     func flush() {
@@ -316,8 +488,7 @@ final class NotebookSession: ObservableObject {
         let id = UUID()
         preservationID = id
         isPerformingRecovery = true
-        recoveryMessage = nil
-        recoveryFailure = nil
+        clearRecoveryFeedback()
         // The session owns this work even if a caller stops waiting.
         let task = Task { [self] in
             await preserveRecoveryCopy(storage: storage, coordinator: coordinator, id: id)
@@ -361,15 +532,17 @@ final class NotebookSession: ObservableObject {
                 receipt: receipt, fingerprint: fingerprint, coverage: coverage
             )
             if unchangedAfterEncoding && unchangedAfterFingerprint && matches(coverage) {
-                recoveryMessage = "All waiting edits are preserved. You can reopen the saved notebook."
+                setRecoveryFeedback("All waiting edits are preserved. You can reopen the saved notebook.")
             } else {
-                recoveryMessage = "A copy was preserved. Newer waiting edits need another copy before reopening."
+                setRecoveryFeedback("A copy was preserved. Newer waiting edits need another copy before reopening.")
             }
         } catch {
             guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
-            recoveryFailure = NotebookSaveFailure.classify(error)
-            recoveryMessage = "The recovery copy could not be saved. Your waiting edits remain here."
+            setRecoveryFeedback(
+                "The recovery copy could not be saved. Your waiting edits remain here.",
+                failure: NotebookSaveFailure.classify(error)
+            )
         }
     }
 
@@ -379,8 +552,8 @@ final class NotebookSession: ObservableObject {
         let coverage = preservedState.coverage
         retireAudit()
         isPerformingRecovery = true
-        recoveryFailure = nil
-        recoveryMessage = nil
+        clearRecoveryFeedback()
+        extentIntent = nil
         defer { finishRecoveryOperation() }
         var recoveryVerified = false
         do {
@@ -408,12 +581,14 @@ final class NotebookSession: ObservableObject {
             snapshotProvider = nil
             install(opening: opening, drawing: drawing)
             self.preservedState = nil
-            recoveryMessage = "Saved notebook reopened. Your recovery copy remains available."
+            setRecoveryFeedback("Saved notebook reopened. Your recovery copy remains available.")
         } catch {
             captureWorkingInk()
             if !recoveryVerified { self.preservedState = nil }
-            recoveryFailure = NotebookSaveFailure.classify(error)
-            recoveryMessage = "The saved notebook could not be reopened. Your waiting edits remain here."
+            setRecoveryFeedback(
+                "The saved notebook could not be reopened. Your waiting edits remain here.",
+                failure: NotebookSaveFailure.classify(error)
+            )
         }
     }
 
@@ -504,6 +679,9 @@ final class NotebookSession: ObservableObject {
         if let active = backgroundFlush { finishBackgroundFlush(id: active.id) }
         retireAudit()
         installationID = UUID()
+        clearRecoveryFeedback()
+        statusModel.reset()
+        resetCanvasCommands()
         openingPin = opening.historyPin
         requiresPinRefresh = storage.auditHistory != nil && opening.requiresFirstPublicationRefresh
         integrityFailure = nil
@@ -689,18 +867,32 @@ final class NotebookSession: ObservableObject {
         refreshPresentation()
     }
 
-    deinit { auditTask?.cancel() }
+    deinit {
+        auditTask?.cancel()
+        feedbackTask?.cancel()
+    }
 
     private func refreshPresentation() {
+        guard !isRefreshingPresentation else { return }
+        isRefreshingPresentation = true
+        defer { isRefreshingPresentation = false }
+        if inputGate == .failed || inputGate == .readOnly || inputGate == .recovering {
+            extentIntent = nil
+        }
+        if inputGate == .open {
+            applyExtentIntentIfReady()
+        }
         if activeCanvasOwner != nil, let canvasGateSink, lastPushedCanvasGate != inputGate {
             lastPushedCanvasGate = inputGate
             canvasGateSink(inputGate)
         }
+        refreshCommandAvailability()
         gateModel.update(pageCount: pageCount, inputGate: inputGate)
         statusModel.update(NotebookSavePresentation(
             status: saveState, inputPaused: inputPaused, performingRecovery: isPerformingRecovery,
             canPreserveRecovery: canPreserveRecovery, canReopenSaved: canReopenSaved,
-            recoveryMessage: recoveryMessage, recoveryFailure: recoveryFailure
+            recoveryMessage: recoveryMessage, recoveryFailure: recoveryFailure,
+            isReady: loadState == .ready
         ))
     }
 }
@@ -747,6 +939,22 @@ struct NotebookSavePresentation: Equatable {
     let canReopenSaved: Bool
     let recoveryMessage: String?
     let recoveryFailure: NotebookSaveFailure?
+    let isReady: Bool
+
+    init(
+        status: NotebookSaveStatus, inputPaused: Bool, performingRecovery: Bool,
+        canPreserveRecovery: Bool, canReopenSaved: Bool,
+        recoveryMessage: String?, recoveryFailure: NotebookSaveFailure?, isReady: Bool = true
+    ) {
+        self.status = status
+        self.inputPaused = inputPaused
+        self.performingRecovery = performingRecovery
+        self.canPreserveRecovery = canPreserveRecovery
+        self.canReopenSaved = canReopenSaved
+        self.recoveryMessage = recoveryMessage
+        self.recoveryFailure = recoveryFailure
+        self.isReady = isReady
+    }
 }
 
 @MainActor
@@ -754,11 +962,65 @@ final class NotebookSavePresentationModel: ObservableObject {
     @Published private(set) var state = NotebookSavePresentation(
         status: .idle, inputPaused: true, performingRecovery: false,
         canPreserveRecovery: false, canReopenSaved: false,
-        recoveryMessage: nil, recoveryFailure: nil
+        recoveryMessage: nil, recoveryFailure: nil, isReady: false
     )
+
+    @Published private(set) var displayedStatus = NotebookSaveStatus.idle
+    private let delay: @Sendable (Duration) async throws -> Void
+    private var savingTask: Task<Void, Never>?
+    private var episode = UUID()
+
+    init(delay: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
+        self.delay = delay
+    }
+
+    func reset() {
+        savingTask?.cancel()
+        savingTask = nil
+        episode = UUID()
+        displayedStatus = .idle
+    }
 
     func update(_ next: NotebookSavePresentation) {
         if next != state { state = next }
+        if next.status == .saving {
+            guard savingTask == nil, displayedStatus != .saving else { return }
+            let id = episode
+            let delay = delay
+            savingTask = Task { @MainActor [weak self] in
+                guard !Task.isCancelled else { return }
+                do { try await delay(.milliseconds(400)) } catch { return }
+                guard !Task.isCancelled, let self, self.episode == id,
+                      self.state.status == .saving else { return }
+                self.displayedStatus = .saving
+                self.savingTask = nil
+            }
+        } else {
+            savingTask?.cancel()
+            savingTask = nil
+            episode = UUID()
+            if displayedStatus != next.status { displayedStatus = next.status }
+        }
+    }
+
+    deinit { savingTask?.cancel() }
+}
+
+@MainActor
+final class NotebookCanvasCommandModel: ObservableObject {
+    struct State: Equatable {
+        let canUndo: Bool
+        let canRedo: Bool
+        let isUsingTool: Bool
+        let canOpenRecoveryCopies: Bool
+    }
+
+    @Published private(set) var state = State(
+        canUndo: false, canRedo: false, isUsingTool: false, canOpenRecoveryCopies: true
+    )
+
+    func update(_ next: State) {
+        if state != next { state = next }
     }
 }
 

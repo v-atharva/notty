@@ -20,10 +20,32 @@ struct NotebookCanvas: UIViewControllerRepresentable {
             session.recordObservation(observation, ownerID: seed.ownerID)
             return session.inputGateForCanvas(ownerID: seed.ownerID)
         }
+        controller.canPerformHistoryAction = { [weak session] in
+            session?.canPerformHistoryAction(ownerID: seed.ownerID) ?? false
+        }
+        controller.reserveHistoryAction = { [weak session] in
+            session?.reserveHistoryAction(ownerID: seed.ownerID) ?? false
+        }
+        controller.onUndoAvailabilityChange = { [weak session] availability in
+            session?.updateUndoAvailability(availability, ownerID: seed.ownerID)
+        }
+        controller.onToolCompletion = { [weak session] completion in
+            session?.completedTool(completion, ownerID: seed.ownerID)
+        }
+        controller.onInteractionInterrupted = { [weak session] in
+            session?.cancelCanvasToolCompletion(ownerID: seed.ownerID)
+        }
         session.attachCanvas(
             ownerID: seed.ownerID,
             observations: { [weak controller] in controller?.captureBarrier() },
-            applyInputGate: { [weak controller] in controller?.setInputGate($0) }
+            applyInputGate: { [weak controller] in controller?.setInputGate($0) },
+            controls: NotebookCanvasControls(
+                undo: { [weak controller] in controller?.performUndo() },
+                redo: { [weak controller] in controller?.performRedo() },
+                setPaletteSuppressed: { [weak controller] in controller?.setPaletteSuppressed($0) },
+                applyPageCount: { [weak controller] in controller?.setPageCount($0) },
+                currentAvailability: { [weak controller] in controller?.currentUndoAvailability ?? .unavailable }
+            )
         )
         controller.onDetach = { [weak session] in
             session?.detachCanvas(ownerID: seed.ownerID)

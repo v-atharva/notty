@@ -86,7 +86,7 @@ final class NotebookControllerTests: XCTestCase {
         window.isHidden = true
     }
 
-    func testTwentyCapacityCyclesKeepResponderPaletteViewportAndInsets() {
+    func testTwentyCapacityCyclesKeepResponderPaletteViewportAndInsets() throws {
         let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
         let controller = NotebookViewController(pageCount: 3, initialDrawing: drawing)
         let window = present(controller)
@@ -95,7 +95,7 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        let picker = controller.drawingToolPicker
+        let picker = try XCTUnwrap(controller.drawingToolPicker)
         canvas.setZoomScale(
             min(canvas.minimumZoomScale * 1.25, canvas.maximumZoomScale), animated: false
         )
@@ -114,7 +114,7 @@ final class NotebookControllerTests: XCTestCase {
             XCTAssertTrue(canvas.isFirstResponder)
             XCTAssertFalse(canvas.isDrawingEnabled)
             XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
-            XCTAssertNil(canvas.undoManager)
+            XCTAssertNotNil(canvas.undoManager)
             XCTAssertEqual(picker.isVisible, pickerVisible)
             XCTAssertEqual(canvas.contentInset, insets)
             XCTAssertEqual(canvas.verticalScrollIndicatorInsets, indicatorInsets)
@@ -134,7 +134,7 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(canvas.drawing.strokes.map(\.id), drawing.strokes.map(\.id))
     }
 
-    func testNativeToolChoicesDuringCapacityCannotReenableMutation() async {
+    func testNativeToolChoicesDuringCapacityCannotReenableMutation() async throws {
         let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
         let controller = NotebookViewController(pageCount: 3, initialDrawing: drawing)
         let window = present(controller)
@@ -143,7 +143,7 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        let picker = controller.drawingToolPicker
+        let picker = try XCTUnwrap(controller.drawingToolPicker)
         let originalTool = picker.selectedToolItem
         let initialDrawing = canvas.drawing
         let tools = picker.toolItems.filter {
@@ -160,7 +160,7 @@ final class NotebookControllerTests: XCTestCase {
             XCTAssertTrue(canvas.isFirstResponder)
             XCTAssertFalse(canvas.isDrawingEnabled)
             XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
-            XCTAssertNil(canvas.undoManager)
+            XCTAssertNotNil(canvas.undoManager)
             for action in ["cut:", "paste:", "delete:", "undo:", "redo:", "duplicate:"] {
                 let selector = NSSelectorFromString(action)
                 XCTAssertFalse(canvas.canPerformAction(selector, withSender: nil))
@@ -260,7 +260,7 @@ final class NotebookControllerTests: XCTestCase {
             controller.setInputGate(gate)
             controller.setInputGate(gate)
             XCTAssertFalse(controller.canvasView.isFirstResponder)
-            XCTAssertFalse(controller.drawingToolPicker.isVisible)
+            XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
             XCTAssertFalse(controller.canvasView.isDrawingEnabled)
             XCTAssertTrue(controller.canvasView.panGestureRecognizer.isEnabled)
             XCTAssertTrue(controller.canvasView.pinchGestureRecognizer?.isEnabled == true)
@@ -295,19 +295,19 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(controller.inputGate, .capacity)
         XCTAssertTrue(canvas.isDrawingEnabled)
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
-        XCTAssertNil(canvas.undoManager)
+        XCTAssertNotNil(canvas.undoManager)
         XCTAssertFalse(canvas.canPerformAction(NSSelectorFromString("paste:"), withSender: nil))
         controller.setInputGate(.failed)
         XCTAssertTrue(canvas.isDrawingEnabled)
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertTrue(canvas.isFirstResponder)
-        XCTAssertTrue(controller.drawingToolPicker.isVisible)
+        XCTAssertTrue(controller.drawingToolPicker?.isVisible == true)
         controller.canvasViewDidEndUsingTool(canvas)
         XCTAssertFalse(canvas.isDrawingEnabled)
         XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertEqual(observations.count, 2)
         XCTAssertFalse(canvas.isFirstResponder)
-        XCTAssertFalse(controller.drawingToolPicker.isVisible)
+        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
         controller.tearDown()
         XCTAssertEqual(observations.count, 2)
     }
@@ -362,7 +362,7 @@ final class NotebookControllerTests: XCTestCase {
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
-        controller.drawingToolPicker.setVisible(true, forFirstResponder: controller.canvasView)
+        controller.drawingToolPicker?.setVisible(true, forFirstResponder: controller.canvasView)
         XCTAssertTrue(controller.canvasView.becomeFirstResponder())
         return window
     }
