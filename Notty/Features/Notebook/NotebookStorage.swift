@@ -12,23 +12,32 @@ struct NotebookStorage: Sendable {
         notebookID: UUID, libraryRoot: URL?, recoveryRoot: URL?
     ) async throws -> Self {
         try await Task.detached(priority: .utility) {
-            let support = try FileManager.default.url(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask,
-                appropriateFor: nil,
-                create: true
-            )
-            let repository = try NotebookRepository(
-                rootURL: libraryRoot ?? support.appendingPathComponent("NottyLibrary", isDirectory: true)
-            )
+            let support: URL?
+            if libraryRoot == nil || recoveryRoot == nil {
+                support = try FileManager.default.url(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: nil,
+                    create: true
+                )
+            } else {
+                support = nil
+            }
+            guard let resolvedLibrary = libraryRoot
+                    ?? support?.appendingPathComponent("NottyLibrary", isDirectory: true),
+                  let resolvedRecovery = recoveryRoot
+                    ?? support?.appendingPathComponent("NottyRecovery", isDirectory: true) else {
+                throw NotebookSaveFailure.storageUnavailable
+            }
+            let repository = NotebookRepositoryAccess(root: resolvedLibrary, notebookID: notebookID)
             let recovery = NotebookRecoveryAccess(
-                root: recoveryRoot ?? support.appendingPathComponent("NottyRecovery", isDirectory: true)
+                root: resolvedRecovery
             )
             return Self(
-                load: { try await repository.load(id: notebookID) },
+                load: { try await repository.load() },
                 save: { content, revision in
                     try await repository.save(
-                        id: notebookID, content: content, expectedRevisionID: revision
+                        content: content, expectedRevisionID: revision
                     )
                 },
                 preserve: { try await recovery.preserve($0) },
@@ -62,5 +71,33 @@ private actor NotebookRecoveryAccess {
 
     func load(id: UUID) async throws -> NotebookRecoveryBatch {
         try await openedStore().load(id: id)
+    }
+}
+
+private actor NotebookRepositoryAccess {
+    let root: URL
+    let notebookID: UUID
+    private var repository: NotebookRepository?
+
+    init(root: URL, notebookID: UUID) {
+        self.root = root
+        self.notebookID = notebookID
+    }
+
+    private func openedRepository() throws -> NotebookRepository {
+        if let repository { return repository }
+        let opened = try NotebookRepository(rootURL: root)
+        repository = opened
+        return opened
+    }
+
+    func load() async throws -> StoredNotebook? {
+        try await openedRepository().load(id: notebookID)
+    }
+
+    func save(content: NotebookContent, expectedRevisionID: UUID?) async throws -> StoredNotebook {
+        try await openedRepository().save(
+            id: notebookID, content: content, expectedRevisionID: expectedRevisionID
+        )
     }
 }

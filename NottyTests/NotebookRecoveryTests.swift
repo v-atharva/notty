@@ -107,4 +107,47 @@ final class NotebookRecoveryTests: XCTestCase {
             XCTFail("Recovery limits must reject excess strokes.")
         } catch NotebookSaveFailure.contentLimit {}
     }
+
+    func testPreservedCopyRemainsAccessibleAfterRestartWithUnsafeLibraryRoot() async throws {
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let libraryRoot = root.appendingPathComponent("Library")
+        let marker = Data("existing damaged library".utf8)
+        try marker.write(to: libraryRoot)
+        let recoveryRoot = root.appendingPathComponent("Recovery", isDirectory: true)
+        let notebookID = UUID()
+        let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
+        let edit = NotebookPendingEdit(
+            snapshot: NotebookDrawingSnapshot(drawing: drawing, pageCount: 3, title: "Notes"),
+            stamp: NotebookTestFixtures.stamp(1)
+        )
+        let batch = try await NotebookRecoveryCodec().encode(
+            notebookID: notebookID, baseRevisionID: UUID(), edits: [edit]
+        )
+        let store = try NotebookRecoveryStore(rootURL: recoveryRoot)
+        let receipt = try await store.preserve(batch)
+
+        let restarted = NotebookSession(
+            notebookID: notebookID, libraryRoot: libraryRoot, recoveryRoot: recoveryRoot
+        )
+        await restarted.load()
+        if case .failed = restarted.loadState {} else {
+            XCTFail("An unusable library root must fail closed.")
+        }
+        XCTAssertFalse(restarted.canEdit)
+        XCTAssertTrue(restarted.pendingEdits.isEmpty)
+        await restarted.refreshRecoveryCopies()
+        XCTAssertNil(restarted.recoveryListFailure)
+        XCTAssertEqual(restarted.recoveryCopies, [receipt])
+        let reopened = try await restarted.openRecoveryCopy(id: receipt.id)
+        XCTAssertEqual(reopened, batch)
+        let decoded = try await NotebookRecoveryCodec().decode(reopened.edits[0])
+        XCTAssertEqual(decoded.strokes.map(\.id), drawing.strokes.map(\.id))
+        XCTAssertEqual(reopened.edits[0].stamp, edit.stamp)
+        XCTAssertFalse(restarted.canReopenSaved)
+        XCTAssertTrue(restarted.pendingEdits.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: libraryRoot), marker)
+    }
+
 }

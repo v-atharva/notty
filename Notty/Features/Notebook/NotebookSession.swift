@@ -96,6 +96,7 @@ final class NotebookSession: ObservableObject {
         loadState = .loading
         do {
             let opened = try await openStorage()
+            storage = opened
             let stored = try await opened.load()
             let drawing: PKDrawing
             if let stored {
@@ -104,7 +105,6 @@ final class NotebookSession: ObservableObject {
             } else {
                 drawing = PKDrawing()
             }
-            storage = opened
             install(stored: stored, drawing: drawing)
             if stored == nil { enqueueCurrentDrawing() }
         } catch {
@@ -234,7 +234,11 @@ final class NotebookSession: ObservableObject {
     }
 
     func refreshRecoveryCopies() async {
-        guard let storage, !isLoadingRecoveryCopies else { return }
+        guard !isLoadingRecoveryCopies else { return }
+        guard let storage else {
+            recoveryListFailure = .storageUnavailable
+            return
+        }
         isLoadingRecoveryCopies = true
         recoveryListFailure = nil
         defer { isLoadingRecoveryCopies = false }

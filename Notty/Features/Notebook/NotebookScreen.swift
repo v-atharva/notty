@@ -43,7 +43,6 @@ struct NotebookScreen: View {
                     } label: {
                         Label("Recovery copies", systemImage: "clock.arrow.circlepath")
                     }
-                    .disabled(session.loadState != .ready)
                     Button {
                         session.extendPaper()
                     } label: {
