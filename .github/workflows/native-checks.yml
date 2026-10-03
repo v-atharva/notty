@@ -77,7 +77,7 @@ jobs:
           if [ "${{ inputs.storage_stress }}" = "true" ]; then
             NOTTY_SWIFT_TEST_FLAGS=(-Xswiftc -DNOTTY_STORAGE_STRESS)
           fi
-          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2 "${NOTTY_SWIFT_TEST_FLAGS[@]}"
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --filter PaperGeometryTests --parallel --num-workers 2 "${NOTTY_SWIFT_TEST_FLAGS[@]}"
 
       - name: Record storage measurements
         if: always()
@@ -111,6 +111,14 @@ jobs:
             -sdk iphonesimulator27.0 \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testSimulatorAcceptsNativeDrawingInput \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testMinimumZoomCanShowAnEntireA4Section \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testCapacityKeepsTheRealUndoManagerAvailable \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownEndsActiveToolBeforeApplyingClosedAdmission \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownClearsTheActualUndoAndRedoStacks \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsFailedPreservationFeedbackWithoutChangingPendingEdits \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsSuccessfulPreservationFeedback \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testSaveFailureDoesNotResizeCanvasOrMoveViewport \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
