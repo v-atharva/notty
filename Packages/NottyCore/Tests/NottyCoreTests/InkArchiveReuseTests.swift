@@ -221,6 +221,82 @@ final class InkArchiveReuseTests: XCTestCase {
         XCTAssertNotEqual(old, try InkDrawingSignature(PKDrawing(strokes: [changed])))
     }
 
+
+    func testSemanticSignatureRepresentsContentBeyondNormalSaveCapacity() throws {
+        let template = stroke()
+        let strokes = (0...InkCodec.maximumStrokeCount).map { _ in
+            var copy = template
+            copy.id = UUID()
+            return copy
+        }
+        let drawing = PKDrawing(strokes: strokes)
+        XCTAssertEqual(drawing.strokes.count, InkCodec.maximumStrokeCount + 1)
+        let first = try InkDrawingSignature(drawing)
+        let second = try InkDrawingSignature(drawing)
+        XCTAssertTrue(first.compared(to: second).isEqual)
+        XCTAssertEqual(first.constructionWork.signatureChecks, strokes.count)
+        var changed = drawing.strokes
+        changed[0].transform = CGAffineTransform(translationX: 1, y: 2)
+        XCTAssertNotEqual(first, try InkDrawingSignature(PKDrawing(strokes: changed)))
+    }
+
+    func testBinaryPropertyListFallbackPreservesCompleteRenderState() throws {
+        var native = stroke()
+        native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        let drawing = PKDrawing(strokes: [native])
+        let first = try InkDrawingSignature(drawing, forceRenderStateEncodingFallback: true)
+        let second = try InkDrawingSignature(drawing, forceRenderStateEncodingFallback: true)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.constructionWork.renderStateFallbacks, 1)
+        XCTAssertEqual(first.constructionWork.propertyListRenderStates, 1)
+        XCTAssertEqual(first.constructionWork.nativeDrawingFallbackSnapshots, 0)
+        XCTAssertGreaterThan(first.constructionWork.renderStateBytes, 0)
+        native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 30, y: 40))
+        let changed = try InkDrawingSignature(
+            PKDrawing(strokes: [native]), forceRenderStateEncodingFallback: true
+        )
+        XCTAssertNotEqual(first, changed)
+    }
+
+    func testRareNativeEqualityFallbackDeduplicatesAndReportsItsWork() async throws {
+        var native = stroke()
+        native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        let drawing = PKDrawing(strokes: [native])
+        let first = try InkDrawingSignature(
+            drawing, forceRenderStateEncodingFallback: false,
+            forceNativeDrawingEqualityFallback: true
+        )
+        let second = try InkDrawingSignature(
+            drawing, forceRenderStateEncodingFallback: false,
+            forceNativeDrawingEqualityFallback: true
+        )
+        let comparison = first.compared(to: second)
+        XCTAssertTrue(comparison.isEqual)
+        XCTAssertEqual(comparison.work.nativeDrawingEqualityFallbacks, 1)
+        XCTAssertEqual(first.constructionWork.nativeDrawingFallbackSnapshots, 1)
+        XCTAssertEqual(first, first)
+        native.transform = CGAffineTransform(translationX: 15, y: 25)
+        let changed = try InkDrawingSignature(
+            PKDrawing(strokes: [native]), forceRenderStateEncodingFallback: false,
+            forceNativeDrawingEqualityFallback: true
+        )
+        XCTAssertNotEqual(first, changed)
+
+        let codec = InkCodec(
+            maximumStrokeCount: 10, maximumDrawingBytes: InkCodec.maximumDrawingBytes,
+            forceNativeDrawingEqualityFallback: true
+        )
+        let original = try await codec.encode(drawing)
+        let before = await codec.workMetrics
+        let same = try await codec.encode(drawing)
+        let after = await codec.workMetrics
+        XCTAssertEqual(original, same)
+        XCTAssertEqual(original[0].cachedDigest, same[0].cachedDigest)
+        XCTAssertEqual(after.serializedStrokes, before.serializedStrokes)
+        XCTAssertEqual(after.nativeDrawingEqualityFallbacks - before.nativeDrawingEqualityFallbacks, 1)
+        XCTAssertEqual(after.hashedArchiveBytes, before.hashedArchiveBytes)
+    }
+
     func testOneStrokeChangeMetricsExposeExactFallbackWorkAtOneHundredAndTwoThousand() async throws {
         for count in [100, 2_000] {
             let strokes = (0..<count).map { stroke(x: CGFloat($0) * 10) }
@@ -245,7 +321,14 @@ final class InkArchiveReuseTests: XCTestCase {
             ]
             let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
             print("NOTTY_SAVE_METRIC \(String(decoding: data, as: UTF8.self))")
+            if let path = ProcessInfo.processInfo.environment["NOTTY_SAVE_METRICS_DIRECTORY"] {
+                let directory = URL(fileURLWithPath: path, isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try data.write(
+                    to: directory.appendingPathComponent("codec-native-strokes-\(count).json"),
+                    options: .atomic
+                )
+            }
         }
     }
 }
-

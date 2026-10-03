@@ -31,6 +31,10 @@ public actor InkCodec {
         public fileprivate(set) var encodedRenderStates = 0
         public fileprivate(set) var renderStateBytes = 0
         public fileprivate(set) var renderStateFallbacks = 0
+        public fileprivate(set) var maskFallbacks = 0
+        public fileprivate(set) var propertyListRenderStates = 0
+        public fileprivate(set) var nativeDrawingFallbackSnapshots = 0
+        public fileprivate(set) var nativeDrawingEqualityFallbacks = 0
     }
 
     public static let maximumStrokeBytes = 10 * 1_024 * 1_024
@@ -38,12 +42,14 @@ public actor InkCodec {
     public static let maximumDrawingBytes = 64 * 1_024 * 1_024
     static let maximumRetiredStrokeCount = 64
     static let maximumRetiredBytes = 8 * 1_024 * 1_024
-    public private(set) var serializedStrokeCount = 0
+    public var serializedStrokeCount: Int { workMetrics.serializedStrokes }
 
     private let strokeLimit: Int
     private let byteLimit: Int
     private let retiredCountLimit: Int
     private let retiredByteLimit: Int
+    private let forceRenderStateEncodingFallback: Bool
+    private let forceNativeDrawingEqualityFallback: Bool
     private(set) var workMetrics = WorkMetrics()
     var cachedStrokeCount: Int { cache.count }
     var retiredStrokeCount: Int { retired.count }
@@ -64,9 +70,13 @@ public actor InkCodec {
         let evenOddFill: Bool
         let renderGroupID: UUID?
         let renderState: Data?
-        let canReuse: Bool
+        let nativeDrawingFallback: PKDrawing?
 
-        init(_ stroke: PKStroke, work: inout WorkMetrics) throws {
+        init(
+            _ stroke: PKStroke, work: inout WorkMetrics,
+            forceRenderStateEncodingFallback: Bool = false,
+            forceNativeDrawingEqualityFallback: Bool = false
+        ) throws {
             work.signatureChecks += 1
             path = stroke.path
             transform = stroke.transform
@@ -74,31 +84,50 @@ public actor InkCodec {
             color = stroke.ink.color.cgColor
             randomSeed = stroke.randomSeed
             renderGroupID = stroke.renderGroupID
+            var fallback: PKDrawing?
 
             if let state = stroke.renderState {
                 work.encodedRenderStates += 1
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.sortedKeys]
-                do {
-                    renderState = try encoder.encode(state)
-                    work.renderStateBytes += renderState?.count ?? 0
-                    canReuse = true
-                } catch {
-                    renderState = nil
-                    canReuse = false
+                encoder.nonConformingFloatEncodingStrategy = .convertToString(
+                    positiveInfinity: "Infinity", negativeInfinity: "-Infinity", nan: "NaN"
+                )
+                let json = forceRenderStateEncodingFallback || forceNativeDrawingEqualityFallback
+                    ? nil : (try? encoder.encode(state))
+                if let json {
+                    renderState = json
+                    work.renderStateBytes += json.count
+                } else {
                     work.renderStateFallbacks += 1
+                    work.encodedRenderStates += 1
+                    work.propertyListRenderStates += 1
+                    let encoder = PropertyListEncoder()
+                    encoder.outputFormat = .binary
+                    let binary = forceNativeDrawingEqualityFallback ? nil : try? encoder.encode(state)
+                    if let binary {
+                        renderState = binary
+                        work.renderStateBytes += binary.count
+                    } else {
+                        renderState = nil
+                        fallback = PKDrawing(strokes: [stroke])
+                        work.nativeDrawingFallbackSnapshots += 1
+                    }
                 }
             } else {
                 renderState = nil
-                canReuse = true
             }
 
             if let nativeMask = stroke.mask {
                 work.maskSnapshots += 1
-                guard let copy = nativeMask.cgPath.copy() else {
-                    throw CodecError.invalidMaskGeometry
+                mask = nativeMask.cgPath.copy()
+                if mask == nil {
+                    work.maskFallbacks += 1
+                    if fallback == nil {
+                        fallback = PKDrawing(strokes: [stroke])
+                        work.nativeDrawingFallbackSnapshots += 1
+                    }
                 }
-                mask = copy
                 #if canImport(UIKit)
                 evenOddFill = nativeMask.usesEvenOddFillRule
                 #else
@@ -108,12 +137,19 @@ public actor InkCodec {
                 mask = nil
                 evenOddFill = false
             }
+            nativeDrawingFallback = fallback
         }
 
         func matches(_ other: Self, work: inout WorkMetrics) -> Bool {
             work.signatureChecks += 1
-            guard canReuse, other.canReuse,
-                  path.id == other.path.id,
+            if nativeDrawingFallback != nil || other.nativeDrawingFallback != nil {
+                guard let first = nativeDrawingFallback, let second = other.nativeDrawingFallback else {
+                    return false
+                }
+                work.nativeDrawingEqualityFallbacks += 1
+                return first == second
+            }
+            guard path.id == other.path.id,
                   path.creationDate == other.path.creationDate,
                   path.count == other.path.count,
                   transform == other.transform,
@@ -158,13 +194,17 @@ public actor InkCodec {
         byteLimit = Self.maximumDrawingBytes
         retiredCountLimit = Self.maximumRetiredStrokeCount
         retiredByteLimit = Self.maximumRetiredBytes
+        forceRenderStateEncodingFallback = false
+        forceNativeDrawingEqualityFallback = false
     }
 
     init(
         maximumStrokeCount: Int,
         maximumDrawingBytes: Int,
         maximumRetiredStrokeCount: Int = InkCodec.maximumRetiredStrokeCount,
-        maximumRetiredBytes: Int = InkCodec.maximumRetiredBytes
+        maximumRetiredBytes: Int = InkCodec.maximumRetiredBytes,
+        forceRenderStateEncodingFallback: Bool = false,
+        forceNativeDrawingEqualityFallback: Bool = false
     ) {
         precondition(maximumStrokeCount >= 0 && maximumDrawingBytes >= 0)
         precondition(maximumRetiredStrokeCount >= 0 && maximumRetiredBytes >= 0)
@@ -172,6 +212,8 @@ public actor InkCodec {
         byteLimit = maximumDrawingBytes
         retiredCountLimit = maximumRetiredStrokeCount
         retiredByteLimit = maximumRetiredBytes
+        self.forceRenderStateEncodingFallback = forceRenderStateEncodingFallback
+        self.forceNativeDrawingEqualityFallback = forceNativeDrawingEqualityFallback
     }
 
     public func encode(_ drawing: PKDrawing) throws -> [NotebookStroke] {
@@ -191,14 +233,17 @@ public actor InkCodec {
         result.reserveCapacity(drawing.strokes.count)
 
         for stroke in drawing.strokes {
-            let signature = try StrokeSignature(stroke, work: &workMetrics)
+            let signature = try StrokeSignature(
+                stroke, work: &workMetrics,
+                forceRenderStateEncodingFallback: forceRenderStateEncodingFallback,
+                forceNativeDrawingEqualityFallback: forceNativeDrawingEqualityFallback
+            )
             let asset: NotebookStroke
             if let existing = cache[stroke.id] ?? retired[stroke.id],
                existing.signature.matches(signature, work: &workMetrics) {
                 asset = existing.asset
             } else {
                 let archive = PKDrawing(strokes: [stroke]).dataRepresentation()
-                serializedStrokeCount += 1
                 workMetrics.serializedStrokes += 1
                 guard archive.count <= Self.maximumStrokeBytes else {
                     throw CodecError.oversizedStrokeArchive
@@ -248,7 +293,11 @@ public actor InkCodec {
             }
             // Manifest identities remain authoritative across archive versions.
             stroke.id = asset.id
-            let signature = try StrokeSignature(stroke, work: &workMetrics)
+            let signature = try StrokeSignature(
+                stroke, work: &workMetrics,
+                forceRenderStateEncodingFallback: forceRenderStateEncodingFallback,
+                forceNativeDrawingEqualityFallback: forceNativeDrawingEqualityFallback
+            )
             nextCache[asset.id] = CachedStroke(signature: signature, asset: owned)
             strokes.append(stroke)
         }
@@ -315,18 +364,25 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
     public let constructionWork: InkCodec.WorkMetrics
 
     public init(_ drawing: PKDrawing) throws {
-        guard drawing.strokes.count <= InkCodec.maximumStrokeCount else {
-            throw InkCodec.CodecError.tooManyStrokes
-        }
+        try self.init(
+            drawing, forceRenderStateEncodingFallback: false,
+            forceNativeDrawingEqualityFallback: false
+        )
+    }
+
+    init(
+        _ drawing: PKDrawing, forceRenderStateEncodingFallback: Bool,
+        forceNativeDrawingEqualityFallback: Bool = false
+    ) throws {
         var work = InkCodec.WorkMetrics()
-        var identities = Set<UUID>()
         var entries: [Entry] = []
         entries.reserveCapacity(drawing.strokes.count)
         for stroke in drawing.strokes {
-            guard identities.insert(stroke.id).inserted else {
-                throw InkCodec.CodecError.duplicateStrokeID
-            }
-            let signature = try InkCodec.StrokeSignature(stroke, work: &work)
+            let signature = try InkCodec.StrokeSignature(
+                stroke, work: &work,
+                forceRenderStateEncodingFallback: forceRenderStateEncodingFallback,
+                forceNativeDrawingEqualityFallback: forceNativeDrawingEqualityFallback
+            )
             entries.append(Entry(id: stroke.id, stroke: signature))
         }
         self.entries = entries
