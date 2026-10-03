@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import PencilKit
 import QuartzCore
@@ -86,6 +87,7 @@ final class NotebookSaveThroughputTests: XCTestCase {
                 && controller.canvasView.contentSize.width > 0
                 && controller.currentDrawing.strokes.count == 2_000
         }
+        try await waitForRenderedFrames()
         await session.waitUntilSettled()
         XCTAssertTrue(session.pendingEdits.isEmpty)
         XCTAssertTrue(session.canEdit)
@@ -154,7 +156,9 @@ final class NotebookSaveThroughputTests: XCTestCase {
             controller.canvasView.drawing = sourceDrawing
             controller.view.layoutIfNeeded()
             CATransaction.flush()
-            await fulfillment(of: [callback], timeout: 5)
+            let completion = await XCTWaiter.fulfillment(of: [callback], timeout: 5)
+            guard completion == .completed else { throw ThroughputFailure.readiness }
+            try await waitForRenderedFrames()
             XCTAssertGreaterThan(observed.count, countBefore)
             XCTAssertEqual(controller.currentDrawing.strokes.last?.id, stroke.id)
         }
@@ -184,6 +188,8 @@ final class NotebookSaveThroughputTests: XCTestCase {
         XCTAssertEqual(captured.invalidShapes, 0)
         XCTAssertTrue(captured.committed.map(\.edit.id) == observed.map(\.pending.id))
         for (record, state) in zip(captured.committed, observed) {
+            XCTAssertEqual(state.pending.stamp.capturedAt, state.observation.capturedAt)
+            XCTAssertEqual(state.pending.stamp.uptime, state.observation.uptime)
             XCTAssertEqual(record.edit.content.editStamp, state.pending.stamp)
             XCTAssertEqual(record.edit.content.title, state.pending.snapshot.title)
             XCTAssertEqual(record.edit.content.pageCount, state.pending.snapshot.pageCount)
@@ -220,13 +226,22 @@ final class NotebookSaveThroughputTests: XCTestCase {
         let reopened = NotebookSession(notebookID: id, libraryRoot: library, recoveryRoot: recovery)
         await reopened.load()
         XCTAssertEqual(reopened.loadState, .ready)
-        let restored = Dictionary(uniqueKeysWithValues: reopened.workingDrawing.strokes.map { ($0.id, $0) })
-        for state in observed {
-            XCTAssertTrue(state.observation.drawing.strokes.allSatisfy { stroke in
-                guard let archived = restored[stroke.id] else { return false }
-                return equivalent(stroke, archived)
-            }, "An observed native state changed after archive restoration.")
+        var nativeArchives: [String: PKStroke] = [:]
+        XCTAssertTrue(try verifyArchivedState(first.content, drawing: initialDrawing, archives: &nativeArchives))
+        for (record, state) in zip(captured.committed, observed) {
+            XCTAssertTrue(
+                try verifyArchivedState(
+                    record.edit.content, drawing: state.observation.drawing, archives: &nativeArchives
+                ),
+                "An observed native state changed after its own archive restoration."
+            )
         }
+        XCTAssertTrue(
+            zip(session.workingDrawing.strokes, reopened.workingDrawing.strokes).allSatisfy {
+                equivalent($0.0, $0.1)
+            },
+            "The fresh session changed the final native drawing."
+        )
         XCTAssertTrue(
             reopened.workingDrawing.strokes.map(\.id) == sourceDrawing.strokes.map(\.id),
             "The reopened drawing changed its final order."
@@ -253,6 +268,7 @@ final class NotebookSaveThroughputTests: XCTestCase {
             "barrierWork": ThroughputMetrics.dictionary(barrierBefore, barrierAfter),
             "verifiedRevisions": verification.revisions,
             "verifiedDistinctAssets": verification.assets,
+            "verifiedNativeArchiveVersions": nativeArchives.count,
             "verificationElapsedMicroseconds": ThroughputMetrics.microseconds(
                 verificationStarted.duration(to: clock.now)
             )
@@ -269,6 +285,16 @@ final class NotebookSaveThroughputTests: XCTestCase {
     private struct ObservedState {
         let observation: NotebookCanvasObservation
         let pending: NotebookPendingEdit<NotebookDrawingSnapshot>
+    }
+
+    private func waitForRenderedFrames() async throws {
+        let completed = expectation(description: "Live canvas display frames")
+        let waiter = ThroughputFrameWaiter(completed: completed)
+        let link = CADisplayLink(target: waiter, selector: #selector(ThroughputFrameWaiter.advance(_:)))
+        link.add(to: .main, forMode: .common)
+        defer { link.invalidate() }
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 5)
+        guard result == .completed else { throw ThroughputFailure.readiness }
     }
 
     private func requireReady(_ predicate: () -> Bool) async throws {
@@ -294,13 +320,38 @@ final class NotebookSaveThroughputTests: XCTestCase {
         return window
     }
 
+    private func verifyArchivedState(
+        _ content: NotebookContent, drawing: PKDrawing, archives: inout [String: PKStroke]
+    ) throws -> Bool {
+        let strokes = drawing.strokes
+        guard strokes.count == content.strokes.count else { return false }
+        for (original, stored) in zip(strokes, content.strokes) {
+            let digest = stored.cachedDigest ?? NotebookDigest.sha256(stored.data)
+            let decoded: PKStroke
+            if let cached = archives[digest] {
+                decoded = cached
+            } else {
+                decoded = try autoreleasepool {
+                    let drawing = try PKDrawing(data: stored.data)
+                    guard drawing.strokes.count == 1 else { throw ThroughputFailure.asset }
+                    return drawing.strokes[0]
+                }
+                archives[digest] = decoded
+            }
+            var authoritative = decoded
+            authoritative.id = stored.id
+            guard equivalent(original, authoritative) else { return false }
+        }
+        return true
+    }
+
     private func equivalent(_ first: PKStroke, _ second: PKStroke) -> Bool {
         guard first.id == second.id, first.transform == second.transform,
-              first.ink.inkType == second.ink.inkType, first.ink.color.cgColor == second.ink.color.cgColor,
+              first.ink.inkType == second.ink.inkType, equivalentColor(first.ink.color, second.ink.color),
               first.randomSeed == second.randomSeed, first.renderGroupID == second.renderGroupID,
               first.mask?.cgPath == second.mask?.cgPath,
               first.mask?.usesEvenOddFillRule == second.mask?.usesEvenOddFillRule,
-              first.path.creationDate == second.path.creationDate,
+              first.path.id == second.path.id, first.path.creationDate == second.path.creationDate,
               first.path.count == second.path.count else { return false }
         do {
             let firstState = try renderState(first)
@@ -318,6 +369,17 @@ final class NotebookSaveThroughputTests: XCTestCase {
         }
     }
 
+    private func equivalentColor(_ first: UIColor, _ second: UIColor) -> Bool {
+        guard let space = CGColorSpace(name: CGColorSpace.extendedSRGB),
+              let first = first.cgColor.converted(to: space, intent: .relativeColorimetric, options: nil)?.components,
+              let second = second.cgColor.converted(to: space, intent: .relativeColorimetric, options: nil)?.components,
+              first.count == 4, second.count == 4 else { return false }
+        // Archive color spaces may differ; compare RGBA components in one space.
+        return zip(first, second).allSatisfy {
+            $0.0.isFinite && $0.1.isFinite && abs($0.0 - $0.1) <= 0.000_001
+        }
+    }
+
     private func renderState(_ stroke: PKStroke) throws -> Data? {
         guard let state = stroke.renderState else { return nil }
         let encoder = JSONEncoder()
@@ -326,6 +388,23 @@ final class NotebookSaveThroughputTests: XCTestCase {
             positiveInfinity: "Infinity", negativeInfinity: "-Infinity", nan: "NaN"
         )
         return try encoder.encode(state)
+    }
+}
+
+@MainActor
+private final class ThroughputFrameWaiter: NSObject {
+    private let completed: XCTestExpectation
+    private var remaining = 2
+
+    init(completed: XCTestExpectation) {
+        self.completed = completed
+        super.init()
+    }
+
+    @objc func advance(_ link: CADisplayLink) {
+        guard remaining > 0 else { return }
+        remaining -= 1
+        if remaining == 0 { completed.fulfill() }
     }
 }
 
