@@ -323,7 +323,10 @@ public actor NotebookRepository {
             _ = try migrationStore(history).migrate(head)
             validatedGenerations.removeValue(forKey: id)
             maintainedNotebookIDs.remove(id)
-            snapshot = try history.readHeadSnapshot()
+            guard let migratedSnapshot = try history.readHeadSnapshot() else {
+                throw NotebookRepositoryError.recoveryRequired
+            }
+            snapshot = migratedSnapshot
         }
         let cached = validatedGenerations[id]
         let canReuse = snapshot.map {
@@ -569,7 +572,8 @@ public actor NotebookRepository {
                 guard case .sizeLimitExceeded = error else { throw error }
             }
         }
-        // A verified candidate restores every reference to this content-addressed asset.
+        // Preparation binds immutable candidate bytes to this digest before repair.
+        // Replacing an asset restores every reference to its content address.
         try NotebookFileSystem.withSynchronizedStage(candidate, in: assets) { stage in
             metrics.record(\.assetWrittenBytes, candidate.count)
             try faultInjector?(.assetStaged)

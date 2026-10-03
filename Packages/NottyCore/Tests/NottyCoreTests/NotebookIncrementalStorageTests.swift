@@ -291,6 +291,143 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: notebook(root, id).appendingPathComponent("HEAD.json")), head)
     }
 
+    func testFundedCheckpointBurstsEncodeOnlyAfterActualByteCreditAccumulates() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try NotebookRepository(rootURL: root)
+        let id = UUID()
+        let drawing = content((0..<128).map { trustedStroke($0) }, title: String(repeating: "x", count: 4_096))
+        var latest = try await repository.save(id: id, content: drawing, expectedRevisionID: nil)
+        let initial = await repository.storageMetrics()
+        XCTAssertEqual(initial.checkpointEncodings, 1)
+        var credit = 0
+        var bursts = 0
+        for index in 1...100 {
+            let before = await repository.storageMetrics()
+            latest = try await repository.save(id: id, content: drawing, expectedRevisionID: latest.revisionID)
+            let after = await repository.storageMetrics()
+            let layout = try NotebookHistoryTestFixtures.layout(root: root, id: id)
+            let eventData = try Data(contentsOf: layout.eventURL(latest.revisionID))
+            credit += eventData.count
+            let event: NotebookRevisionFormat.Event = try NotebookRevisionFormat.decode(eventData)
+            if let digest = event.checkpointDigest {
+                let checkpointBytes = try Data(contentsOf: layout.checkpointURL(digest)).count
+                XCTAssertGreaterThanOrEqual(credit, checkpointBytes)
+                XCTAssertEqual(after.checkpointEncodings - before.checkpointEncodings, 1)
+                XCTAssertEqual(after.checkpointWrittenBytes - before.checkpointWrittenBytes, checkpointBytes)
+                XCTAssertEqual(after.checkpointPublications - before.checkpointPublications, 1)
+                bursts += 1
+                credit = 0
+            } else {
+                XCTAssertEqual(after.checkpointEncodings, before.checkpointEncodings)
+                XCTAssertEqual(after.checkpointWrittenBytes, before.checkpointWrittenBytes)
+                XCTAssertEqual(after.metadataEncodeCalls - before.metadataEncodeCalls, 2)
+            }
+            if index <= 20 { XCTAssertNil(event.checkpointDigest) }
+            XCTAssertEqual(after.assetReadCalls, before.assetReadCalls)
+        }
+        XCTAssertGreaterThan(bursts, 0)
+        let audit = try await repository.auditHistory(id: id)
+        XCTAssertEqual(audit.revisionCount, 101)
+        if let directory = ProcessInfo.processInfo.environment["NOTTY_SAVE_METRICS_DIRECTORY"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            let final = await repository.storageMetrics()
+            let report = [
+                "edits": 100, "fundedCheckpointBursts": bursts,
+                "checkpointWrittenBytes": final.checkpointWrittenBytes - initial.checkpointWrittenBytes,
+                "metadataWrittenBytes": final.metadataWrittenBytes - initial.metadataWrittenBytes
+            ]
+            try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+                .write(to: url.appendingPathComponent("checkpoint-storage.json"))
+        }
+    }
+
+    func testMigratedWarmSavesSkipReceiptChainAndExplicitMigrationInvalidatesReceipts() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try NotebookHistoryTestFixtures.writeLegacy(root: root)
+        let latest = try XCTUnwrap(fixture.states.last)
+        let repository = try NotebookRepository(rootURL: root)
+        _ = try await repository.migrateHistory(id: fixture.notebookID, expectedRevisionID: latest.revisionID)
+        let first = try await repository.save(
+            id: fixture.notebookID, content: latest.content, expectedRevisionID: latest.revisionID
+        )
+        var before = await repository.storageMetrics()
+        let second = try await repository.save(
+            id: fixture.notebookID, content: latest.content, expectedRevisionID: first.revisionID
+        )
+        var after = await repository.storageMetrics()
+        XCTAssertEqual(after.assetReadCalls, before.assetReadCalls)
+        XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
+
+        _ = try await repository.migrateHistory(id: fixture.notebookID, expectedRevisionID: second.revisionID)
+        before = await repository.storageMetrics()
+        let third = try await repository.save(
+            id: fixture.notebookID, content: latest.content, expectedRevisionID: second.revisionID
+        )
+        after = await repository.storageMetrics()
+        XCTAssertGreaterThan(after.assetReadCalls, before.assetReadCalls)
+        do {
+            _ = try await repository.rollbackMigration(id: fixture.notebookID, expectedRevisionID: third.revisionID)
+            XCTFail("Rollback accepted a generation beyond the migration anchor.")
+        } catch NotebookRepositoryError.revisionConflict {}
+        before = await repository.storageMetrics()
+        _ = try await repository.save(
+            id: fixture.notebookID, content: latest.content, expectedRevisionID: third.revisionID
+        )
+        after = await repository.storageMetrics()
+        XCTAssertGreaterThan(after.assetReadCalls, before.assetReadCalls)
+    }
+
+    func testSuccessfulRollbackAndRemigrationCannotReuseSameRevisionIdentityAsGeneration() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try NotebookHistoryTestFixtures.writeLegacy(root: root)
+        let latest = try XCTUnwrap(fixture.states.last)
+        let repository = try NotebookRepository(rootURL: root)
+        let first = try await repository.migrateHistory(id: fixture.notebookID, expectedRevisionID: latest.revisionID)
+        let rolledBack = try await repository.rollbackMigration(
+            id: fixture.notebookID, expectedRevisionID: latest.revisionID
+        )
+        XCTAssertEqual(rolledBack.revisionID, latest.revisionID)
+        XCTAssertEqual(rolledBack.content, latest.content)
+        let saved = try await repository.save(
+            id: fixture.notebookID, content: latest.content, expectedRevisionID: latest.revisionID
+        )
+        let layout = try NotebookHistoryTestFixtures.layout(root: root, id: fixture.notebookID)
+        XCTAssertNotEqual(layout.generationID, first.generationID)
+        let historical = try await repository.loadRevision(id: fixture.notebookID, revisionID: latest.revisionID)
+        NotebookHistoryTestFixtures.assertSame(historical, latest)
+        XCTAssertEqual(saved.sequence, latest.sequence + 1)
+    }
+
+    func testGroupRefreshRepairsRegularCandidateAssetBeforeSelectingHistory() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let archive = stroke(1)
+        let baseline = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content([archive]), expectedRevisionID: nil
+        )
+        let asset = notebook(root, id).appendingPathComponent("assets/\(NotebookDigest.sha256(archive.data)).stroke")
+        try Data("damaged".utf8).write(to: asset)
+        let repository = try NotebookRepository(rootURL: root)
+        let edits = [
+            NotebookSaveEdit(id: UUID(), content: content([archive], title: "First")),
+            NotebookSaveEdit(id: UUID(), content: content([archive, stroke(2)], title: "Second"))
+        ]
+        let result = try await repository.saveBatch(id: id, edits: edits, expectedRevisionID: baseline.revisionID)
+        XCTAssertEqual(result.committed.map(\.editID), edits.map(\.id))
+        XCTAssertEqual(try Data(contentsOf: asset), archive.data)
+        let metrics = await repository.storageMetrics()
+        XCTAssertEqual(metrics.headPublications, 1)
+        let report = await repository.maintenanceReport()
+        XCTAssertEqual(report[.repairedAsset], 1)
+        let historical = try await repository.loadRevision(id: id, revisionID: baseline.revisionID)
+        XCTAssertEqual(historical.content, baseline.content)
+    }
+
     private func appendMetrics(strokeCount: Int) async throws -> [String: Int] {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
