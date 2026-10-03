@@ -14,6 +14,12 @@ struct NotebookHistory {
         let summaries: [NotebookRevisionSummary]
     }
 
+    struct HeadSnapshot {
+        let head: Format.Head
+        let digest: String
+    }
+
+    let metrics: NotebookStorageMetricsRecorder?
     let directory: URL
     let notebookID: UUID
     let assetVerificationObserver: (@Sendable (String) -> Void)?
@@ -22,8 +28,10 @@ struct NotebookHistory {
     init(
         directory: URL, notebookID: UUID,
         assetVerificationObserver: (@Sendable (String) -> Void)?,
-        assetDirectory: URL? = nil
+        assetDirectory: URL? = nil,
+        metrics: NotebookStorageMetricsRecorder? = nil
     ) {
+        self.metrics = metrics
         self.directory = directory
         self.notebookID = notebookID
         self.assetVerificationObserver = assetVerificationObserver
@@ -31,9 +39,14 @@ struct NotebookHistory {
     }
 
     func readHead() throws -> Format.Head? {
+        try readHeadSnapshot()?.head
+    }
+
+    func readHeadSnapshot() throws -> HeadSnapshot? {
         let url = directory.appendingPathComponent("HEAD.json")
         guard try NotebookFileSystem.kind(url) != nil else { return nil }
-        let head: Format.Head = try Format.decode(readMetadata(url))
+        let data = try readMetadata(url)
+        let head: Format.Head = try Format.decode(data)
         guard head.schemaVersion == 1 || head.schemaVersion == 2 else {
             throw NotebookRepositoryError.unsupportedVersion(head.schemaVersion)
         }
@@ -43,7 +56,7 @@ struct NotebookHistory {
               head.schemaVersion == 2 || head.migrationReceiptDigest == nil else {
             throw NotebookRepositoryError.corruptData("The notebook HEAD has invalid metadata.")
         }
-        return head
+        return HeadSnapshot(head: head, digest: Format.digest(data, metrics: metrics))
     }
 
     func generationDirectory(_ head: Format.Head) throws -> URL {
@@ -87,7 +100,7 @@ struct NotebookHistory {
                 let revisions = directory.appendingPathComponent("revisions", isDirectory: true)
                 try requireDirectory(revisions)
                 let data = try readMetadata(revisions.appendingPathComponent("\(id.uuidString.lowercased()).json"))
-                actualDigest = Format.digest(data)
+                actualDigest = Format.digest(data, metrics: metrics)
                 if let digest, digest != actualDigest {
                     throw NotebookRepositoryError.corruptData("The selected legacy revision failed integrity validation.")
                 }
@@ -113,7 +126,7 @@ struct NotebookHistory {
         let revisions = directory.appendingPathComponent("revisions", isDirectory: true)
         try requireDirectory(revisions)
         let data = try readMetadata(revisions.appendingPathComponent("\(link.revisionID.uuidString.lowercased()).json"))
-        guard Format.digest(data) == link.digest else {
+        guard Format.digest(data, metrics: metrics) == link.digest else {
             throw NotebookRepositoryError.corruptData("Legacy history changed during validation.")
         }
         let revision: Format.LegacyRevision = try Format.decode(data)
@@ -268,7 +281,7 @@ struct NotebookHistory {
             guard total <= NotebookRepository.maximumNotebookBytes else {
                 throw NotebookRepositoryError.sizeLimitExceeded("The notebook exceeds 64 MiB.")
             }
-            result.append(NotebookStroke(id: reference.id, data: data))
+            result.append(NotebookStroke(id: reference.id, data: data, validatedDigest: reference.digest))
         }
         return result
     }
@@ -277,6 +290,13 @@ struct NotebookHistory {
         _ state: Format.State, candidates: [String: Data],
         candidateAsset: ((Format.Reference, Data) throws -> Data)? = nil
     ) throws -> Set<String> {
+        Set(try verifiedAssetSizes(state, candidates: candidates, candidateAsset: candidateAsset).keys)
+    }
+
+    func verifiedAssetSizes(
+        _ state: Format.State, candidates: [String: Data],
+        candidateAsset: ((Format.Reference, Data) throws -> Data)? = nil
+    ) throws -> [String: Int] {
         try validateAssetsDirectory(state)
         var sizes: [String: Int] = [:]
         var total = 0
@@ -298,14 +318,14 @@ struct NotebookHistory {
                 throw NotebookRepositoryError.sizeLimitExceeded("The notebook exceeds 64 MiB.")
             }
         }
-        return Set(sizes.keys)
+        return sizes
     }
 
     func readAsset(_ reference: Format.Reference) throws -> Data {
         let assets = assetDirectory
         try requireDirectory(assets)
         let data = try readMetadataAsset(assets.appendingPathComponent("\(reference.digest).stroke"))
-        guard Format.digest(data) == reference.digest else {
+        guard (metrics?.assetDigest(data) ?? Format.digest(data)) == reference.digest else {
             throw NotebookRepositoryError.corruptData("A committed stroke asset failed integrity validation.")
         }
         assetVerificationObserver?(reference.digest)
@@ -318,7 +338,7 @@ struct NotebookHistory {
         let data = try readMetadata(
             generation.appendingPathComponent("events/\(id.uuidString.lowercased()).json")
         )
-        guard Format.digest(data) == digest else {
+        guard Format.digest(data, metrics: metrics) == digest else {
             throw NotebookRepositoryError.corruptData("A committed history event failed integrity validation.")
         }
         let event: Format.Event = try Format.decode(data)
@@ -342,7 +362,7 @@ struct NotebookHistory {
         _ digest: String, event: Format.Event, generation: URL
     ) throws -> Format.State {
         let data = try readMetadata(generation.appendingPathComponent("checkpoints/\(digest).json"))
-        guard Format.digest(data) == digest else {
+        guard Format.digest(data, metrics: metrics) == digest else {
             throw NotebookRepositoryError.corruptData("A history checkpoint failed integrity validation.")
         }
         let checkpoint: Format.Checkpoint = try Format.decode(data)
@@ -362,7 +382,10 @@ struct NotebookHistory {
             throw NotebookRepositoryError.corruptData("A committed history file is missing.")
         }
         do {
-            return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
+            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
+            metrics?.record(\.metadataReadCalls)
+            metrics?.record(\.metadataReadBytes, data.count)
+            return data
         } catch let error as NotebookRepositoryError {
             if case .sizeLimitExceeded = error {
                 throw NotebookRepositoryError.corruptData("Committed history metadata exceeds supported bounds.")
@@ -382,7 +405,10 @@ struct NotebookHistory {
             throw NotebookRepositoryError.corruptData("A committed stroke asset is missing.")
         }
         do {
-            return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
+            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
+            metrics?.record(\.assetReadCalls)
+            metrics?.record(\.assetReadBytes, data.count)
+            return data
         } catch let error as NotebookRepositoryError {
             if case .sizeLimitExceeded = error {
                 throw NotebookRepositoryError.corruptData("A committed stroke asset exceeds supported bounds.")

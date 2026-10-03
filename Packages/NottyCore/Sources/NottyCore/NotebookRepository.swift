@@ -13,6 +13,7 @@ public actor NotebookRepository {
     static let maximumNotebookBytes = 64 * 1_024 * 1_024
     static let maximumTitleBytes = 4_096
 
+    private let metrics = NotebookStorageMetricsRecorder()
     private let rootURL: URL
     private let migrationFaultInjector: (@Sendable (NotebookMigrationStage) throws -> Void)?
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
@@ -100,6 +101,8 @@ public actor NotebookRepository {
         self.maintenanceObserver = observer
         self.maintenanceFaultInjector = nil
     }
+
+    public func storageMetrics() -> NotebookStorageMetrics { metrics.snapshot() }
 
     func maintenanceReport() -> [NotebookFileSystem.MaintenanceEvent: Int] {
         maintenanceDiagnostics.snapshot()
@@ -311,7 +314,7 @@ public actor NotebookRepository {
         let savedAt = Date()
         let writer = NotebookHistoryWriter(
             notebookID: id, generationID: generationID, generation: generation,
-            writeFault: faultInjector, migrationFault: nil
+            writeFault: faultInjector, migrationFault: nil, metrics: metrics
         )
         let head = try writer.append(
             state: state, previous: previous, parent: currentHead, revisionID: revisionID,
@@ -375,7 +378,8 @@ public actor NotebookRepository {
 
     private func historyStore(id: UUID, directory: URL) -> NotebookHistory {
         NotebookHistory(
-            directory: directory, notebookID: id, assetVerificationObserver: assetVerificationObserver
+            directory: directory, notebookID: id, assetVerificationObserver: assetVerificationObserver,
+            metrics: metrics
         )
     }
 

@@ -82,10 +82,14 @@ enum NotebookRevisionFormat {
         let checkpointCredit: Int
     }
 
-    static func encode<T: Encodable>(_ value: T) throws -> Data {
+    static func encode<T: Encodable>(
+        _ value: T, metrics: NotebookStorageMetricsRecorder? = nil
+    ) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(value)
+        metrics?.record(\.metadataEncodeCalls)
+        metrics?.record(\.metadataEncodedBytes, data.count)
         guard data.count <= NotebookRepository.maximumMetadataBytes else {
             throw NotebookRepositoryError.sizeLimitExceeded("Notebook metadata exceeds 2 MiB.")
         }
@@ -109,8 +113,8 @@ enum NotebookRevisionFormat {
         }
     }
 
-    static func digest(_ data: Data) -> String {
-        NotebookDigest.sha256(data)
+    static func digest(_ data: Data, metrics: NotebookStorageMetricsRecorder? = nil) -> String {
+        metrics?.metadataDigest(data) ?? NotebookDigest.sha256(data)
     }
 
     static func isDigest(_ value: String) -> Bool {
@@ -154,7 +158,10 @@ enum NotebookRevisionFormat {
         catch { throw NotebookRepositoryError.corruptData("A committed edit timestamp is invalid.") }
     }
 
-    static func delta(from old: State, to new: State) throws -> Delta {
+    static func delta(
+        from old: State, to new: State, metrics: NotebookStorageMetricsRecorder? = nil
+    ) throws -> Delta {
+        metrics?.record(\.referenceComparisons, old.strokes.count + new.strokes.count)
         let oldByID = Dictionary(uniqueKeysWithValues: old.strokes.map { ($0.id, $0.digest) })
         let newIDs = Set(new.strokes.map(\.id))
         let removed = old.strokes.filter { !newIDs.contains($0.id) }.map(\.id)
@@ -183,6 +190,33 @@ enum NotebookRevisionFormat {
             titleChange: old.title == new.title ? nil : new.title,
             pageCountChange: old.pageCount == new.pageCount ? nil : new.pageCount
         )
+    }
+
+    struct CheckpointSize {
+        private let templateBytes: Int
+        private let referenceBytes: Int
+        let encodedTitleBytes: Int
+
+        init(title: String, metrics: NotebookStorageMetricsRecorder? = nil) throws {
+            let id = UUID()
+            templateBytes = try encode(Checkpoint(
+                schemaVersion: 2, notebookID: id, revisionID: id, sequence: 1, state: .empty
+            ), metrics: metrics).count
+            referenceBytes = try encode(Reference(
+                id: id, digest: String(repeating: "0", count: 64)
+            ), metrics: metrics).count
+            encodedTitleBytes = try encode(title, metrics: metrics).count
+        }
+
+        func bytes(strokeCount: Int, pageCount: Int, sequence: Int) throws -> Int {
+            guard (0...NotebookRepository.maximumStrokeCount).contains(strokeCount),
+                  (1...12).contains(pageCount), sequence > 0 else {
+                throw NotebookRepositoryError.sizeLimitExceeded("Checkpoint byte accounting exceeds supported bounds.")
+            }
+            return templateBytes + encodedTitleBytes - 2
+                + String(sequence).utf8.count - 1 + String(pageCount).utf8.count - 1
+                + strokeCount * (referenceBytes + 1) - (strokeCount == 0 ? 0 : 1)
+        }
     }
 
     /// Mutates a single ordered state during audit without copying every historic drawing.
