@@ -23,9 +23,14 @@ final class NativeArchiveReuseTests: XCTestCase {
         let assigned = live.canvas.drawing
         XCTAssertEqual(assigned.strokes.map(\.id), assets.map(\.id))
         XCTAssertEqual(assigned.strokes.map { $0.path.id }, drawing.strokes.map { $0.path.id })
-        for (stroke, asset) in zip(assigned.strokes, assets) {
-            XCTAssertEqual(PKDrawing(strokes: [stroke]).dataRepresentation(), asset.data)
-        }
+        let beforeAssignmentEncode = await codec.workMetrics
+        let assignedAssets = try await codec.encode(assigned)
+        let afterAssignmentEncode = await codec.workMetrics
+        XCTAssertEqual(assignedAssets, assets)
+        XCTAssertEqual(assignedAssets.map(\.cachedDigest), assets.map(\.cachedDigest))
+        XCTAssertEqual(afterAssignmentEncode.serializedStrokes, beforeAssignmentEncode.serializedStrokes)
+        XCTAssertEqual(afterAssignmentEncode.hashedArchiveBytes, beforeAssignmentEncode.hashedArchiveBytes)
+        XCTAssertEqual(try InkDrawingSignature(assigned), try InkDrawingSignature(drawing))
 
         let added = NativeArchiveFixtures.stroke(x: 320)
         await live.assign(PKDrawing(strokes: assigned.strokes + [added]))
@@ -64,8 +69,17 @@ final class NativeArchiveReuseTests: XCTestCase {
             XCTAssertEqual(restored.strokes[0].path.id, native.path.id)
             await live.assign(restored)
             XCTAssertEqual(live.canvas.drawing.strokes[0].path.id, native.path.id)
-            let archive = PKDrawing(strokes: [live.canvas.drawing.strokes[0]]).dataRepresentation()
-            XCTAssertEqual(archive, assets[0].data)
+            let before = await codec.workMetrics
+            let cached = try await codec.encode(live.canvas.drawing)
+            let after = await codec.workMetrics
+            XCTAssertEqual(cached, assets)
+            XCTAssertEqual(cached[0].cachedDigest, assets[0].cachedDigest)
+            XCTAssertEqual(after.serializedStrokes, before.serializedStrokes)
+            XCTAssertEqual(after.hashedArchiveBytes, before.hashedArchiveBytes)
+            XCTAssertEqual(
+                try InkDrawingSignature(live.canvas.drawing),
+                try InkDrawingSignature(PKDrawing(strokes: [native]))
+            )
             for (actual, expected) in zip(live.canvas.drawing.strokes[0].path, native.path) {
                 XCTAssertEqual(actual.location, expected.location)
                 XCTAssertEqual(actual.timeOffset, expected.timeOffset)

@@ -11,6 +11,13 @@ import AppKit
 
 @available(iOS 27.0, macOS 27.0, *)
 final class InkArchiveReuseTests: XCTestCase {
+
+    private func byteDifferences(_ first: Data, _ second: Data) -> Int {
+        zip(first, second).reduce(abs(first.count - second.count)) { count, pair in
+            count + (pair.0 == pair.1 ? 0 : 1)
+        }
+    }
+
     private func stroke(id: UUID = UUID(), x: CGFloat = 20) -> PKStroke {
         #if canImport(UIKit)
         let color = UIColor.black
@@ -35,8 +42,19 @@ final class InkArchiveReuseTests: XCTestCase {
 
     func testArchiveBytesAndTrustedDigestsRemainPairedAcrossCacheHits() async throws {
         let native = stroke()
-        let firstArchive = PKDrawing(strokes: [native]).dataRepresentation()
-        let secondArchive = PKDrawing(strokes: [native]).dataRepresentation()
+        let ownedDrawing = PKDrawing(strokes: [native])
+        let firstArchive = ownedDrawing.dataRepresentation()
+        let secondArchive = ownedDrawing.dataRepresentation()
+        let anotherWrapper = PKDrawing(strokes: [native]).dataRepresentation()
+        let decodedArchive = try PKDrawing(data: firstArchive).dataRepresentation()
+        let diagnostics = [
+            "archiveBytes": firstArchive.count,
+            "sameOwnedDifferentBytes": byteDifferences(firstArchive, secondArchive),
+            "newWrapperDifferentBytes": byteDifferences(firstArchive, anotherWrapper),
+            "decodedArchiveDifferentBytes": byteDifferences(firstArchive, decodedArchive)
+        ]
+        let diagnosticData = try JSONSerialization.data(withJSONObject: diagnostics, options: [.sortedKeys])
+        print("NOTTY_SAVE_METRIC archive-stability \(String(decoding: diagnosticData, as: UTF8.self))")
         XCTAssertEqual(firstArchive, secondArchive)
         let codec = InkCodec()
         let first = try await codec.encode(PKDrawing(strokes: [native]))
@@ -230,3 +248,4 @@ final class InkArchiveReuseTests: XCTestCase {
         }
     }
 }
+
