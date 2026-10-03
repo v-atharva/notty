@@ -23,8 +23,9 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertNotNil(session.recoveryMessage)
         await probe.setSuspendSave()
         await probe.setSaveFailure(nil)
+        let callsBeforeRetry = await probe.saveCalls
         session.retrySave()
-        await probe.waitForSave()
+        try await waitForSuspendedSave(probe, after: callsBeforeRetry, session: session)
         XCTAssertNil(session.recoveryFailure)
         XCTAssertNil(session.recoveryMessage)
         XCTAssertEqual(session.pendingEdits, pending)
@@ -47,8 +48,9 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertNotNil(session.recoveryMessage)
         await probe.setSuspendSave()
         await probe.setSaveFailure(nil)
+        let callsBeforeRetry = await probe.saveCalls
         session.retrySave()
-        await probe.waitForSave()
+        try await waitForSuspendedSave(probe, after: callsBeforeRetry, session: session)
         XCTAssertNil(session.recoveryMessage)
         XCTAssertNil(session.recoveryFailure)
         await probe.releaseSave()
@@ -98,6 +100,23 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertEqual(controller.canvasView.contentOffset.x, originalOffset.x, accuracy: 0.5)
         XCTAssertEqual(controller.canvasView.contentOffset.y, originalOffset.y, accuracy: 0.5)
         XCTAssertEqual(controller.canvasView.zoomScale, originalZoom, accuracy: 0.001)
+    }
+
+    private func waitForSuspendedSave(
+        _ probe: NotebookStorageProbe, after previousCalls: Int, session: NotebookSession
+    ) async throws {
+        do {
+            for _ in 0..<100 {
+                if await probe.saveCalls > previousCalls { return }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTFail("The retried save did not begin within two seconds.")
+            throw NotebookSaveFailure.unexpected
+        } catch {
+            await probe.releaseSave()
+            await session.waitUntilSettled()
+            throw error
+        }
     }
 
     private func makeSession(
