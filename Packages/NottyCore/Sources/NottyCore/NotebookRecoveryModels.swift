@@ -51,6 +51,16 @@ public struct NotebookRecoveryReceipt: Sendable, Equatable {
     }
 }
 
+public struct NotebookRecoveryScan: Sendable, Equatable {
+    public let copies: [NotebookRecoveryReceipt]
+    public let unavailableCopyIDs: [UUID]
+
+    public init(copies: [NotebookRecoveryReceipt], unavailableCopyIDs: [UUID]) {
+        self.copies = copies
+        self.unavailableCopyIDs = unavailableCopyIDs
+    }
+}
+
 public enum NotebookRecoveryWriteStage: Sendable, Equatable, CaseIterable {
     case archiveSynchronized
     case manifestSynchronized

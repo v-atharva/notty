@@ -149,7 +149,57 @@ public actor NotebookRecoveryStore {
                 savedAt: record.savedAt
             ))
         }
-        return receipts.sorted {
+        return Self.sortedReceipts(receipts)
+    }
+
+    /// Reports unavailable bundles without hiding independently validated copies.
+    public func scan(notebookID: UUID) throws -> NotebookRecoveryScan {
+        let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
+        defer { NotebookFileSystem.releaseWriterLock(lock) }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: rootURL, includingPropertiesForKeys: nil
+        )
+        var receipts: [NotebookRecoveryReceipt] = []
+        var unavailable: [UUID] = []
+        for entry in entries {
+            guard let id = UUID(uuidString: entry.lastPathComponent),
+                  entry.lastPathComponent == id.uuidString.lowercased() else { continue }
+            try requireRoot()
+            do {
+                let (record, manifest, directory) = try readBundle(id: id)
+                for reference in manifest.edits {
+                    _ = try readArchive(reference, bundle: directory)
+                }
+                if record.notebookID == notebookID {
+                    receipts.append(NotebookRecoveryReceipt(
+                        id: record.id,
+                        notebookID: record.notebookID,
+                        editCount: record.editCount,
+                        savedAt: record.savedAt
+                    ))
+                }
+            } catch {
+                try requireRoot()
+                unavailable.append(id)
+            }
+        }
+        try requireRoot()
+        return NotebookRecoveryScan(
+            copies: Self.sortedReceipts(receipts),
+            unavailableCopyIDs: unavailable.sorted { $0.uuidString < $1.uuidString }
+        )
+    }
+
+    private func requireRoot() throws {
+        guard try NotebookFileSystem.existingDirectory(rootURL) else {
+            throw NotebookRepositoryError.unsafePath("The recovery root is missing.")
+        }
+    }
+
+    private static func sortedReceipts(
+        _ receipts: [NotebookRecoveryReceipt]
+    ) -> [NotebookRecoveryReceipt] {
+        receipts.sorted {
             if $0.savedAt == $1.savedAt { return $0.id.uuidString < $1.id.uuidString }
             return $0.savedAt > $1.savedAt
         }

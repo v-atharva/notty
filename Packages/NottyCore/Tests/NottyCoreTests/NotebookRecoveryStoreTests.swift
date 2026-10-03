@@ -202,6 +202,67 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         }
     }
 
+    func testScanKeepsHealthyCopiesAccessibleDespiteDamagedBundles() async throws {
+        for damaged in ["receipt", "archive"] {
+            for belongsToAnotherNotebook in [false, true] {
+                let root = try makeRoot()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let store = try NotebookRecoveryStore(rootURL: root)
+                let notebookID = UUID()
+                let firstBatch = sampleBatch(notebookID: notebookID)
+                let secondBatch = sampleBatch(notebookID: notebookID)
+                let damagedBatch = sampleBatch(
+                    notebookID: belongsToAnotherNotebook ? UUID() : notebookID
+                )
+                let first = try await store.preserve(firstBatch)
+                let second = try await store.preserve(secondBatch)
+                let damagedReceipt = try await store.preserve(damagedBatch)
+                let target = damaged == "receipt"
+                    ? bundle(root: root, id: damagedReceipt.id).appendingPathComponent("RECEIPT.json")
+                    : archive(
+                        root: root, receiptID: damagedReceipt.id, editID: damagedBatch.edits[0].id
+                    )
+                try Data("damaged".utf8).write(to: target)
+                let before = try snapshot(root: root)
+
+                let result = try await store.scan(notebookID: notebookID)
+                let expected = [first, second].sorted {
+                    if $0.savedAt == $1.savedAt { return $0.id.uuidString < $1.id.uuidString }
+                    return $0.savedAt > $1.savedAt
+                }
+                XCTAssertEqual(result.copies, expected)
+                XCTAssertEqual(result.unavailableCopyIDs, [damagedReceipt.id])
+                let loadedFirst = try await store.load(id: first.id)
+                let loadedSecond = try await store.load(id: second.id)
+                XCTAssertEqual(loadedFirst, firstBatch)
+                XCTAssertEqual(loadedSecond, secondBatch)
+                if damaged == "receipt" || !belongsToAnotherNotebook {
+                    do {
+                        _ = try await store.list(notebookID: notebookID)
+                        XCTFail("Strict listing accepted a damaged matching or unidentified bundle.")
+                    } catch {
+                        guard case .corruptData? = error as? NotebookRepositoryError else {
+                            return XCTFail("Unexpected strict listing error: \(error)")
+                        }
+                    }
+                }
+                XCTAssertEqual(try snapshot(root: root), before)
+            }
+        }
+    }
+
+    func testScanExcludesHealthyCopiesOfOtherNotebooks() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try NotebookRecoveryStore(rootURL: root)
+        let batch = sampleBatch()
+        let receipt = try await store.preserve(batch)
+        let result = try await store.scan(notebookID: UUID())
+        XCTAssertEqual(result, NotebookRecoveryScan(copies: [], unavailableCopyIDs: []))
+        let own = try await store.scan(notebookID: batch.notebookID)
+        XCTAssertEqual(own, NotebookRecoveryScan(copies: [receipt], unavailableCopyIDs: []))
+    }
+
     func testNativeArchiveAndManifestStrokeCountMustMatch() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -346,6 +407,14 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         } catch {
             guard case .unsafePath? = error as? NotebookRepositoryError else {
                 return XCTFail("Unexpected replacement error: \(error)")
+            }
+        }
+        do {
+            _ = try await store.scan(notebookID: batch.notebookID)
+            XCTFail("A replaced recovery root was reported as a per-copy failure.")
+        } catch {
+            guard case .unsafePath? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected scan root error: \(error)")
             }
         }
         XCTAssertEqual(try snapshot(root: moved), before)
