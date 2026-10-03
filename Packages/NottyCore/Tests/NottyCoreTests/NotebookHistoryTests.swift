@@ -223,13 +223,19 @@ final class NotebookHistoryTests: XCTestCase {
         let repository = try NotebookRepository(rootURL: root)
         let shared = Fixtures.asset(index: 1, bytes: 4 * 1_024 * 1_024).data
         let atLimit = (0..<16).map { _ in NotebookStroke(id: UUID(), data: shared) }
-        let saved = try await repository.save(
+        let first = try await repository.save(
             id: id, content: NotebookContent(title: "Notes", pageCount: 3, strokes: atLimit),
             expectedRevisionID: nil
+        )
+        let saved = try await repository.save(
+            id: id,
+            content: NotebookContent(title: "Notes", pageCount: 3, strokes: atLimit, editStamp: Fixtures.stamp(2)),
+            expectedRevisionID: first.revisionID
         )
         let log = Fixtures.VerificationLog()
         let auditor = try NotebookRepository(rootURL: root, assetVerificationObserver: { log.record($0) })
         let audit = try await auditor.auditHistory(id: id)
+        XCTAssertEqual(audit.revisionCount, 2)
         XCTAssertEqual(audit.verifiedAssetCount, 1)
         XCTAssertEqual(log.snapshot(), [Fixtures.digest(shared)])
         let headURL = Fixtures.noteDirectory(root: root, id: id).appendingPathComponent("HEAD.json")
