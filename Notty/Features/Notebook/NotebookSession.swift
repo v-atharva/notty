@@ -377,6 +377,7 @@ final class NotebookSession: ObservableObject {
         captureWorkingInk()
         guard canReopenSaved, let preservedState, let storage else { return }
         let coverage = preservedState.coverage
+        retireAudit()
         isPerformingRecovery = true
         recoveryFailure = nil
         recoveryMessage = nil
@@ -393,7 +394,6 @@ final class NotebookSession: ObservableObject {
                 throw NotebookSaveFailure.corruptData
             }
             recoveryVerified = true
-            retireAudit()
             let opening = try await readOpening(storage)
             let stored = opening.notebook
             captureWorkingInk()
@@ -406,7 +406,7 @@ final class NotebookSession: ObservableObject {
             // Invalidate the previous controller before publishing a new saved session.
             activeCanvasOwner = nil
             snapshotProvider = nil
-            install(stored: stored, drawing: drawing)
+            install(opening: opening, drawing: drawing)
             self.preservedState = nil
             recoveryMessage = "Saved notebook reopened. Your recovery copy remains available."
         } catch {
@@ -629,7 +629,9 @@ final class NotebookSession: ObservableObject {
             switch outcome {
             case .verified(let report):
                 guard report.notebookID == pin.notebookID,
-                      report.headRevisionID == pin.revisionID, report.revisionCount > 0 else {
+                      report.headRevisionID == pin.revisionID,
+                      report.revisionCount == pin.sequence, report.revisionCount > 0,
+                      report.verifiedAssetCount >= 0 else {
                     self.integrityFailure = .corruptData
                     self.integrityModel.update(.damaged(.corruptData))
                     self.refreshPresentation()
@@ -654,6 +656,7 @@ final class NotebookSession: ObservableObject {
         installation: UUID, expectedRevisionID: UUID?, published: Bool
     ) async {
         guard installationID == installation, requiresPinRefresh, let storage else { return }
+        let previousPin = openingPin
         // Migration may select its equivalent anchor even when the following save fails.
         retireAudit()
         if published { requiresPinRefresh = false }
@@ -667,6 +670,12 @@ final class NotebookSession: ObservableObject {
             guard installationID == installation else { return }
             guard pin.notebookID == notebookID, pin.revisionID == revision else {
                 throw NotebookSaveFailure.revisionConflict
+            }
+            if let previousPin, previousPin.requiresFirstPublicationRefresh,
+               !pin.requiresFirstPublicationRefresh,
+               !previousPin.hasSameHistoryGeneration(as: pin) {
+                integrityFailure = nil
+                integrityModel.update(nil)
             }
             requiresPinRefresh = pin.requiresFirstPublicationRefresh
             openingPin = pin
