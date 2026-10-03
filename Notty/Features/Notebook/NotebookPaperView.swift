@@ -31,6 +31,9 @@ class NotebookPaperView: UIView {
         edgeLayer.backgroundColor = UIColor(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.65).cgColor
         contentLayer.addSublayer(edgeLayer)
         layer.addSublayer(contentLayer)
+        registerForTraitChanges([UITraitDisplayScale.self]) { (view: NotebookPaperView, _: UITraitCollection) in
+            view.finishZoom()
+        }
     }
 
     @available(*, unavailable)

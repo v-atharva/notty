@@ -20,7 +20,7 @@ final class NotebookViewController: UIViewController {
     private let geometry = NotebookPaperMetrics.geometry
     private let logicalWidth = CGFloat(NotebookPaperMetrics.pageWidth)
     private let canvas = NotebookCanvasView()
-    let paperView = NotebookPaperView(frame: .zero)
+    let paperView: NotebookPaperView
     private let injectedToolPicker: PKToolPicker?
     private let allowsEditing: Bool
     private var scenePickerOwner: NotebookSceneToolPicker?
@@ -30,6 +30,7 @@ final class NotebookViewController: UIViewController {
     private var capacityHistoryActionReserved = false
     private var paletteSuppressed = false
     private var isTornDown = false
+    private var isPublishingUndoAvailability = false
     private var toolBeginSignature: InkDrawingSignature?
     private var toolBeginGeneration: UInt64?
 
@@ -40,10 +41,11 @@ final class NotebookViewController: UIViewController {
     var drawingToolPicker: PKToolPicker? { toolPicker }
     var onUndoAvailabilityChange: ((NotebookUndoAvailability) -> Void)?
     var onToolCompletion: ((NotebookToolCompletion) -> Void)?
+    var onInteractionInterrupted: (() -> Void)?
     var canPerformHistoryAction: (() -> Bool)?
     var reserveHistoryAction: (() -> Bool)?
     var currentUndoAvailability: NotebookUndoAvailability {
-        let admitted = !isTornDown && !canvas.hasActiveTool
+        let admitted = !isTornDown && !paletteSuppressed && !canvas.hasActiveTool
             && (inputGate == .open || (inputGate == .capacity && !capacityHistoryActionReserved))
         return NotebookUndoAvailability(
             canUndo: admitted && (retainedUndoManager?.canUndo ?? false),
@@ -73,10 +75,11 @@ final class NotebookViewController: UIViewController {
 
     init(
         pageCount: Int, initialDrawing: PKDrawing, toolPicker: PKToolPicker? = nil,
-        allowsEditing: Bool = true
+        allowsEditing: Bool = true, paperView: NotebookPaperView? = nil
     ) {
         self.injectedToolPicker = toolPicker
         self.allowsEditing = allowsEditing
+        self.paperView = paperView ?? NotebookPaperView(frame: .zero)
         self.initialDrawing = initialDrawing
         self.lastDeliveredSignature = try? InkDrawingSignature(initialDrawing)
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
@@ -191,7 +194,9 @@ final class NotebookViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        finishActiveTool()
+        _ = captureBarrier()
+        onInteractionInterrupted?()
+        resetActiveTool()
         if ownsToolPicker { toolPicker?.setVisible(false, forFirstResponder: canvas) }
         canvas.resignFirstResponder()
         paletteKeepsAccess = false
@@ -202,7 +207,7 @@ final class NotebookViewController: UIViewController {
     }
 
     private func acquireToolPicker() {
-        guard allowsEditing, !observesToolPicker, let scene = view.window?.windowScene else { return }
+        guard allowsEditing, inputGate.keepsPalette, !isTornDown, !observesToolPicker, let scene = view.window?.windowScene else { return }
         if let injectedToolPicker {
             toolPicker = injectedToolPicker
             injectedToolPicker.showsDrawingPolicyControls = false
@@ -229,6 +234,7 @@ final class NotebookViewController: UIViewController {
         guard isViewLoaded else { return }
         canvas.permitsMutation = gate.allowsMutation
         canvas.permitsHistoryAccess = gate.keepsPalette
+        if gate == .open { acquireToolPicker() }
         refreshUndoManager()
         publishUndoAvailability()
         applyPaletteGate()
@@ -237,6 +243,7 @@ final class NotebookViewController: UIViewController {
     func setPaletteSuppressed(_ suppressed: Bool) {
         guard paletteSuppressed != suppressed else { return }
         paletteSuppressed = suppressed
+        publishUndoAvailability()
         applyPaletteGate()
     }
 
@@ -274,6 +281,9 @@ final class NotebookViewController: UIViewController {
     }
 
     private func publishUndoAvailability() {
+        guard !isPublishingUndoAvailability else { return }
+        isPublishingUndoAvailability = true
+        defer { isPublishingUndoAvailability = false }
         onUndoAvailabilityChange?(currentUndoAvailability)
     }
 
@@ -296,13 +306,11 @@ final class NotebookViewController: UIViewController {
         publishUndoAvailability()
     }
 
-    private func finishActiveTool() {
-        _ = captureBarrier()
-        canvas.hasActiveTool = false
+    private func resetActiveTool() {
         toolBeginSignature = nil
         toolBeginGeneration = nil
+        canvas.hasActiveTool = false
         publishUndoAvailability()
-        applyPaletteGate()
     }
 
     private func observeDrawing(signature: InkDrawingSignature? = nil) {
@@ -361,15 +369,19 @@ final class NotebookViewController: UIViewController {
 
     func tearDown() {
         guard !isTornDown else { return }
-        finishActiveTool()
+        _ = captureBarrier()
         isTornDown = true
+        onUndoAvailabilityChange = nil
+        for observer in undoObservers { NotificationCenter.default.removeObserver(observer) }
+        undoObservers.removeAll()
+        retainedUndoManager?.removeAllActions()
+        retainedUndoManager = nil
+        onDetach?()
+        onDetach = nil
         inputGate = .readOnly
         canvas.permitsMutation = false
         canvas.permitsHistoryAccess = false
-        retainedUndoManager?.removeAllActions()
-        for observer in undoObservers { NotificationCenter.default.removeObserver(observer) }
-        undoObservers.removeAll()
-        retainedUndoManager = nil
+        resetActiveTool()
         if let scenePickerOwner {
             scenePickerOwner.detach(self)
         } else if observesToolPicker {
@@ -384,13 +396,10 @@ final class NotebookViewController: UIViewController {
         canvas.onUndo = nil
         canvas.onRedo = nil
         canvas.historyAvailability = nil
-        publishUndoAvailability()
-        onDetach?()
-        onDetach = nil
         onCompletedEdit = nil
         onObservation = nil
-        onUndoAvailabilityChange = nil
         onToolCompletion = nil
+        onInteractionInterrupted = nil
         canPerformHistoryAction = nil
         reserveHistoryAction = nil
     }
@@ -470,6 +479,10 @@ extension NotebookViewController: PKCanvasViewDelegate {
         canvas.hasActiveTool = false
         publishUndoAvailability()
         if let begin, let end = lastDeliveredSignature, let beginGeneration,
+           begin.constructionWork.nativeDrawingFallbackSnapshots == 0,
+           begin.constructionWork.uncacheableStrokeSignatures == 0,
+           end.constructionWork.nativeDrawingFallbackSnapshots == 0,
+           end.constructionWork.uncacheableStrokeSignatures == 0,
            observedGeneration > beginGeneration, let observation {
             let comparison = begin.compared(to: end)
             observationWork.add(comparison.work)

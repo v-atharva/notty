@@ -32,6 +32,9 @@ struct NotebookCanvas: UIViewControllerRepresentable {
         controller.onToolCompletion = { [weak session] completion in
             session?.completedTool(completion, ownerID: seed.ownerID)
         }
+        controller.onInteractionInterrupted = { [weak session] in
+            session?.cancelCanvasToolCompletion(ownerID: seed.ownerID)
+        }
         session.attachCanvas(
             ownerID: seed.ownerID,
             observations: { [weak controller] in controller?.captureBarrier() },
