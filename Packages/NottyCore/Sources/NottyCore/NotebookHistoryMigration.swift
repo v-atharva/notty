@@ -19,14 +19,14 @@ struct NotebookHistoryMigration {
 
     func migrate(_ head: Format.Head) throws -> (Format.Head, NotebookMigrationReceipt) {
         if head.schemaVersion == 2 {
-            _ = try history.audit(head)
-            return (head, try receipt(head).record.receipt)
+            let audit = try history.audit(head)
+            return (head, try receipt(head, links: audit.links).record.receipt)
         }
         let oldHeadURL = history.directory.appendingPathComponent("HEAD.json")
         let oldHeadData = try history.readMetadata(oldHeadURL)
         guard try history.readHead() == head else { throw NotebookRepositoryError.revisionConflict }
         let links = try history.selectedLinks(head)
-        _ = try history.audit(head)
+        _ = try history.audit(head, links: links)
         let generationID = UUID()
         let transaction = root.appendingPathComponent(".migration-\(UUID().uuidString.lowercased())", isDirectory: true)
         try NotebookFileSystem.ensureDirectory(transaction)
@@ -105,7 +105,7 @@ struct NotebookHistoryMigration {
         guard stagedLinks.count == links.count else {
             throw NotebookRepositoryError.corruptData("The migrated history has a different event count.")
         }
-        _ = try staged.audit(anchor)
+        _ = try staged.audit(anchor, links: stagedLinks)
         try fault?(.generationValidated)
         let publicReceipt = NotebookMigrationReceipt(
             notebookID: history.notebookID, revisionID: anchor.revisionID,
@@ -148,11 +148,11 @@ struct NotebookHistoryMigration {
     }
 
     func rollback(_ head: Format.Head) throws -> StoredNotebook {
-        let stored = try receipt(head)
+        let audit = try history.audit(head)
+        let stored = try receipt(head, links: audit.links)
         guard head == selectedHead(stored.record, digest: stored.digest) else {
             throw NotebookRepositoryError.revisionConflict
         }
-        _ = try history.audit(head)
         let legacy: Format.Head = try Format.decode(stored.legacyHeadData)
         guard legacy.schemaVersion == 1 else {
             throw NotebookRepositoryError.corruptData("The retained rollback HEAD is not legacy history.")
@@ -162,7 +162,7 @@ struct NotebookHistoryMigration {
               chainDigest(legacyLinks) == stored.record.legacyChainDigest else {
             throw NotebookRepositoryError.corruptData("Retained legacy history differs from the migration receipt.")
         }
-        _ = try history.audit(legacy)
+        _ = try history.audit(legacy, links: legacyLinks)
         let current = try history.current(legacy)
         let strokes = try history.readAssets(current.state)
         guard try history.readHead() == head else { throw NotebookRepositoryError.revisionConflict }
@@ -187,11 +187,53 @@ struct NotebookHistoryMigration {
         )
     }
 
-    func validateReceipt(_ head: Format.Head) throws {
-        if head.migrationReceiptDigest != nil { _ = try receipt(head) }
+    func validateReceipt(_ head: Format.Head, links: [NotebookHistory.Link]? = nil) throws {
+        if head.migrationReceiptDigest != nil {
+            _ = try receipt(head, links: try links ?? history.selectedLinks(head))
+        }
     }
 
-    private func receipt(_ head: Format.Head) throws -> (
+    /// Checks the bounded receipt record; selected ancestry belongs to the full audit.
+    func validateReceiptRecord(_ head: Format.Head, selectedSequence: Int? = nil) throws {
+        guard head.migrationReceiptDigest != nil else { return }
+        let stored = try receiptRecord(head)
+        let anchor = stored.record.anchor
+        let generation = try history.generationDirectory(head)
+        let (anchorEvent, _) = try history.readEvent(
+            id: anchor.revisionID, digest: anchor.revisionDigest, generation: generation
+        )
+        let sequence: Int
+        if let selectedSequence { sequence = selectedSequence }
+        else if head.revisionID == anchor.revisionID { sequence = anchorEvent.sequence }
+        else {
+            sequence = try history.readEvent(
+                id: head.revisionID, digest: head.revisionDigest, generation: generation
+            ).0.sequence
+        }
+        guard anchorEvent.sequence == stored.record.receipt.revisionCount,
+              sequence >= anchorEvent.sequence,
+              sequence != anchorEvent.sequence || (
+                head.revisionID == anchor.revisionID && head.revisionDigest == anchor.revisionDigest
+              ) else {
+            throw NotebookRepositoryError.corruptData("The migration receipt has inconsistent anchor sequence.")
+        }
+    }
+
+    private func receipt(_ head: Format.Head, links: [NotebookHistory.Link]) throws -> (
+        record: Record, digest: String, legacyHeadData: Data
+    ) {
+        let stored = try receiptRecord(head)
+        let record = stored.record
+        guard let anchorIndex = links.firstIndex(where: { $0.revisionID == record.anchor.revisionID }),
+              anchorIndex + 1 == record.receipt.revisionCount,
+              links[anchorIndex].sequence == record.receipt.revisionCount,
+              links[anchorIndex].digest == record.anchor.revisionDigest else {
+            throw NotebookRepositoryError.corruptData("The migration receipt is not anchored in selected history.")
+        }
+        return stored
+    }
+
+    private func receiptRecord(_ head: Format.Head) throws -> (
         record: Record, digest: String, legacyHeadData: Data
     ) {
         guard head.schemaVersion == 2, let digest = head.migrationReceiptDigest else {
@@ -212,7 +254,7 @@ struct NotebookHistoryMigration {
               record.anchor.generationID == head.generationID,
               record.anchor.migrationReceiptDigest == nil,
               Format.isDigest(record.anchor.revisionDigest),
-              Format.isDigest(record.legacyHeadDigest) else {
+              Format.isDigest(record.legacyHeadDigest), Format.isDigest(record.legacyChainDigest) else {
             throw NotebookRepositoryError.corruptData("The migration receipt has invalid anchor metadata.")
         }
         let legacyData = try history.readMetadata(generation.appendingPathComponent("legacy-head.json"))
@@ -225,13 +267,6 @@ struct NotebookHistoryMigration {
               Format.isDigest(legacy.revisionDigest),
               legacy.generationID == nil, legacy.migrationReceiptDigest == nil else {
             throw NotebookRepositoryError.corruptData("The preserved legacy HEAD has inconsistent identities.")
-        }
-        let links = try history.selectedLinks(head)
-        guard Format.isDigest(record.legacyChainDigest),
-              let anchorIndex = links.firstIndex(where: { $0.revisionID == record.anchor.revisionID }),
-              anchorIndex + 1 == record.receipt.revisionCount,
-              links[anchorIndex].digest == record.anchor.revisionDigest else {
-            throw NotebookRepositoryError.corruptData("The migration receipt is not anchored in selected history.")
         }
         return (record, digest, legacyData)
     }
