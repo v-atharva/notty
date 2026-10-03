@@ -882,11 +882,11 @@ final class NotebookSession: ObservableObject {
         if inputGate == .open {
             applyExtentIntentIfReady()
         }
-        refreshCommandAvailability()
         if activeCanvasOwner != nil, let canvasGateSink, lastPushedCanvasGate != inputGate {
             lastPushedCanvasGate = inputGate
             canvasGateSink(inputGate)
         }
+        refreshCommandAvailability()
         gateModel.update(pageCount: pageCount, inputGate: inputGate)
         statusModel.update(NotebookSavePresentation(
             status: saveState, inputPaused: inputPaused, performingRecovery: isPerformingRecovery,

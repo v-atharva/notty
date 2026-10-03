@@ -770,6 +770,58 @@ final class NotebookWritingStatusTests: XCTestCase {
         }
     }
 
+
+    func testCapacityDrainRefreshesCommandsAfterSynchronousNativeReservationReset() async throws {
+        let (session, probe, root) = try await makeSession()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await probe.setSuspendSave()
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        var nativeGate = NotebookInputGate.open
+        session.attachCanvas(
+            ownerID: seed.ownerID, observations: { nil },
+            applyInputGate: { gate in
+                nativeGate = gate
+                if gate == .open {
+                    controls.availability = NotebookUndoAvailability(
+                        canUndo: true, canRedo: true, isUsingTool: false
+                    )
+                    session.updateUndoAvailability(controls.availability, ownerID: seed.ownerID)
+                }
+            }, controls: controls.controls
+        )
+        XCTAssertTrue(session.commandModel.state.canUndo)
+        for index in 1...8 {
+            session.recordObservation(
+                NotebookCanvasObservation(generation: UInt64(index), drawing: PKDrawing(),
+                    capturedAt: Date(timeIntervalSince1970: Double(index)), uptime: Double(index)),
+                ownerID: seed.ownerID
+            )
+        }
+        try await waitForSuspendedSave(probe, after: 0, session: session)
+        XCTAssertEqual(nativeGate, .capacity)
+        // A used native capacity reservation disables both commands until genuine open admission.
+        controls.availability = .unavailable
+        session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+        XCTAssertFalse(session.commandModel.state.canUndo)
+        XCTAssertFalse(session.commandModel.state.canRedo)
+        let original = session.pendingEdits
+        let canvasBefore = session.renderDiagnostics.canvasUpdateCount
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        XCTAssertEqual(nativeGate, .open)
+        XCTAssertEqual(session.inputGate, .open)
+        XCTAssertTrue(session.commandModel.state.canUndo)
+        XCTAssertTrue(session.commandModel.state.canRedo)
+        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
+        XCTAssertTrue(session.pendingEdits.isEmpty)
+        let storage = await probe.storage(notebookID: session.notebookID)
+        let saved = try await storage.load()
+        XCTAssertEqual(saved?.content.editStamp, original.last?.stamp)
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 8)
+    }
+
     private func presentation(_ status: NotebookSaveStatus) -> NotebookSavePresentation {
         NotebookSavePresentation(
             status: status, inputPaused: false, performingRecovery: false,
