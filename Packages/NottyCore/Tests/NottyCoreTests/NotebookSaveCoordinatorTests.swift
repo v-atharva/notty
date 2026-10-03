@@ -173,7 +173,7 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
         let captured = coordinator.pendingEdits
         let generation = coordinator.generation
         await saver.waitForRequests(1)
-        await saver.fail(.storageFull)
+        await saver.fail(NotebookSaveFailure.storageFull)
         await coordinator.waitUntilSettled()
         coordinator.enqueue(snapshot: "A", stamp: stamp(3))
         XCTAssertEqual(Array(coordinator.pendingEdits.prefix(2)), captured)
