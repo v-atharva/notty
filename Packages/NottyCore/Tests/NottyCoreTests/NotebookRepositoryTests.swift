@@ -96,9 +96,9 @@ final class NotebookRepositoryTests: XCTestCase {
         let committed = try await originalRepository.save(
             id: id, content: content(), expectedRevisionID: nil
         )
-        let faulty = try NotebookRepository(rootURL: root) { stage in
+        let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
             if stage == .revisionStaged { throw InjectedFailure.stop }
-        }
+        })
         do {
             _ = try await faulty.save(
                 id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
@@ -215,9 +215,9 @@ final class NotebookRepositoryTests: XCTestCase {
                 title: "After",
                 strokes: [NotebookStroke(id: UUID(), data: Data("after".utf8))]
             )
-            let faulty = try NotebookRepository(rootURL: root) { stage in
+            let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
                 if stage == target { throw InjectedFailure.stop }
-            }
+            })
             do {
                 _ = try await faulty.save(id: id, content: next, expectedRevisionID: first.revisionID)
                 XCTFail("Publication fault \(target) did not interrupt the save.")
@@ -246,9 +246,9 @@ final class NotebookRepositoryTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: root) }
             let id = UUID()
             let item = content(strokes: [NotebookStroke(id: UUID(), data: Data("new archive".utf8))])
-            let faulty = try NotebookRepository(rootURL: root) { stage in
+            let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
                 if stage == target { throw InjectedFailure.stop }
-            }
+            })
             do {
                 _ = try await faulty.save(id: id, content: item, expectedRevisionID: nil)
                 XCTFail("Creation fault \(target) did not interrupt publication.")
@@ -546,9 +546,9 @@ final class NotebookRepositoryTests: XCTestCase {
         let committed = try await originalRepository.save(
             id: id, content: content(), expectedRevisionID: nil
         )
-        let faulty = try NotebookRepository(rootURL: root) { stage in
+        let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
             if stage == .assetPublished { throw InjectedFailure.stop }
-        }
+        })
         do {
             _ = try await faulty.save(
                 id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
