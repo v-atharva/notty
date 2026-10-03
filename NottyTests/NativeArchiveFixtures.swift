@@ -21,6 +21,64 @@ enum NativeArchiveFixtures {
         )
     }
 
+    enum PointField: String, CaseIterable {
+        case location, timeOffset, size, opacity, force, azimuth, altitude
+        case secondaryScale, threshold, lateralJitter
+
+        func value(_ point: PKStrokePoint) -> Double {
+            switch self {
+            case .location: return Double(point.location.x)
+            case .timeOffset: return point.timeOffset
+            case .size: return Double(point.size.width)
+            case .opacity: return Double(point.opacity)
+            case .force: return Double(point.force)
+            case .azimuth: return Double(point.azimuth)
+            case .altitude: return Double(point.altitude)
+            case .secondaryScale: return Double(point.secondaryScale)
+            case .threshold: return Double(point.threshold)
+            case .lateralJitter: return Double(point.lateralJitter)
+            }
+        }
+
+        func changed(_ stroke: PKStroke) -> PKStroke {
+            let points = stroke.path.enumerated().map { index, point in
+                guard index == 0 else { return point }
+                var location = point.location
+                var timeOffset = point.timeOffset
+                var size = point.size
+                var opacity = point.opacity
+                var force = point.force
+                var azimuth = point.azimuth
+                var altitude = point.altitude
+                var secondaryScale = point.secondaryScale
+                var threshold = point.threshold
+                var lateralJitter = point.lateralJitter
+                switch self {
+                case .location: location.x += 7
+                case .timeOffset: timeOffset += 0.005
+                case .size: size.width += 2
+                case .opacity: opacity = 0.5
+                case .force: force = 0.5
+                case .azimuth: azimuth = 0.5
+                case .altitude: altitude = 0.7
+                case .secondaryScale: secondaryScale = 0.75
+                case .threshold: threshold = 0.25
+                case .lateralJitter: lateralJitter = 0.25
+                }
+                return PKStrokePoint(
+                    location: location, timeOffset: timeOffset, size: size, opacity: opacity,
+                    force: force, azimuth: azimuth, altitude: altitude,
+                    secondaryScale: secondaryScale, threshold: threshold, lateralJitter: lateralJitter
+                )
+            }
+            var result = stroke
+            result.path = PKStrokePath(
+                controlPoints: points, creationDate: stroke.path.creationDate
+            )
+            return result
+        }
+    }
+
     static func changedPath(_ stroke: PKStroke) -> PKStroke {
         var result = stroke
         let points = stroke.path.map { point in

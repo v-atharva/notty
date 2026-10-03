@@ -552,8 +552,16 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         saved = try await repository.save(id: id, content: content(strokes, title: title), expectedRevisionID: saved.revisionID)
         let before = await repository.storageMetrics()
         strokes.append(trustedStroke(strokeCount + 1))
-        _ = try await repository.save(id: id, content: content(strokes, title: title), expectedRevisionID: saved.revisionID)
-        return difference(before, await repository.storageMetrics())
+        let candidate = content(strokes, title: title)
+        let clock = ContinuousClock()
+        let started = clock.now
+        _ = try await repository.save(id: id, content: candidate, expectedRevisionID: saved.revisionID)
+        let elapsed = started.duration(to: clock.now).components
+        var sample = difference(before, await repository.storageMetrics())
+        sample["saveElapsedMicroseconds"] = Int(
+            elapsed.seconds * 1_000_000 + elapsed.attoseconds / 1_000_000_000_000
+        )
+        return sample
     }
 
     private func difference(_ before: NotebookStorageMetrics, _ after: NotebookStorageMetrics) -> [String: Int] {

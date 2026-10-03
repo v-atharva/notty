@@ -262,6 +262,10 @@ final class NotebookSession: ObservableObject {
         await backgroundWaiter?.value
     }
 
+    func codecWorkMetrics() async -> InkCodec.WorkMetrics {
+        await codec.workMetrics
+    }
+
     private func ownsBackgroundFlush(
         id: UUID, coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>
     ) -> Bool {
@@ -638,6 +642,7 @@ struct NotebookObservationWork {
     private(set) var encodedRenderStates = 0
     private(set) var renderStateBytes = 0
     private(set) var renderStateFallbacks = 0
+    private(set) var uncacheableStrokeSignatures = 0
 
     mutating func add(_ work: InkCodec.WorkMetrics) {
         serializedStrokes += work.serializedStrokes
@@ -654,6 +659,7 @@ struct NotebookObservationWork {
         encodedRenderStates += work.encodedRenderStates
         renderStateBytes += work.renderStateBytes
         renderStateFallbacks += work.renderStateFallbacks
+        uncacheableStrokeSignatures += work.uncacheableStrokeSignatures
     }
 
     var values: [String: Int] {
@@ -666,7 +672,8 @@ struct NotebookObservationWork {
             "maskFallbacks": maskFallbacks, "pointComparisons": comparedPoints,
             "signatureChecks": signatureChecks, "maskSnapshots": maskSnapshots,
             "maskComparisons": comparedMaskPaths, "renderStateEncodings": encodedRenderStates,
-            "renderStateBytes": renderStateBytes, "renderStateFallbacks": renderStateFallbacks
+            "renderStateBytes": renderStateBytes, "renderStateFallbacks": renderStateFallbacks,
+            "uncacheableStrokeSignatures": uncacheableStrokeSignatures
         ]
     }
 }
