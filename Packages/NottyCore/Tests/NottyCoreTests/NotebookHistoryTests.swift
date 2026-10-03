@@ -6,12 +6,12 @@ import XCTest
 final class NotebookHistoryTests: XCTestCase {
     private typealias Fixtures = NotebookHistoryTestFixtures
 
-    func testThreeHundredDistinctAssetsKeepAllMetadataBelowFourTimesAssetsWithLargeTitle() async throws {
+    func testThreeHundredDistinctAssetsKeepAllMetadataBelowOneAndAHalfTimesAssetsWithLargeTitle() async throws {
         try await assertLinearHistory(strokeCount: 300, title: String(repeating: "t", count: 4_096))
     }
 
     #if NOTTY_STORAGE_STRESS
-    func testTwoThousandDistinctAssetsKeepAllMetadataBelowFourTimesAssets() async throws {
+    func testTwoThousandDistinctAssetsKeepAllMetadataBelowOneAndAHalfTimesAssets() async throws {
         try await assertLinearHistory(strokeCount: 2_000, title: String(repeating: "t", count: 4_096))
     }
     #endif
@@ -65,9 +65,9 @@ final class NotebookHistoryTests: XCTestCase {
         XCTAssertEqual(assetFiles.count, strokeCount)
         XCTAssertEqual(assetBytes, strokeCount * 1_024)
         XCTAssertGreaterThan(metadataBytes, 0)
-        XCTAssertLessThan(
-            metadataBytes, assetBytes * 4,
-            "All selected-generation metadata must stay proportional to distinct archive bytes."
+        XCTAssertLessThanOrEqual(
+            metadataBytes, assetBytes + assetBytes / 2,
+            "All selected-generation metadata must stay within 1.5 times distinct archive bytes."
         )
         let reopened = try NotebookRepository(rootURL: root)
         let loaded = try await reopened.load(id: id)

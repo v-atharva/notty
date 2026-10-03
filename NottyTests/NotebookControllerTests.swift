@@ -277,6 +277,8 @@ final class NotebookControllerTests: XCTestCase {
             return .capacity
         }
         let canvas = controller.canvasView
+        // This fixture controls callback delivery independently of SDK assignment notifications.
+        canvas.delegate = nil
         controller.canvasViewDidBeginUsingTool(canvas)
         let stroke = NotebookTestFixtures.stroke()
         canvas.drawing = PKDrawing(strokes: [stroke])
@@ -319,6 +321,8 @@ final class NotebookControllerTests: XCTestCase {
             return .open
         }
         let canvas = controller.canvasView
+        // Omit assignment notifications to exercise the end and flush barriers explicitly.
+        canvas.delegate = nil
         let stroke = NotebookTestFixtures.stroke()
         controller.canvasViewDidBeginUsingTool(canvas)
         canvas.drawing = PKDrawing(strokes: [stroke])
