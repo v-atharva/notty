@@ -20,13 +20,17 @@ Recovery bounds are 32 edits per copy, 20,000 stroke identities per drawing, 128
 
 ## Storage and history
 
-Individual stroke archives are shared across immutable revisions. Native stroke IDs, ordered asset references, original edit timestamps, and prior saved states are retained for future recording links and replay. Replay itself is not available.
+Individual stroke archives are shared across immutable edit history. New notebooks use schema 2: each completed edit retains its revision identity, sequence, original edit stamp and save time in an authenticated delta. Deltas record changed stroke archives, deletions, ordering, title and paper extent. Unchanged title and extent values are omitted. Full checkpoints are published only when actual encoded event bytes fund their size, with one bootstrap checkpoint; every edit event remains retained for future recording links and replay. Replay itself is not available.
 
 Notebook publication verifies hashes and schema versions, rejects stale revisions, and updates its head after assets and revision metadata are written. First creation publishes a complete notebook from a private transaction. Missing publication metadata in an existing notebook requires recovery and does not create a blank notebook. Failed writes clean up their stages; recovery maintenance removes validated internal temporary transactions under the writer lock. Notebook-stage cleanup follows successful content validation and skips temporary-looking directories and links without touching their targets. Cleanup errors retain the note for another maintenance attempt. Once maintenance succeeds, consecutive successful saves avoid directory scans; cleanup failures remain eligible for retry even after a successful publication.
 
 Normal bounds are 10,000 strokes, 10 MiB per stroke asset, 64 MiB aggregate current stroke data, and 2 MiB metadata. This increment requires iPadOS 27 for native stable PencilKit stroke identities. Twelve sections and the validation bounds are study limits.
 
-Full stroke-reference manifests are still retained per edit, and normal saves still verify current committed assets. Compact history and incremental save costs are subsequent remediation checkpoints before library expansion. This study is not a daily-use release.
+Public opening audits every event and checkpoint reachable from the selected head and verifies every unique historical stroke archive. Each historical state counts every stroke reference toward its byte bound, even when references share an archive. Current content is reconstructed from the nearest checkpoint and subsequent deltas. Unselected events and generations never become committed content. Opening grows with retained history and historical archive versions; it is not limited to current visible ink.
+
+Existing schema-1 notebooks migrate side by side before their next normal save, or through an explicit repository migration call. Migration checks every selected legacy state against the new history before atomically switching the head, retaining original revisions and archives. Legacy parent metadata lacked authenticated digest links; migration validates the available chain and cannot retroactively establish its authenticity. The selected migration receipt binds exact preserved head bytes, the migrated anchor and a fingerprint of every original selected revision. Public opening validates that receipt and its preserved head metadata. Rollback revalidates the retained legacy bytes and archives and is allowed only at the exact migration anchor, before any new schema-2 edit is accepted. A successful migration followed by a normal save failure can leave the equivalent migrated anchor selected without accepting the failed edit.
+
+The repository exposes paginated history summaries, historical state loading and a full integrity audit. Normal saves still hash supplied archives and verify current committed assets; measured incremental save work is the next remediation checkpoint before library expansion. This study is not a daily-use release.
 
 File synchronization and atomic publication target process-crash recovery. Physical interruption, file protection, latency, thermal behavior, and abrupt power-loss durability remain acceptance checks.
 
@@ -34,7 +38,7 @@ Library organization, recording, PDF annotation, bookmarks, and export remain su
 
 ## Cloud checks
 
-The suite contains 84 core tests, including 16 native archive cases, and 24 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
+The suite contains 108 core tests, including 16 native archive cases and 24 history/migration cases, and 24 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
 
 The standard GitHub image is currently a preview; the workflow verifies actual host, toolchain and SDK versions and selects an available iPadOS 27.0 tablet simulator. A single job has a fifteen-minute limit and cancels superseded checks on the same pull request.
 

@@ -42,7 +42,7 @@ final class NotebookRepositoryTests: XCTestCase {
         )
 
         XCTAssertEqual(try files(root: root, id: id, folder: "assets", extension: "stroke").count, 1)
-        XCTAssertEqual(try files(root: root, id: id, folder: "revisions", extension: "json").count, 2)
+        XCTAssertEqual(try files(root: root, id: id, folder: "events", extension: "json").count, 2)
         XCTAssertEqual(second.sequence, 2)
         let loaded = try await requiredNotebook(repository, id: id)
         XCTAssertEqual(loaded.content.strokes.map(\.id), [stroke.id, secondStroke.id])
@@ -96,9 +96,9 @@ final class NotebookRepositoryTests: XCTestCase {
         let committed = try await originalRepository.save(
             id: id, content: content(), expectedRevisionID: nil
         )
-        let faulty = try NotebookRepository(rootURL: root) { stage in
+        let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
             if stage == .revisionStaged { throw InjectedFailure.stop }
-        }
+        })
         do {
             _ = try await faulty.save(
                 id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
@@ -141,12 +141,12 @@ final class NotebookRepositoryTests: XCTestCase {
 
         XCTAssertEqual(third.sequence, 3)
         XCTAssertEqual(try files(root: root, id: id, folder: "assets", extension: "stroke").count, 2)
-        XCTAssertEqual(try files(root: root, id: id, folder: "revisions", extension: "json").count, 3)
+        XCTAssertEqual(try files(root: root, id: id, folder: "events", extension: "json").count, 3)
         let firstManifest = try object(at: revisionURL(root: root, id: id, revision: first.revisionID))
         let secondManifest = try object(at: revisionURL(root: root, id: id, revision: second.revisionID))
         let thirdManifest = try object(at: revisionURL(root: root, id: id, revision: third.revisionID))
-        let firstReference = try XCTUnwrap((firstManifest["strokes"] as? [[String: Any]])?.first)
-        let secondReference = try XCTUnwrap((secondManifest["strokes"] as? [[String: Any]])?.first)
+        let firstReference = try XCTUnwrap(((firstManifest["delta"] as? [String: Any])?["upserts"] as? [[String: Any]])?.first)
+        let secondReference = try XCTUnwrap(((secondManifest["delta"] as? [String: Any])?["upserts"] as? [[String: Any]])?.first)
         XCTAssertEqual(firstReference["id"] as? String, secondReference["id"] as? String)
         XCTAssertNotEqual(firstReference["digest"] as? String, secondReference["digest"] as? String)
         XCTAssertEqual(secondManifest["parentRevisionID"] as? String, first.revisionID.uuidString)
@@ -197,7 +197,7 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertNotEqual(firstSucceeded, secondSucceeded)
         let loaded = try await requiredNotebook(firstRepository, id: id)
         XCTAssertEqual(loaded.sequence, 1)
-        XCTAssertEqual(try files(root: root, id: id, folder: "revisions", extension: "json").count, 1)
+        XCTAssertEqual(try files(root: root, id: id, folder: "events", extension: "json").count, 1)
     }
 
     func testEveryPrepublicationFaultPreservesThePreviousHeadAndAllowsRetry() async throws {
@@ -215,9 +215,9 @@ final class NotebookRepositoryTests: XCTestCase {
                 title: "After",
                 strokes: [NotebookStroke(id: UUID(), data: Data("after".utf8))]
             )
-            let faulty = try NotebookRepository(rootURL: root) { stage in
+            let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
                 if stage == target { throw InjectedFailure.stop }
-            }
+            })
             do {
                 _ = try await faulty.save(id: id, content: next, expectedRevisionID: first.revisionID)
                 XCTFail("Publication fault \(target) did not interrupt the save.")
@@ -246,9 +246,9 @@ final class NotebookRepositoryTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: root) }
             let id = UUID()
             let item = content(strokes: [NotebookStroke(id: UUID(), data: Data("new archive".utf8))])
-            let faulty = try NotebookRepository(rootURL: root) { stage in
+            let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
                 if stage == target { throw InjectedFailure.stop }
-            }
+            })
             do {
                 _ = try await faulty.save(id: id, content: item, expectedRevisionID: nil)
                 XCTFail("Creation fault \(target) did not interrupt publication.")
@@ -298,7 +298,7 @@ final class NotebookRepositoryTests: XCTestCase {
             case "head":
                 url = noteURL(root: root, id: id).appendingPathComponent("HEAD.json")
             case "revision":
-                url = revisionURL(root: root, id: id, revision: saved.revisionID)
+                url = try revisionURL(root: root, id: id, revision: saved.revisionID)
             default:
                 url = try XCTUnwrap(files(root: root, id: id, folder: "assets", extension: "stroke").first)
             }
@@ -363,13 +363,15 @@ final class NotebookRepositoryTests: XCTestCase {
                 if mutation == "identity" {
                     manifest["notebookID"] = UUID().uuidString
                 } else {
-                    var references = manifest["strokes"] as! [[String: Any]]
+                    var delta = manifest["delta"] as! [String: Any]
+                    var references = delta["upserts"] as! [[String: Any]]
                     if mutation == "digest" {
                         references[0]["digest"] = "../../outside"
                     } else {
                         references.append(references[0])
                     }
-                    manifest["strokes"] = references
+                    delta["upserts"] = references
+                    manifest["delta"] = delta
                 }
             }
             do {
@@ -467,7 +469,7 @@ final class NotebookRepositoryTests: XCTestCase {
             }
         }
 
-        for location in ["head", "asset", "revisions"] {
+        for location in ["head", "asset", "events"] {
             let root = try makeRoot()
             defer { try? FileManager.default.removeItem(at: root) }
             let id = UUID()
@@ -484,7 +486,7 @@ final class NotebookRepositoryTests: XCTestCase {
             case "asset":
                 original = try XCTUnwrap(files(root: root, id: id, folder: "assets", extension: "stroke").first)
             default:
-                original = noteURL(root: root, id: id).appendingPathComponent("revisions", isDirectory: true)
+                original = try eventsURL(root: root, id: id)
             }
             let moved = root.appendingPathComponent("moved")
             try FileManager.default.moveItem(at: original, to: moved)
@@ -544,9 +546,9 @@ final class NotebookRepositoryTests: XCTestCase {
         let committed = try await originalRepository.save(
             id: id, content: content(), expectedRevisionID: nil
         )
-        let faulty = try NotebookRepository(rootURL: root) { stage in
+        let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
             if stage == .assetPublished { throw InjectedFailure.stop }
-        }
+        })
         do {
             _ = try await faulty.save(
                 id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
@@ -588,7 +590,7 @@ final class NotebookRepositoryTests: XCTestCase {
             _ = try await repository.load(id: id)
             XCTFail("Oversized metadata was accepted.")
         } catch {
-            guard case .sizeLimitExceeded? = error as? NotebookRepositoryError else {
+            guard case .corruptData? = error as? NotebookRepositoryError else {
                 return XCTFail("Unexpected metadata error: \(error)")
             }
         }
@@ -739,7 +741,7 @@ final class NotebookRepositoryTests: XCTestCase {
         let owned = [
             directory.appendingPathComponent(".head-\(UUID().uuidString).tmp"),
             directory.appendingPathComponent("assets/.\(UUID().uuidString).tmp"),
-            directory.appendingPathComponent("revisions/.\(UUID().uuidString).tmp")
+            try eventsURL(root: root, id: id).appendingPathComponent(".\(UUID().uuidString).tmp")
         ]
         for stage in owned { try Data("process residue".utf8).write(to: stage) }
         let unrelated = directory.appendingPathComponent("notes.tmp")
@@ -862,7 +864,7 @@ final class NotebookRepositoryTests: XCTestCase {
             id: id, content: content(title: "First", strokes: [stroke]),
             expectedRevisionID: baseline.revisionID
         )
-        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.enumerationCount, 5)
         XCTAssertEqual(counter.count(.directoryEnumeration(.library)), 0)
         counter.reset()
 
@@ -891,7 +893,7 @@ final class NotebookRepositoryTests: XCTestCase {
             id: idB, content: content(title: "B"), expectedRevisionID: nil
         )
         let stageA = noteURL(root: root, id: idA).appendingPathComponent("assets/.\(UUID().uuidString).tmp")
-        let stageB = noteURL(root: root, id: idB).appendingPathComponent("revisions/.\(UUID().uuidString).tmp")
+        let stageB = try eventsURL(root: root, id: idB).appendingPathComponent(".\(UUID().uuidString).tmp")
         try Data("left A".utf8).write(to: stageA)
         try Data("left B".utf8).write(to: stageB)
         let counter = NotebookMaintenanceCounter()
@@ -903,7 +905,7 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(loadedA.content, savedA.content)
         XCTAssertFalse(FileManager.default.fileExists(atPath: stageA.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: stageB.path))
-        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.enumerationCount, 5)
         counter.reset()
 
         let updatedB = try await repository.save(
@@ -911,7 +913,7 @@ final class NotebookRepositoryTests: XCTestCase {
         )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: stageB.path))
-        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.enumerationCount, 5)
         XCTAssertEqual(counter.count(.removedStage), 1)
         counter.reset()
         _ = try await repository.save(
@@ -970,7 +972,7 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(counter.count(.directoryEnumeration(.privateTransaction)), 1)
         XCTAssertEqual(counter.count(.directoryEnumeration(.notebook)), 1)
         XCTAssertEqual(counter.count(.directoryEnumeration(.assets)), 1)
-        XCTAssertEqual(counter.count(.directoryEnumeration(.revisions)), 1)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.events)), 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: transaction.path))
         XCTAssertEqual(
@@ -994,7 +996,7 @@ final class NotebookRepositoryTests: XCTestCase {
         let baseline = try await NotebookRepository(rootURL: root).save(
             id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
         )
-        let stage = noteURL(root: root, id: id).appendingPathComponent("revisions/.\(UUID().uuidString).tmp")
+        let stage = try eventsURL(root: root, id: id).appendingPathComponent(".\(UUID().uuidString).tmp")
         try Data("retry cleanup".utf8).write(to: stage)
         let counter = NotebookMaintenanceCounter()
         let fault = NotebookMaintenanceFaultBudget(failures: 2)
@@ -1024,7 +1026,7 @@ final class NotebookRepositoryTests: XCTestCase {
         )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
-        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.enumerationCount, 5)
         XCTAssertEqual(counter.count(.removedStage), 1)
         let recoveredReport = await repository.maintenanceReport()
         XCTAssertEqual(recoveredReport[.failed(.io)], 2)
@@ -1091,7 +1093,7 @@ final class NotebookRepositoryTests: XCTestCase {
         let directory = noteURL(root: root, id: id)
         let stages = (0..<65).map { _ in directory.appendingPathComponent(".\(UUID().uuidString).tmp") }
         for stage in stages { try Data("residue".utf8).write(to: stage) }
-        let revision = revisionURL(root: root, id: id, revision: saved.revisionID)
+        let revision = try revisionURL(root: root, id: id, revision: saved.revisionID)
         let historyBytes = try Data(contentsOf: revision)
         let counter = NotebookMaintenanceCounter()
         let repository = try NotebookRepository(
@@ -1170,9 +1172,15 @@ final class NotebookRepositoryTests: XCTestCase {
         root.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
     }
 
-    private func revisionURL(root: URL, id: UUID, revision: UUID) -> URL {
-        noteURL(root: root, id: id).appendingPathComponent("revisions", isDirectory: true)
-            .appendingPathComponent("\(revision.uuidString.lowercased()).json")
+    private func eventsURL(root: URL, id: UUID) throws -> URL {
+        let head = try object(at: noteURL(root: root, id: id).appendingPathComponent("HEAD.json"))
+        let generation = try XCTUnwrap(head["generationID"] as? String)
+        return noteURL(root: root, id: id)
+            .appendingPathComponent("history/\(generation.lowercased())/events", isDirectory: true)
+    }
+
+    private func revisionURL(root: URL, id: UUID, revision: UUID) throws -> URL {
+        try eventsURL(root: root, id: id).appendingPathComponent("\(revision.uuidString.lowercased()).json")
     }
 
     private func files(
@@ -1181,9 +1189,14 @@ final class NotebookRepositoryTests: XCTestCase {
         folder: String,
         extension suffix: String
     ) throws -> [URL] {
-        try FileManager.default.contentsOfDirectory(
-            at: noteURL(root: root, id: id).appendingPathComponent(folder, isDirectory: true),
-            includingPropertiesForKeys: nil
+        let directory: URL
+        if folder == "events" {
+            directory = try eventsURL(root: root, id: id)
+        } else {
+            directory = noteURL(root: root, id: id).appendingPathComponent(folder, isDirectory: true)
+        }
+        return try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == suffix }
     }
 
@@ -1218,7 +1231,7 @@ final class NotebookRepositoryTests: XCTestCase {
         revision: UUID,
         mutation: (inout [String: Any]) -> Void
     ) throws {
-        let revisionURL = revisionURL(root: root, id: id, revision: revision)
+        let revisionURL = try revisionURL(root: root, id: id, revision: revision)
         var manifest = try object(at: revisionURL)
         mutation(&manifest)
         let data = try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
