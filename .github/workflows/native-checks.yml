@@ -132,7 +132,7 @@ jobs:
       - name: Test native notebook session and canvas
         timeout-minutes: 5
         env:
-          NOTTY_SAVE_METRICS_DIRECTORY: ${{ runner.temp }}/NottySaveMetrics
+          TEST_RUNNER_NOTTY_SAVE_METRICS_DIRECTORY: ${{ runner.temp }}/NottySaveMetrics
         run: |
           xcodebuild \
             -project Notty.xcodeproj \
