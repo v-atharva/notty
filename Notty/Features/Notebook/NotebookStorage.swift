@@ -9,6 +9,7 @@ struct NotebookStorage: Sendable {
     let preserve: @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt
     let listRecovery: @Sendable () async throws -> NotebookRecoveryScan
     let loadRecovery: @Sendable (UUID) async throws -> NotebookRecoveryBatch
+    let storageMetrics: (@Sendable () async throws -> NotebookStorageMetrics)?
 
     init(
         load: @escaping @Sendable () async throws -> StoredNotebook?,
@@ -16,6 +17,7 @@ struct NotebookStorage: Sendable {
         preserve: @escaping @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt,
         listRecovery: @escaping @Sendable () async throws -> NotebookRecoveryScan,
         loadRecovery: @escaping @Sendable (UUID) async throws -> NotebookRecoveryBatch,
+        storageMetrics: (@Sendable () async throws -> NotebookStorageMetrics)? = nil,
         saveBatch: (@Sendable ([NotebookSaveEdit], UUID?) async throws -> NotebookBatchSaveResult)? = nil
     ) {
         self.load = load
@@ -23,6 +25,7 @@ struct NotebookStorage: Sendable {
         self.preserve = preserve
         self.listRecovery = listRecovery
         self.loadRecovery = loadRecovery
+        self.storageMetrics = storageMetrics
         self.saveBatch = saveBatch ?? { edits, revision in
             var committed: [NotebookCommittedEdit] = []
             var cursor = revision
@@ -97,6 +100,7 @@ struct NotebookStorage: Sendable {
                 preserve: { try await recovery.preserve($0) },
                 listRecovery: { try await recovery.scan(notebookID: notebookID) },
                 loadRecovery: { try await recovery.load(id: $0) },
+                storageMetrics: { try await repository.currentMetrics() },
                 saveBatch: { try await repository.saveBatch(edits: $0, expectedRevisionID: $1) }
             )
         }.value
@@ -148,6 +152,10 @@ private actor NotebookRepositoryAccess {
 
     func load() async throws -> StoredNotebook? {
         try await openedRepository().load(id: notebookID)
+    }
+
+    func currentMetrics() async throws -> NotebookStorageMetrics {
+        try await openedRepository().storageMetrics()
     }
 
     func saveBatch(edits: [NotebookSaveEdit], expectedRevisionID: UUID?) async throws -> NotebookBatchSaveResult {
