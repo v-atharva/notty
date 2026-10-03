@@ -18,7 +18,7 @@ public actor NotebookRepository {
     private let assetVerificationObserver: (@Sendable (String) -> Void)?
 
     public init(rootURL: URL) throws {
-        self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
+        self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = nil
         self.assetVerificationObserver = nil
     }
@@ -28,7 +28,7 @@ public actor NotebookRepository {
         rootURL: URL,
         faultInjector: @escaping @Sendable (NotebookWriteStage) throws -> Void
     ) throws {
-        self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
+        self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = faultInjector
         self.assetVerificationObserver = nil
     }
@@ -37,20 +37,33 @@ public actor NotebookRepository {
         rootURL: URL,
         assetVerificationObserver: @escaping @Sendable (String) -> Void
     ) throws {
-        self.rootURL = try NotebookFileSystem.prepareRoot(rootURL)
+        self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = nil
         self.assetVerificationObserver = assetVerificationObserver
+    }
+
+    private static func prepareRoot(_ rootURL: URL) throws -> URL {
+        let root = try NotebookFileSystem.prepareRoot(rootURL)
+        let lock = try NotebookFileSystem.acquireWriterLock(root)
+        defer { NotebookFileSystem.releaseWriterLock(lock) }
+        try NotebookFileSystem.sweepPrivateTransactions(in: root, prefix: ".creation-")
+        return root
     }
 
     public func load(id: UUID) throws -> StoredNotebook? {
         guard try NotebookFileSystem.existingDirectory(rootURL) else {
             throw NotebookRepositoryError.unsafePath("The notebook storage directory is missing.")
         }
+        let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
+        defer { NotebookFileSystem.releaseWriterLock(lock) }
         let directory = notebookDirectory(id: id)
         guard try NotebookFileSystem.existingDirectory(directory) else { return nil }
-        guard let head = try readHead(id: id, directory: directory) else { return nil }
+        guard let head = try readHead(id: id, directory: directory) else {
+            throw NotebookRepositoryError.recoveryRequired
+        }
         let revision = try readRevision(head: head, directory: directory)
         let strokes = try readAssets(revision: revision, directory: directory)
+        try NotebookFileSystem.sweepNotebookStages(in: directory)
         return storedNotebook(revision: revision, strokes: strokes)
     }
 
@@ -64,14 +77,39 @@ public actor NotebookRepository {
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
 
-        let directory = notebookDirectory(id: id)
-        try NotebookFileSystem.ensureDirectory(directory)
+        try NotebookFileSystem.sweepPrivateTransactions(in: rootURL, prefix: ".creation-")
+        let destination = notebookDirectory(id: id)
+        let isCreating = try NotebookFileSystem.kind(destination) == nil
+        let directory: URL
+        let currentHead: Head?
+        if isCreating {
+            guard expectedRevisionID == nil else {
+                throw NotebookRepositoryError.revisionConflict
+            }
+            directory = rootURL.appendingPathComponent(
+                ".creation-\(UUID().uuidString.lowercased())", isDirectory: true
+            )
+            try NotebookFileSystem.ensureDirectory(directory)
+            currentHead = nil
+        } else {
+            guard try NotebookFileSystem.existingDirectory(destination) else {
+                throw NotebookRepositoryError.unsafePath("The notebook directory is missing.")
+            }
+            directory = destination
+            guard let head = try readHead(id: id, directory: directory) else {
+                throw NotebookRepositoryError.recoveryRequired
+            }
+            currentHead = head
+        }
+        defer {
+            if isCreating {
+                try? NotebookFileSystem.removePrivateTransaction(directory, prefix: ".creation-")
+            }
+        }
         let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
         let revisionsDirectory = directory.appendingPathComponent("revisions", isDirectory: true)
         try NotebookFileSystem.ensureDirectory(assetsDirectory)
         try NotebookFileSystem.ensureDirectory(revisionsDirectory)
-
-        let currentHead = try readHead(id: id, directory: directory)
         guard currentHead?.revisionID == expectedRevisionID else {
             throw NotebookRepositoryError.revisionConflict
         }
@@ -88,6 +126,7 @@ public actor NotebookRepository {
                 throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
             }
             sequence = current.sequence + 1
+            try NotebookFileSystem.sweepNotebookStages(in: directory)
         }
 
         for reference in prepared.references {
@@ -106,11 +145,11 @@ public actor NotebookRepository {
                 }
                 assetVerificationObserver?(digest)
             } else {
-                let stage = assetsDirectory.appendingPathComponent(".\(UUID().uuidString).tmp")
-                try NotebookFileSystem.writeSynchronized(candidate, to: stage)
-                try faultInjector?(.assetStaged)
-                try NotebookFileSystem.publishImmutable(stage, to: destination)
-                try faultInjector?(.assetPublished)
+                try NotebookFileSystem.withSynchronizedStage(candidate, in: assetsDirectory) { stage in
+                    try faultInjector?(.assetStaged)
+                    try NotebookFileSystem.publishImmutable(stage, to: destination)
+                    try faultInjector?(.assetPublished)
+                }
             }
             verifiedDigests.insert(digest)
         }
@@ -128,14 +167,13 @@ public actor NotebookRepository {
             savedAt: Date()
         )
         let revisionData = try encodeMetadata(revision)
-        let revisionStage = revisionsDirectory.appendingPathComponent(".\(UUID().uuidString).tmp")
-        try NotebookFileSystem.writeSynchronized(revisionData, to: revisionStage)
-        try faultInjector?(.revisionStaged)
-        try NotebookFileSystem.publishImmutable(
-            revisionStage,
-            to: revisionURL(id: revision.revisionID, directory: directory)
-        )
-        try faultInjector?(.revisionPublished)
+        try NotebookFileSystem.withSynchronizedStage(revisionData, in: revisionsDirectory) { stage in
+            try faultInjector?(.revisionStaged)
+            try NotebookFileSystem.publishImmutable(
+                stage, to: revisionURL(id: revision.revisionID, directory: directory)
+            )
+            try faultInjector?(.revisionPublished)
+        }
 
         let head = Head(
             schemaVersion: 1,
@@ -143,13 +181,19 @@ public actor NotebookRepository {
             revisionID: revision.revisionID,
             revisionDigest: Self.digest(revisionData)
         )
-        let headStage = directory.appendingPathComponent(".head-\(UUID().uuidString).tmp")
-        try NotebookFileSystem.writeSynchronized(try encodeMetadata(head), to: headStage)
-        try faultInjector?(.headStaged)
-        try faultInjector?(.beforeHeadPublication)
-        try NotebookFileSystem.replaceAtomically(
-            headStage, destination: directory.appendingPathComponent("HEAD.json")
-        )
+        try NotebookFileSystem.withSynchronizedStage(
+            try encodeMetadata(head), in: directory, head: true
+        ) { stage in
+            try faultInjector?(.headStaged)
+            try faultInjector?(.beforeHeadPublication)
+            try NotebookFileSystem.replaceAtomically(
+                stage, destination: directory.appendingPathComponent("HEAD.json")
+            )
+        }
+        if isCreating {
+            try faultInjector?(.beforeNotebookPublication)
+            try NotebookFileSystem.publishImmutable(directory, to: destination)
+        }
 
         return storedNotebook(revision: revision, strokes: content.strokes)
     }

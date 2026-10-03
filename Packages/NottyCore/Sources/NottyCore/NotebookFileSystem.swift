@@ -92,14 +92,173 @@ enum NotebookFileSystem {
         throw NotebookRepositoryError.sizeLimitExceeded("A notebook file exceeds its supported size.")
     }
 
-    static func writeSynchronized(_ data: Data, to url: URL) throws {
+    static func writeSynchronized(
+        _ data: Data,
+        to url: URL,
+        writeBody: ((FileHandle, Data) throws -> Void)? = nil
+    ) throws {
         let descriptor = try openFile(
             url, flags: O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW
         )
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close() }
-        try handle.write(contentsOf: data)
+        var synchronized = false
+        defer {
+            try? handle.close()
+            if !synchronized { try? FileManager.default.removeItem(at: url) }
+        }
+        if let writeBody {
+            try writeBody(handle, data)
+        } else {
+            try handle.write(contentsOf: data)
+        }
         try handle.synchronize()
+        synchronized = true
+    }
+
+    static func withSynchronizedStage<T>(
+        _ data: Data,
+        in directory: URL,
+        head: Bool = false,
+        publish: (URL) throws -> T
+    ) throws -> T {
+        let name = head ? ".head-\(UUID().uuidString).tmp" : ".\(UUID().uuidString).tmp"
+        let stage = directory.appendingPathComponent(name)
+        var created = false
+        defer {
+            if created { try? FileManager.default.removeItem(at: stage) }
+        }
+        try writeSynchronized(data, to: stage)
+        created = true
+        return try publish(stage)
+    }
+
+    static func sweepPrivateTransactions(in root: URL, prefix: String) throws {
+        guard prefix == ".creation-" || prefix == ".recovery-" else {
+            throw NotebookRepositoryError.unsafePath("Unknown storage transaction namespace.")
+        }
+        var removed = 0
+        try visitChildren(in: root, limit: 2_048) { entry in
+            guard isTransactionName(entry.lastPathComponent, prefix: prefix) else { return true }
+            try removePrivateTransaction(entry, prefix: prefix)
+            removed += 1
+            return removed < 16
+        }
+    }
+
+    static func removePrivateTransaction(_ url: URL, prefix: String) throws {
+        guard isTransactionName(url.lastPathComponent, prefix: prefix) else {
+            throw NotebookRepositoryError.unsafePath("The storage transaction has an invalid name.")
+        }
+        guard let type = try kind(url) else { return }
+        guard type == .directory else {
+            throw NotebookRepositoryError.unsafePath("The storage transaction has an unsafe file type.")
+        }
+        var directories = [url]
+        var visited = 0
+        var bytes: Int64 = 0
+        while let directory = directories.popLast() {
+            try visitChildren(in: directory, limit: 50_001) { child in
+                visited += 1
+                guard visited <= 50_000 else {
+                    throw NotebookRepositoryError.sizeLimitExceeded("The abandoned transaction exceeds cleanup bounds.")
+                }
+                guard let type = try kind(child) else { return true }
+                switch type {
+                case .directory:
+                    directories.append(child)
+                case .regularFile:
+                    let attributes = try FileManager.default.attributesOfItem(atPath: child.path)
+                    bytes += (attributes[.size] as? NSNumber)?.int64Value ?? 0
+                    guard bytes <= 600 * 1_024 * 1_024 else {
+                        throw NotebookRepositoryError.sizeLimitExceeded("The abandoned transaction exceeds cleanup bounds.")
+                    }
+                case .other:
+                    throw NotebookRepositoryError.unsafePath("The storage transaction contains an unsafe file type.")
+                }
+                return true
+            }
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    static func sweepNotebookStages(in directory: URL) throws {
+        let locations = [
+            directory,
+            directory.appendingPathComponent("assets", isDirectory: true),
+            directory.appendingPathComponent("revisions", isDirectory: true)
+        ]
+        var removed = 0
+        for location in locations {
+            guard try existingDirectory(location) else { continue }
+            try visitChildren(in: location, limit: 20_000) { entry in
+                guard isStageName(entry.lastPathComponent) else { return true }
+                guard try kind(entry) == .regularFile else {
+                    throw NotebookRepositoryError.unsafePath("A staged notebook file has an unsafe file type.")
+                }
+                try FileManager.default.removeItem(at: entry)
+                removed += 1
+                return removed < 64
+            }
+            if removed == 64 { return }
+        }
+    }
+
+    private static func visitChildren(
+        in directory: URL,
+        limit: Int,
+        _ visit: (URL) throws -> Bool
+    ) throws {
+        let failure = EnumerationFailure()
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants],
+            errorHandler: { _, error in
+                failure.record(error)
+                return false
+            }
+        ) else {
+            throw NotebookRepositoryError.unsafePath("A storage directory cannot be enumerated.")
+        }
+        var visited = 0
+        for case let entry as URL in enumerator {
+            if visited == limit { break }
+            visited += 1
+            if try !visit(entry) { break }
+        }
+        if let error = failure.value() { throw error }
+    }
+
+    private final class EnumerationFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var error: Error?
+
+        func record(_ error: Error) {
+            lock.lock()
+            defer { lock.unlock() }
+            self.error = error
+        }
+
+        func value() -> Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return error
+        }
+    }
+
+    private static func isTransactionName(_ name: String, prefix: String) -> Bool {
+        guard name.hasPrefix(prefix) else { return false }
+        let suffix = String(name.dropFirst(prefix.count))
+        guard let identifier = UUID(uuidString: suffix) else { return false }
+        return suffix == identifier.uuidString || suffix == identifier.uuidString.lowercased()
+    }
+
+    private static func isStageName(_ name: String) -> Bool {
+        guard name.hasPrefix("."), name.hasSuffix(".tmp") else { return false }
+        var identifier = String(name.dropFirst().dropLast(4))
+        if identifier.hasPrefix("head-") { identifier = String(identifier.dropFirst(5)) }
+        guard let uuid = UUID(uuidString: identifier) else { return false }
+        return identifier == uuid.uuidString || identifier == uuid.uuidString.lowercased()
     }
 
     static func publishImmutable(_ stage: URL, to destination: URL) throws {
