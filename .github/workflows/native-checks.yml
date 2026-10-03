@@ -26,7 +26,6 @@ jobs:
     timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
-      NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
     defaults:
       run:
         shell: bash
@@ -53,11 +52,15 @@ jobs:
           done
 
       - name: Test notebook core and native stroke archives
+        env:
+          NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
         run: |
           xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2
 
       - name: Record history growth measurements
         if: always()
+        env:
+          NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
         run: |
           if [ -d "$NOTTY_HISTORY_METRICS_DIRECTORY" ]; then
             for report in "$NOTTY_HISTORY_METRICS_DIRECTORY"/*.json; do
