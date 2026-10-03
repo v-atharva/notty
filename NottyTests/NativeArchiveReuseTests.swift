@@ -102,6 +102,7 @@ final class NativeArchiveReuseTests: XCTestCase {
             XCTAssertNotEqual(field.value(changed.path[0]), field.value(original.path[0]), field.rawValue)
             let codec = InkCodec()
             let assets = try await codec.encode(PKDrawing(strokes: [original, untouched]))
+            let baseline = try await InkCodec().decode(assets)
             await live.assign(PKDrawing(strokes: [changed, untouched]))
             let observed = live.canvas.drawing
             XCTAssertEqual(observed.strokes.map(\.id), [original.id, untouched.id], field.rawValue)
@@ -125,8 +126,17 @@ final class NativeArchiveReuseTests: XCTestCase {
             let restored = try await InkCodec().decode(result)
             XCTAssertEqual(restored.strokes.map(\.id), result.map(\.id), field.rawValue)
             XCTAssertEqual(restored.strokes[0].path.id, changed.path.id, field.rawValue)
+            let restoredValue = field.value(restored.strokes[0].path[0])
+            XCTAssertEqual(restoredValue, field.value(changed.path[0]), accuracy: 0.001, field.rawValue)
+            XCTAssertGreaterThan(
+                abs(restoredValue - field.value(baseline.strokes[0].path[0])), 0.002, field.rawValue
+            )
             try report(name: "point-field-\(field.rawValue)", values: [
                 "distinctNativePath": changed.path.id == original.path.id ? 0 : 1,
+                "restoredFieldErrorMillionths":
+                    Int((abs(restoredValue - field.value(changed.path[0])) * 1_000_000).rounded()),
+                "restoredChangeMillionths":
+                    Int((abs(restoredValue - field.value(baseline.strokes[0].path[0])) * 1_000_000).rounded()),
                 "serializations": after.serializedStrokes - before.serializedStrokes,
                 "pointComparisons": after.comparedPoints - before.comparedPoints,
                 "assetSHABytes": after.hashedArchiveBytes - before.hashedArchiveBytes

@@ -395,7 +395,6 @@ final class InkArchiveReuseTests: XCTestCase {
         }
     }
 
-
     func testEveryPublicPointFieldUsesNewNativePathAndInvalidatesOnlyChangedArchive() async throws {
         let original = stroke()
         let untouched = stroke(x: 120)
@@ -412,6 +411,7 @@ final class InkArchiveReuseTests: XCTestCase {
             XCTAssertNotEqual(originalSignature, changedSignature, field.rawValue)
             let codec = InkCodec()
             let assets = try await codec.encode(PKDrawing(strokes: [original, untouched]))
+            let baseline = try await InkCodec().decode(assets)
             let before = await codec.workMetrics
             let result = try await codec.encode(PKDrawing(strokes: [changed, untouched]))
             let after = await codec.workMetrics
@@ -425,6 +425,11 @@ final class InkArchiveReuseTests: XCTestCase {
             let restored = try await InkCodec().decode(result)
             XCTAssertEqual(restored.strokes.map(\.id), result.map(\.id), field.rawValue)
             XCTAssertEqual(restored.strokes[0].path.id, changed.path.id, field.rawValue)
+            let restoredValue = field.value(restored.strokes[0].path[0])
+            XCTAssertEqual(restoredValue, field.value(changed.path[0]), accuracy: 0.001, field.rawValue)
+            XCTAssertGreaterThan(
+                abs(restoredValue - field.value(baseline.strokes[0].path[0])), 0.002, field.rawValue
+            )
         }
     }
 
