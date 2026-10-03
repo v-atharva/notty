@@ -266,11 +266,13 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         let root: URL
     }
 
+    @MainActor
     private final class LeaseProbe {
         var expirations: [@MainActor @Sendable () -> Void] = []
         var ended: [Int] = []
         var started: Int { expirations.count }
 
+        @MainActor
         func makeLease() -> NotebookBackgroundLease {
             NotebookBackgroundLease(begin: { [self] expiration in
                 expirations.append(expiration)
