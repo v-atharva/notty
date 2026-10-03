@@ -43,6 +43,11 @@ final class NotebookHistoryTests: XCTestCase {
                     "assets=\(assetBytes) checkpointCount=\(checkpoints) " +
                     "ratio=\(Double(eventBytes + checkpointBytes) / Double(assetBytes))"
                 )
+                try Fixtures.writeGrowthMetrics(
+                    workloadEdits: strokeCount, edits: index, eventBytes: eventBytes,
+                    checkpointBytes: checkpointBytes, assetBytes: assetBytes,
+                    checkpointCount: checkpoints
+                )
             }
         }
         let saved = try XCTUnwrap(latest)

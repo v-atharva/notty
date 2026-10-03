@@ -138,9 +138,16 @@ enum NotebookHistoryTestFixtures {
     }
 
     static func snapshot(in directory: URL) throws -> [String: Data] {
-        let prefix = directory.path + "/"
-        return try Dictionary(uniqueKeysWithValues: regularFiles(in: directory).map { url in
-            (String(url.path.dropFirst(prefix.count)), try Data(contentsOf: url))
+        let canonicalDirectory = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = canonicalDirectory.path + "/"
+        return try Dictionary(uniqueKeysWithValues: regularFiles(in: canonicalDirectory).map { url in
+            let canonicalFile = url.standardizedFileURL.resolvingSymlinksInPath()
+            guard canonicalFile.path.hasPrefix(prefix) else {
+                throw FixtureError.malformedMetadata
+            }
+            let path = String(canonicalFile.path.dropFirst(prefix.count))
+            guard !path.isEmpty else { throw FixtureError.malformedMetadata }
+            return (path, try Data(contentsOf: canonicalFile))
         })
     }
 
@@ -249,6 +256,27 @@ enum NotebookHistoryTestFixtures {
             defer { lock.unlock() }
             return digests
         }
+    }
+
+    static func writeGrowthMetrics(
+        workloadEdits: Int, edits: Int, eventBytes: Int, checkpointBytes: Int,
+        assetBytes: Int, checkpointCount: Int
+    ) throws {
+        guard let path = ProcessInfo.processInfo.environment["NOTTY_HISTORY_METRICS_DIRECTORY"] else {
+            return
+        }
+        guard !path.isEmpty, assetBytes > 0 else { throw FixtureError.malformedMetadata }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let object: [String: Any] = [
+            "workloadEdits": workloadEdits, "edits": edits,
+            "eventBytes": eventBytes, "checkpointBytes": checkpointBytes,
+            "assetBytes": assetBytes, "checkpointCount": checkpointCount,
+            "ratio": Double(eventBytes + checkpointBytes) / Double(assetBytes)
+        ]
+        let filename = "workload-\(workloadEdits)-edits-\(edits).json"
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .prettyPrinted])
+            .write(to: directory.appendingPathComponent(filename), options: .atomic)
     }
 
     static func writeObject(_ object: [String: Any], to url: URL) throws {
