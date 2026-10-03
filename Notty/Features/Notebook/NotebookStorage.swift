@@ -5,7 +5,7 @@ struct NotebookStorage: Sendable {
     let load: @Sendable () async throws -> StoredNotebook?
     let save: @Sendable (NotebookContent, UUID?) async throws -> StoredNotebook
     let preserve: @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt
-    let listRecovery: @Sendable () async throws -> [NotebookRecoveryReceipt]
+    let listRecovery: @Sendable () async throws -> NotebookRecoveryScan
     let loadRecovery: @Sendable (UUID) async throws -> NotebookRecoveryBatch
 
     static func open(
@@ -41,7 +41,7 @@ struct NotebookStorage: Sendable {
                     )
                 },
                 preserve: { try await recovery.preserve($0) },
-                listRecovery: { try await recovery.list(notebookID: notebookID) },
+                listRecovery: { try await recovery.scan(notebookID: notebookID) },
                 loadRecovery: { try await recovery.load(id: $0) }
             )
         }.value
@@ -65,8 +65,8 @@ private actor NotebookRecoveryAccess {
         try await openedStore().preserve(batch)
     }
 
-    func list(notebookID: UUID) async throws -> [NotebookRecoveryReceipt] {
-        try await openedStore().list(notebookID: notebookID)
+    func scan(notebookID: UUID) async throws -> NotebookRecoveryScan {
+        try await openedStore().scan(notebookID: notebookID)
     }
 
     func load(id: UUID) async throws -> NotebookRecoveryBatch {

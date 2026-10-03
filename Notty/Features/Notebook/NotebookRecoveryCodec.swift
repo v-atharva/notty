@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import NottyCore
 import PencilKit
@@ -6,6 +7,21 @@ struct NotebookDrawingSnapshot: Sendable, Equatable {
     let drawing: PKDrawing
     let pageCount: Int
     let title: String
+}
+
+struct NotebookRecoveryFingerprint: Sendable, Equatable {
+    struct Edit: Sendable, Equatable {
+        let id: UUID
+        let archiveDigest: Data
+        let strokeIDs: [UUID]
+        let title: String
+        let pageCount: Int
+        let stamp: NotebookEditStamp
+    }
+
+    let notebookID: UUID
+    let baseRevisionID: UUID?
+    let edits: [Edit]
 }
 
 actor NotebookRecoveryCodec {
@@ -48,6 +64,21 @@ actor NotebookRecoveryCodec {
         }
         return NotebookRecoveryBatch(
             notebookID: notebookID, baseRevisionID: baseRevisionID, edits: archived
+        )
+    }
+
+    func fingerprint(_ batch: NotebookRecoveryBatch) -> NotebookRecoveryFingerprint {
+        NotebookRecoveryFingerprint(
+            notebookID: batch.notebookID,
+            baseRevisionID: batch.baseRevisionID,
+            edits: batch.edits.map { edit in
+                NotebookRecoveryFingerprint.Edit(
+                    id: edit.id,
+                    archiveDigest: Data(SHA256.hash(data: edit.drawingData)),
+                    strokeIDs: edit.strokeIDs, title: edit.title,
+                    pageCount: edit.pageCount, stamp: edit.stamp
+                )
+            }
         )
     }
 

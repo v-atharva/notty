@@ -25,6 +25,7 @@ final class NotebookSession: ObservableObject {
 
     private struct PreservedState {
         let receipt: NotebookRecoveryReceipt
+        let fingerprint: NotebookRecoveryFingerprint
         let coverage: RecoveryCoverage
     }
 
@@ -39,6 +40,7 @@ final class NotebookSession: ObservableObject {
     @Published private(set) var recoveryMessage: String?
     @Published private(set) var recoveryFailure: NotebookSaveFailure?
     @Published private(set) var recoveryCopies: [NotebookRecoveryReceipt] = []
+    @Published private(set) var unavailableRecoveryCopyIDs: [UUID] = []
     @Published private(set) var isLoadingRecoveryCopies = false
     @Published private(set) var recoveryListFailure: NotebookSaveFailure?
 
@@ -55,6 +57,13 @@ final class NotebookSession: ObservableObject {
     private var activeCanvasOwner: UUID?
     private var snapshotProvider: (() -> PKDrawing?)?
     private var preservedState: PreservedState?
+    private struct BackgroundFlush {
+        let id: UUID
+        let coordinatorID: ObjectIdentifier
+        var token: NotebookBackgroundLease.Token?
+    }
+
+    private var backgroundFlush: BackgroundFlush?
     private var backgroundWaiter: Task<Void, Never>?
 
     var saveState: NotebookSaveStatus { coordinator?.status ?? .idle }
@@ -157,17 +166,35 @@ final class NotebookSession: ObservableObject {
         guard loadState == .ready else { return }
         captureWorkingInk()
         guard let coordinator, coordinator.pendingCount > 0,
-              coordinator.failure == nil, backgroundWaiter == nil else { return }
-        let token = backgroundLease.start()
+              coordinator.failure == nil else { return }
+        let coordinatorID = ObjectIdentifier(coordinator)
+        if var existing = backgroundFlush, existing.coordinatorID == coordinatorID {
+            existing.token = backgroundLease.start()
+            backgroundFlush = existing
+            return
+        }
+        if let existing = backgroundFlush { finishBackgroundFlush(id: existing.id) }
+        let id = UUID()
+        backgroundFlush = BackgroundFlush(
+            id: id, coordinatorID: coordinatorID, token: backgroundLease.start()
+        )
         backgroundWaiter = Task { [self] in
             await coordinator.waitUntilSettled()
-            if let token { backgroundLease.finish(token) }
-            backgroundWaiter = nil
+            finishBackgroundFlush(id: id)
         }
     }
 
     func waitUntilSettled() async {
         await coordinator?.waitUntilSettled()
+        await backgroundWaiter?.value
+    }
+
+    private func finishBackgroundFlush(id: UUID) {
+        guard let active = backgroundFlush, active.id == id else { return }
+        if let token = active.token { backgroundLease.finish(token) }
+        backgroundFlush = nil
+        backgroundWaiter?.cancel()
+        backgroundWaiter = nil
     }
 
     func saveRecoveryCopy() async {
@@ -185,13 +212,18 @@ final class NotebookSession: ObservableObject {
             )
             captureWorkingInk()
             let unchangedAfterEncoding = matches(coverage)
+            let fingerprint = await recoveryCodec.fingerprint(batch)
+            captureWorkingInk()
+            let unchangedAfterFingerprint = matches(coverage)
             let receipt = try await storage.preserve(batch)
             captureWorkingInk()
             guard receipt.notebookID == notebookID, receipt.editCount == edits.count else {
                 throw NotebookSaveFailure.corruptData
             }
-            preservedState = PreservedState(receipt: receipt, coverage: coverage)
-            if unchangedAfterEncoding && matches(coverage) {
+            preservedState = PreservedState(
+                receipt: receipt, fingerprint: fingerprint, coverage: coverage
+            )
+            if unchangedAfterEncoding && unchangedAfterFingerprint && matches(coverage) {
                 recoveryMessage = "All waiting edits are preserved. You can reopen the saved notebook."
             } else {
                 recoveryMessage = "A copy was preserved. Newer waiting edits need another copy before reopening."
@@ -211,7 +243,18 @@ final class NotebookSession: ObservableObject {
         recoveryFailure = nil
         recoveryMessage = nil
         defer { isPerformingRecovery = false }
+        var recoveryVerified = false
         do {
+            let batch = try await storage.loadRecovery(preservedState.receipt.id)
+            captureWorkingInk()
+            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+            let fingerprint = await recoveryCodec.fingerprint(batch)
+            captureWorkingInk()
+            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+            guard fingerprint == preservedState.fingerprint else {
+                throw NotebookSaveFailure.corruptData
+            }
+            recoveryVerified = true
             let stored = try await storage.load()
             captureWorkingInk()
             guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
@@ -228,6 +271,7 @@ final class NotebookSession: ObservableObject {
             recoveryMessage = "Saved notebook reopened. Your recovery copy remains available."
         } catch {
             captureWorkingInk()
+            if !recoveryVerified { self.preservedState = nil }
             recoveryFailure = NotebookSaveFailure.classify(error)
             recoveryMessage = "The saved notebook could not be reopened. Your waiting edits remain here."
         }
@@ -243,11 +287,15 @@ final class NotebookSession: ObservableObject {
         recoveryListFailure = nil
         defer { isLoadingRecoveryCopies = false }
         do {
-            let copies = try await storage.listRecovery()
-            guard copies.allSatisfy({ $0.notebookID == notebookID }) else {
+            let scan = try await storage.listRecovery()
+            guard scan.copies.allSatisfy({ $0.notebookID == notebookID }),
+                  Set(scan.copies.map(\.id)).count == scan.copies.count,
+                  Set(scan.unavailableCopyIDs).count == scan.unavailableCopyIDs.count,
+                  Set(scan.copies.map(\.id)).isDisjoint(with: scan.unavailableCopyIDs) else {
                 throw NotebookSaveFailure.corruptData
             }
-            recoveryCopies = copies
+            recoveryCopies = scan.copies
+            unavailableRecoveryCopyIDs = scan.unavailableCopyIDs
         } catch {
             recoveryListFailure = NotebookSaveFailure.classify(error)
         }
@@ -299,6 +347,7 @@ final class NotebookSession: ObservableObject {
 
     private func install(stored: StoredNotebook?, drawing: PKDrawing) {
         guard let storage else { return }
+        if let active = backgroundFlush { finishBackgroundFlush(id: active.id) }
         workingDrawing = drawing
         pageCount = stored?.content.pageCount ?? 3
         title = stored?.content.title ?? "Personal notebook"

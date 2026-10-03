@@ -51,6 +51,9 @@ actor NotebookStorageProbe {
     private var saveFailure: NotebookSaveFailure?
     private var loadFailure: NotebookSaveFailure?
     private var preserveFailure: NotebookSaveFailure?
+    private var suspendSave = false
+    private var saveContinuation: CheckedContinuation<Void, Never>?
+    private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     private var suspendLoad = false
     private var loadContinuation: CheckedContinuation<Void, Never>?
     private var loadWaiters: [CheckedContinuation<Void, Never>] = []
@@ -68,6 +71,7 @@ actor NotebookStorageProbe {
     func setSaveFailure(_ failure: NotebookSaveFailure?) { saveFailure = failure }
     func setLoadFailure(_ failure: NotebookSaveFailure?) { loadFailure = failure }
     func setPreserveFailure(_ failure: NotebookSaveFailure?) { preserveFailure = failure }
+    func setSuspendSave() { suspendSave = true }
     func setSuspendLoad() { suspendLoad = true }
     func setSuspendPreserve() { suspendPreserve = true }
 
@@ -76,7 +80,7 @@ actor NotebookStorageProbe {
             load: { try await self.load() },
             save: { try await self.save($0, revision: $1, notebookID: notebookID) },
             preserve: { try await self.preserve($0) },
-            listRecovery: { try await self.recovery.list(notebookID: notebookID) },
+            listRecovery: { try await self.recovery.scan(notebookID: notebookID) },
             loadRecovery: { try await self.recovery.load(id: $0) }
         )
     }
@@ -106,8 +110,16 @@ actor NotebookStorageProbe {
         continuation?.resume()
     }
 
-    private func save(_ content: NotebookContent, revision: UUID?, notebookID: UUID) throws -> StoredNotebook {
+    private func save(_ content: NotebookContent, revision: UUID?, notebookID: UUID) async throws -> StoredNotebook {
         saveCalls += 1
+        if suspendSave {
+            await withCheckedContinuation { continuation in
+                saveContinuation = continuation
+                let waiters = saveWaiters
+                saveWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        }
         if let saveFailure { throw saveFailure }
         let next = StoredNotebook(
             id: notebookID, revisionID: UUID(), sequence: (stored?.sequence ?? 0) + 1,
@@ -115,6 +127,18 @@ actor NotebookStorageProbe {
         )
         stored = next
         return next
+    }
+
+    func waitForSave() async {
+        if saveContinuation != nil { return }
+        await withCheckedContinuation { saveWaiters.append($0) }
+    }
+
+    func releaseSave() {
+        suspendSave = false
+        let continuation = saveContinuation
+        saveContinuation = nil
+        continuation?.resume()
     }
 
     private func preserve(_ batch: NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt {

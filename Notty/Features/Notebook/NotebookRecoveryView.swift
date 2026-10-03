@@ -21,8 +21,17 @@ struct NotebookRecoveryView: View {
                     }
                 }
                 if !session.isLoadingRecoveryCopies && session.recoveryListFailure == nil
-                    && session.recoveryCopies.isEmpty {
+                    && session.recoveryCopies.isEmpty && session.unavailableRecoveryCopyIDs.isEmpty {
                     Text("No recovery copies have been preserved for this notebook.")
+                }
+                if !session.unavailableRecoveryCopyIDs.isEmpty {
+                    Section("Unavailable copies") {
+                        Text("\(session.unavailableRecoveryCopyIDs.count) preserved copies could not be verified. Their files remain stored. Available copies can still be opened below.")
+                        ForEach(session.unavailableRecoveryCopyIDs, id: \.self) { identity in
+                            Label("Unavailable copy \(identity.uuidString.prefix(8))", systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 ForEach(session.recoveryCopies, id: \.id) { receipt in
                     NavigationLink {

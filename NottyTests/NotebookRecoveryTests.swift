@@ -150,4 +150,56 @@ final class NotebookRecoveryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: libraryRoot), marker)
     }
 
+
+    func testMissingOrCorruptPreservedArchiveCannotAuthorizeReopenAndDoesNotHideHealthyCopy() async throws {
+        for deleteArchive in [false, true] {
+            let root = NotebookTestFixtures.root()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let notebookID = UUID()
+            let stored = try await NotebookTestFixtures.stored(id: notebookID)
+            let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
+            await probe.setSaveFailure(.contentLimit)
+            let storage = await probe.storage(notebookID: notebookID)
+            let session = NotebookSession(notebookID: notebookID, openStorage: { storage })
+            await session.load()
+            let seed = session.makeCanvasSeed()
+            let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
+            session.recordCompletedEdit(drawing, ownerID: seed.ownerID)
+            await session.waitUntilSettled()
+            let pending = session.pendingEdits
+            await session.saveRecoveryCopy()
+            await session.refreshRecoveryCopies()
+            let receipt = try XCTUnwrap(session.recoveryCopies.first)
+            let edit = try XCTUnwrap(pending.first)
+            let archive = root
+                .appendingPathComponent(receipt.id.uuidString.lowercased(), isDirectory: true)
+                .appendingPathComponent("archives", isDirectory: true)
+                .appendingPathComponent(edit.id.uuidString.lowercased() + ".drawing")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: archive.path))
+            if deleteArchive {
+                try FileManager.default.removeItem(at: archive)
+            } else {
+                try Data([0, 1, 2, 3]).write(to: archive)
+            }
+            await session.reopenSavedNotebook()
+            XCTAssertNotNil(session.recoveryFailure)
+            XCTAssertFalse(session.canReopenSaved)
+            XCTAssertEqual(session.pendingEdits, pending)
+            XCTAssertEqual(session.saveState, .failed(.contentLimit))
+            XCTAssertEqual(session.workingDrawing.strokes.map(\.id), drawing.strokes.map(\.id))
+            await session.saveRecoveryCopy()
+            XCTAssertNil(session.recoveryFailure)
+            XCTAssertTrue(session.canReopenSaved)
+            await session.refreshRecoveryCopies()
+            XCTAssertNil(session.recoveryListFailure)
+            XCTAssertEqual(session.recoveryCopies.count, 1)
+            XCTAssertNotEqual(session.recoveryCopies.first?.id, receipt.id)
+            XCTAssertEqual(session.unavailableRecoveryCopyIDs, [receipt.id])
+            let healthy = try XCTUnwrap(session.recoveryCopies.first)
+            let loaded = try await session.openRecoveryCopy(id: healthy.id)
+            XCTAssertEqual(loaded.edits.map(\.id), pending.map(\.id))
+            XCTAssertEqual(loaded.edits.map(\.stamp), pending.map(\.stamp))
+        }
+    }
+
 }
