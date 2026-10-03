@@ -57,6 +57,9 @@ final class NotebookSession: ObservableObject {
     private var activeCanvasOwner: UUID?
     private var snapshotProvider: (() -> PKDrawing?)?
     private var preservedState: PreservedState?
+    private var preservationTask: Task<Void, Never>?
+    private var preservationID: UUID?
+    private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
     private struct BackgroundFlush {
         let id: UUID
         let coordinatorID: ObjectIdentifier
@@ -172,8 +175,8 @@ final class NotebookSession: ObservableObject {
     func flush() {
         guard loadState == .ready else { return }
         captureWorkingInk()
-        guard let coordinator, coordinator.pendingCount > 0,
-              coordinator.failure == nil else { return }
+        guard let coordinator, coordinator.pendingCount > 0 else { return }
+        if coordinator.failure != nil, let preservedState, matches(preservedState.coverage) { return }
         let coordinatorID = ObjectIdentifier(coordinator)
         if var existing = backgroundFlush, existing.coordinatorID == coordinatorID {
             existing.token = backgroundLease.start()
@@ -187,6 +190,15 @@ final class NotebookSession: ObservableObject {
         )
         backgroundWaiter = Task { [self] in
             await coordinator.waitUntilSettled()
+            guard ownsBackgroundFlush(id: id, coordinator: coordinator) else { return }
+            await waitUntilRecoveryFinished()
+            while ownsBackgroundFlush(id: id, coordinator: coordinator),
+                  coordinator.failure != nil, !coordinator.pendingEdits.isEmpty {
+                captureWorkingInk()
+                if let preservedState, matches(preservedState.coverage) { break }
+                await saveRecoveryCopy()
+                if recoveryFailure != nil { break }
+            }
             finishBackgroundFlush(id: id)
         }
     }
@@ -194,6 +206,27 @@ final class NotebookSession: ObservableObject {
     func waitUntilSettled() async {
         await coordinator?.waitUntilSettled()
         await backgroundWaiter?.value
+    }
+
+    private func ownsBackgroundFlush(
+        id: UUID, coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>
+    ) -> Bool {
+        !Task.isCancelled && self.coordinator === coordinator
+            && backgroundFlush?.id == id
+            && backgroundFlush?.coordinatorID == ObjectIdentifier(coordinator)
+    }
+
+    private func waitUntilRecoveryFinished() async {
+        while isPerformingRecovery {
+            await withCheckedContinuation { recoveryWaiters.append($0) }
+        }
+    }
+
+    private func finishRecoveryOperation() {
+        isPerformingRecovery = false
+        let waiters = recoveryWaiters
+        recoveryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     private func finishBackgroundFlush(id: UUID) {
@@ -205,24 +238,53 @@ final class NotebookSession: ObservableObject {
     }
 
     func saveRecoveryCopy() async {
-        guard canPreserveRecovery, let storage, let coordinator else { return }
         captureWorkingInk()
-        let coverage = currentCoverage()
-        let edits = coordinator.pendingEdits
+        if let preservationTask {
+            await preservationTask.value
+            return
+        }
+        guard canPreserveRecovery, let storage, let coordinator else { return }
+        if let preservedState, matches(preservedState.coverage) { return }
+        let id = UUID()
+        preservationID = id
         isPerformingRecovery = true
         recoveryMessage = nil
         recoveryFailure = nil
-        defer { isPerformingRecovery = false }
+        // The session owns this work even if a caller stops waiting.
+        let task = Task { [self] in
+            await preserveRecoveryCopy(storage: storage, coordinator: coordinator, id: id)
+        }
+        preservationTask = task
+        await task.value
+    }
+
+    private func preserveRecoveryCopy(
+        storage: NotebookStorage,
+        coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>,
+        id: UUID
+    ) async {
+        let coverage = currentCoverage()
+        let edits = coordinator.pendingEdits
+        defer {
+            if preservationID == id {
+                preservationTask = nil
+                preservationID = nil
+                finishRecoveryOperation()
+            }
+        }
         do {
             let batch = try await recoveryCodec.encode(
                 notebookID: notebookID, baseRevisionID: coverage.baseRevisionID, edits: edits
             )
+            guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             let unchangedAfterEncoding = matches(coverage)
             let fingerprint = await recoveryCodec.fingerprint(batch)
+            guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             let unchangedAfterFingerprint = matches(coverage)
             let receipt = try await storage.preserve(batch)
+            guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             guard receipt.notebookID == notebookID, receipt.editCount == edits.count else {
                 throw NotebookSaveFailure.corruptData
@@ -236,6 +298,7 @@ final class NotebookSession: ObservableObject {
                 recoveryMessage = "A copy was preserved. Newer waiting edits need another copy before reopening."
             }
         } catch {
+            guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             recoveryFailure = NotebookSaveFailure.classify(error)
             recoveryMessage = "The recovery copy could not be saved. Your waiting edits remain here."
@@ -249,7 +312,7 @@ final class NotebookSession: ObservableObject {
         isPerformingRecovery = true
         recoveryFailure = nil
         recoveryMessage = nil
-        defer { isPerformingRecovery = false }
+        defer { finishRecoveryOperation() }
         var recoveryVerified = false
         do {
             let batch = try await storage.loadRecovery(preservedState.receipt.id)

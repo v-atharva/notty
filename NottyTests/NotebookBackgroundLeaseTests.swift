@@ -259,6 +259,39 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         XCTAssertEqual(fixture.leases.ended, [101])
     }
 
+
+    func testBackgroundFlushWaitsForReopenAndProtectsLateEditsAfterReopenIsRefused() async throws {
+        let fixture = try await failedSession(suspendPreserve: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.session.saveRecoveryCopy()
+        await fixture.probe.setSuspendLoad()
+        let reopening = Task { await fixture.session.reopenSavedNotebook() }
+        await fixture.probe.waitForLoad()
+        let seed = fixture.session.makeCanvasSeed()
+        fixture.session.recordCompletedEdit(PKDrawing(), ownerID: seed.ownerID)
+        let pending = fixture.session.pendingEdits
+        await fixture.probe.setSuspendPreserve()
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 1)
+        await fixture.probe.releaseLoad()
+        await reopening.value
+        await fixture.probe.waitForPreserve()
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        XCTAssertTrue(fixture.leases.ended.isEmpty)
+        await fixture.probe.releasePreserve()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        XCTAssertEqual(fixture.session.pendingEdits, pending)
+        XCTAssertEqual(fixture.leases.ended, [101])
+        await fixture.session.reopenSavedNotebook()
+        XCTAssertTrue(fixture.session.pendingEdits.isEmpty)
+        XCTAssertFalse(fixture.session.recordCompletedEdit(
+            PKDrawing(strokes: [NotebookTestFixtures.stroke()]), ownerID: seed.ownerID
+        ))
+        fixture.session.flush()
+        XCTAssertEqual(fixture.leases.started, 1)
+    }
+
     private struct FailedSession {
         let session: NotebookSession
         let probe: NotebookStorageProbe
@@ -266,6 +299,7 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         let root: URL
     }
 
+    @MainActor
     private final class LeaseProbe {
         var expirations: [@MainActor @Sendable () -> Void] = []
         var ended: [Int] = []
