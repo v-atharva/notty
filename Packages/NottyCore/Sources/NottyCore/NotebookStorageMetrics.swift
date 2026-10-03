@@ -1,6 +1,9 @@
 import Foundation
 
 public struct NotebookStorageMetrics: Sendable, Equatable {
+    public internal(set) var assetCopiedBytes = 0
+    /// Full input visits during bounds validation, ownership and archive preparation.
+    public internal(set) var inputReferenceVisits = 0
     public internal(set) var assetHashCalls = 0
     public internal(set) var assetHashBytes = 0
     public internal(set) var metadataHashCalls = 0
@@ -17,6 +20,7 @@ public struct NotebookStorageMetrics: Sendable, Equatable {
     public internal(set) var checkpointEncodings = 0
     public internal(set) var checkpointPublications = 0
     public internal(set) var checkpointWrittenBytes = 0
+    /// Reference classifications performed while constructing history deltas.
     public internal(set) var referenceComparisons = 0
 
     public var totalHashBytes: Int { assetHashBytes + metadataHashBytes }

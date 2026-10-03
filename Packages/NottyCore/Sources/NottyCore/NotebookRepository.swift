@@ -236,17 +236,33 @@ public actor NotebookRepository {
     public func save(
         id: UUID, content: NotebookContent, expectedRevisionID: UUID?
     ) throws -> StoredNotebook {
-        let result = try saveBatch(
-            id: id, edits: [NotebookSaveEdit(id: UUID(), content: content)],
-            expectedRevisionID: expectedRevisionID
-        )
-        guard let committed = result.committed.first else {
-            throw result.rejection?.error ?? NotebookRepositoryError.invalidContent("No notebook edit was accepted.")
+        do {
+            try validateContent(content)
+            let owned = NotebookContent(
+                title: content.title, pageCount: content.pageCount,
+                strokes: content.strokes.map { stroke in
+                    metrics.record(\.inputReferenceVisits)
+                    return ownedAsset(stroke)
+                },
+                editStamp: content.editStamp
+            )
+            let result = try saveBatch(
+                id: id, edits: [NotebookSaveEdit(id: UUID(), content: owned)],
+                expectedRevisionID: expectedRevisionID
+            )
+            guard let committed = result.committed.first else {
+                throw result.rejection?.error ?? NotebookRepositoryError.invalidContent("No notebook edit was accepted.")
+            }
+            return StoredNotebook(
+                id: id, revisionID: committed.revisionID, sequence: committed.sequence,
+                content: owned, savedAt: committed.savedAt
+            )
+        } catch {
+            validatedGenerations.removeValue(forKey: id)
+            maintainedNotebookIDs.remove(id)
+            privateMaintenanceRequired = true
+            throw error
         }
-        return StoredNotebook(
-            id: id, revisionID: committed.revisionID, sequence: committed.sequence,
-            content: content, savedAt: committed.savedAt
-        )
     }
 
     /// Publishes an ordered prefix of at most eight edits beneath one atomic HEAD.
@@ -610,17 +626,29 @@ public actor NotebookRepository {
         references.reserveCapacity(strokes.count)
         var dataByDigest: [String: Data] = [:]
         for stroke in strokes {
-            let digest = stroke.cachedDigest ?? metrics.assetDigest(stroke.data)
+            metrics.record(\.inputReferenceVisits)
+            let owned = ownedAsset(stroke)
+            let digest = owned.cachedDigest ?? metrics.assetDigest(owned.data)
             guard Format.isDigest(digest) else {
                 throw NotebookRepositoryError.invalidContent("A stroke archive has invalid digest metadata.")
             }
-            if let existing = dataByDigest[digest], existing != stroke.data {
+            if let existing = dataByDigest[digest], existing != owned.data {
                 throw NotebookRepositoryError.invalidContent("Equal stroke digests must have identical bytes.")
             }
-            dataByDigest[digest] = stroke.data
+            dataByDigest[digest] = owned.data
             references.append(Format.Reference(id: stroke.id, digest: digest))
         }
         return (references, dataByDigest)
+    }
+
+    private func ownedAsset(_ stroke: NotebookStroke) -> NotebookStroke {
+        guard stroke.cachedDigest == nil else { return stroke }
+        let data = stroke.data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return Data() }
+            return Data(bytes: base, count: bytes.count)
+        }
+        metrics.record(\.assetCopiedBytes, data.count)
+        return NotebookStroke(id: stroke.id, data: data, validatedDigest: metrics.assetDigest(data))
     }
 
     private func validateContent(_ content: NotebookContent) throws {
@@ -635,6 +663,7 @@ public actor NotebookRepository {
         var identifiers = Set<UUID>()
         var totalBytes = 0
         for stroke in content.strokes {
+            metrics.record(\.inputReferenceVisits)
             guard identifiers.insert(stroke.id).inserted else {
                 throw NotebookRepositoryError.invalidContent("Stroke identifiers must be unique.")
             }
