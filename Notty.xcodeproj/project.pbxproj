@@ -4,6 +4,10 @@
     classes = {};
     objectVersion = 60;
     objects = {
+        D00000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NottyTests/NativeArchiveReuseTests.swift; sourceTree = SOURCE_ROOT; };
+        D00000000000000000000014 = {isa = PBXBuildFile; fileRef = D00000000000000000000013; };
+        D00000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NottyTests/NativeArchiveFixtures.swift; sourceTree = SOURCE_ROOT; };
+        D00000000000000000000016 = {isa = PBXBuildFile; fileRef = D00000000000000000000015; };
         D00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Notty/Features/Notebook/NotebookRecoveryCodec.swift; sourceTree = SOURCE_ROOT; };
         D00000000000000000000002 = {isa = PBXBuildFile; fileRef = D00000000000000000000001; };
         D00000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Notty/Features/Notebook/NotebookRecoveryView.swift; sourceTree = SOURCE_ROOT; };
@@ -22,9 +26,9 @@
         D00000000000000000000010 = {isa = PBXBuildFile; fileRef = D0000000000000000000000F; };
         D00000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NottyTests/NotebookTestFixtures.swift; sourceTree = SOURCE_ROOT; };
         D00000000000000000000012 = {isa = PBXBuildFile; fileRef = D00000000000000000000011; };
-        C00000000000000000000001 = {isa = PBXGroup; children = (D00000000000000000000009, D0000000000000000000000B, D0000000000000000000000D, D0000000000000000000000F, D00000000000000000000011); name = NottyTests; sourceTree = "<group>"; };
+        C00000000000000000000001 = {isa = PBXGroup; children = (D00000000000000000000009, D0000000000000000000000B, D0000000000000000000000D, D0000000000000000000000F, D00000000000000000000011, D00000000000000000000013, D00000000000000000000015); name = NottyTests; sourceTree = "<group>"; };
         C00000000000000000000005 = {isa = PBXNativeTarget; buildConfigurationList = C00000000000000000000015; buildPhases = (C00000000000000000000006, C00000000000000000000007, C00000000000000000000008); buildRules = (); dependencies = (C00000000000000000000021); name = NottyTests; packageProductDependencies = (C0000000000000000000001F); productName = NottyTests; productReference = C00000000000000000000064; productType = "com.apple.product-type.bundle.unit-test"; };
-        C00000000000000000000006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (D0000000000000000000000A, D0000000000000000000000C, D0000000000000000000000E, D00000000000000000000010, D00000000000000000000012); runOnlyForDeploymentPostprocessing = 0; };
+        C00000000000000000000006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (D0000000000000000000000A, D0000000000000000000000C, D0000000000000000000000E, D00000000000000000000010, D00000000000000000000012, D00000000000000000000014, D00000000000000000000016); runOnlyForDeploymentPostprocessing = 0; };
         C00000000000000000000007 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (C00000000000000000000065); runOnlyForDeploymentPostprocessing = 0; };
         C00000000000000000000008 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
         C00000000000000000000015 = {isa = XCConfigurationList; buildConfigurations = (C00000000000000000000018, C00000000000000000000019); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
