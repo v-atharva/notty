@@ -321,7 +321,20 @@ final class NotebookBackgroundAuditTests: XCTestCase {
                 _ = try? await audit.value
                 throw AuditTestFailure.timeout
             }
-            let pausedWork = await repository.storageMetrics()
+            let sampled = AuditSignal(expectation(description: "Actor metrics available during utility audit"))
+            let sampling = Task {
+                defer { sampled.mark() }
+                return await repository.storageMetrics()
+            }
+            let sampleReady = await XCTWaiter.fulfillment(of: [sampled.expectation], timeout: 5)
+            guard sampleReady == .completed else {
+                audit.cancel()
+                gate.release()
+                _ = await sampling.result
+                _ = try? await audit.value
+                throw AuditTestFailure.timeout
+            }
+            let pausedWork = await sampling.value
             let pausedProgress = gate.snapshot()
             audit.cancel()
             gate.release()
@@ -662,6 +675,102 @@ final class NotebookBackgroundAuditTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: headURL), invalidHead)
     }
 
+
+    func testStructurallyValidUnselectedMigrationAnchorIsDeferredToFullAudit() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try Fixtures.writeLegacy(root: root)
+        let repository = try NotebookRepository(rootURL: root)
+        let original = try XCTUnwrap(fixture.states.last)
+        _ = try await repository.migrateHistory(
+            id: fixture.notebookID, expectedRevisionID: original.revisionID
+        )
+        let latest = try await repository.save(
+            id: fixture.notebookID,
+            content: NotebookContent(
+                title: "After migration", pageCount: 3, strokes: [], editStamp: Fixtures.stamp(100)
+            ),
+            expectedRevisionID: original.revisionID
+        )
+        let originalPin = try await repository.captureHistoryPin(
+            id: fixture.notebookID, expectedRevisionID: latest.revisionID
+        )
+        let layout = try Fixtures.layout(root: root, id: fixture.notebookID)
+        let headURL = layout.notebookDirectory.appendingPathComponent("HEAD.json")
+        let receiptURL = layout.generationDirectory.appendingPathComponent("migration.json")
+        let legacyHeadURL = layout.generationDirectory.appendingPathComponent("legacy-head.json")
+        let headBytes = try Data(contentsOf: headURL)
+        let receiptBytes = try Data(contentsOf: receiptURL)
+        let legacyHeadBytes = try Data(contentsOf: legacyHeadURL)
+        defer {
+            try? headBytes.write(to: headURL)
+            try? receiptBytes.write(to: receiptURL)
+            try? legacyHeadBytes.write(to: legacyHeadURL)
+        }
+        let orphanID = UUID()
+        var record = try Fixtures.object(at: receiptURL)
+        var anchor = try XCTUnwrap(record["anchor"] as? [String: Any])
+        let anchorID = try XCTUnwrap((anchor["revisionID"] as? String).flatMap(UUID.init(uuidString:)))
+        var orphan = try Fixtures.object(at: layout.eventURL(anchorID))
+        orphan["revisionID"] = orphanID.uuidString
+        if let checkpointDigest = orphan["checkpointDigest"] as? String {
+            var checkpoint = try Fixtures.object(at: layout.checkpointURL(checkpointDigest))
+            checkpoint["revisionID"] = orphanID.uuidString
+            let bytes = try JSONSerialization.data(withJSONObject: checkpoint, options: [.sortedKeys])
+            let digest = NotebookDigest.sha256(bytes)
+            try bytes.write(to: layout.checkpointURL(digest))
+            orphan["checkpointDigest"] = digest
+        }
+        let orphanBytes = try JSONSerialization.data(withJSONObject: orphan, options: [.sortedKeys])
+        try orphanBytes.write(to: layout.eventURL(orphanID))
+        anchor["revisionID"] = orphanID.uuidString
+        anchor["revisionDigest"] = NotebookDigest.sha256(orphanBytes)
+        record["anchor"] = anchor
+        var receipt = try XCTUnwrap(record["receipt"] as? [String: Any])
+        receipt["revisionID"] = orphanID.uuidString
+        record["receipt"] = receipt
+        var legacyHead = try Fixtures.object(at: legacyHeadURL)
+        legacyHead["revisionID"] = orphanID.uuidString
+        let revisedLegacyHead = try JSONSerialization.data(withJSONObject: legacyHead, options: [.sortedKeys])
+        try revisedLegacyHead.write(to: legacyHeadURL)
+        record["legacyHeadDigest"] = NotebookDigest.sha256(revisedLegacyHead)
+        let revisedReceipt = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+        try revisedReceipt.write(to: receiptURL)
+        var head = try Fixtures.object(at: headURL)
+        head["migrationReceiptDigest"] = NotebookDigest.sha256(revisedReceipt)
+        let revisedHead = try JSONSerialization.data(withJSONObject: head, options: [.sortedKeys])
+        try revisedHead.write(to: headURL)
+        let reader = try NotebookRepository(rootURL: root)
+        let opening = try await reader.open(id: fixture.notebookID)
+        let opened = try XCTUnwrap(opening)
+        Fixtures.assertSame(opened.notebook, latest)
+        XCTAssertEqual(opened.historyPin.sequence, fixture.states.count + 1)
+        XCTAssertNotEqual(opened.historyPin.revisionID, orphanID)
+        let before = await reader.storageMetrics()
+        let captured = try await reader.captureHistoryPin(
+            id: fixture.notebookID, expectedRevisionID: latest.revisionID
+        )
+        let after = await reader.storageMetrics()
+        XCTAssertEqual(captured, opened.historyPin)
+        XCTAssertLessThanOrEqual(after.metadataReadCalls - before.metadataReadCalls, 5)
+        XCTAssertEqual(after.assetReadCalls - before.assetReadCalls, 0)
+        XCTAssertEqual(after.assetHashBytes - before.assetHashBytes, 0)
+        do {
+            _ = try await reader.auditHistory(pin: captured)
+            XCTFail("Full audit must reject a valid receipt anchor outside selected ancestry.")
+        } catch NotebookRepositoryError.corruptData(_) {}
+        XCTAssertEqual(try Data(contentsOf: headURL), revisedHead)
+        let restored = try NotebookRepository(rootURL: root)
+        try headBytes.write(to: headURL)
+        try receiptBytes.write(to: receiptURL)
+        try legacyHeadBytes.write(to: legacyHeadURL)
+        let restoredPin = try await restored.captureHistoryPin(
+            id: fixture.notebookID, expectedRevisionID: latest.revisionID
+        )
+        XCTAssertEqual(restoredPin.revisionID, originalPin.revisionID)
+        let report = try await restored.auditHistory(pin: restoredPin)
+        XCTAssertEqual(report.revisionCount, fixture.states.count + 1)
+    }
 }
 
 private enum AuditTestFailure: Error {

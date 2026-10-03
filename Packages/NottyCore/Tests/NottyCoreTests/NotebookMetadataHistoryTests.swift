@@ -129,7 +129,46 @@ final class NotebookMetadataHistoryTests: XCTestCase {
         let reader = try NotebookRepository(
             rootURL: root, assetVerificationObserver: { verified.record($0) }
         )
+        let layout = try Fixtures.layout(root: root, id: id)
+        let pageLimit = 50
+        var baselineOffset = expected.count - pageLimit
+        while true {
+            let event = try Fixtures.object(at: layout.eventURL(expected[baselineOffset].revisionID))
+            if event["checkpointDigest"] is String { break }
+            guard baselineOffset > 0 else {
+                XCTFail("The metadata fixture must have a reachable checkpoint baseline.")
+                return
+            }
+            baselineOffset -= 1
+        }
+        let prefixLength = expected.count - baselineOffset
+        XCTAssertLessThan(prefixLength, 100, "Actual byte-funded checkpoints must keep this fixture's first page local.")
         let before = await reader.storageMetrics()
+        let firstPage = try await reader.history(id: id, limit: pageLimit)
+        XCTAssertEqual(firstPage.map(\.revisionID), expected.suffix(pageLimit).reversed().map(\.revisionID))
+        let afterFirst = await reader.storageMetrics()
+        XCTAssertGreaterThan(afterFirst.metadataReadCalls - before.metadataReadCalls, 0)
+        XCTAssertLessThanOrEqual(
+            afterFirst.metadataReadCalls - before.metadataReadCalls, 2 * prefixLength + 4
+        )
+        XCTAssertLessThan(afterFirst.metadataReadCalls - before.metadataReadCalls, expected.count / 2)
+        let repeated = try await reader.history(id: id, limit: pageLimit)
+        XCTAssertEqual(repeated, firstPage)
+        let afterRepeat = await reader.storageMetrics()
+        XCTAssertEqual(afterRepeat.metadataReadCalls - afterFirst.metadataReadCalls, 1)
+        XCTAssertEqual(afterRepeat.metadataReadBytes - afterFirst.metadataReadBytes, headBytes.count)
+        do {
+            _ = try await reader.captureHistoryPin(id: id, expectedRevisionID: UUID())
+            XCTFail("A stale expected revision must invalidate cached verification.")
+        } catch NotebookRepositoryError.revisionConflict {}
+        let beforeRefresh = await reader.storageMetrics()
+        let refreshed = try await reader.history(id: id, limit: pageLimit)
+        XCTAssertEqual(refreshed, firstPage)
+        let afterRefresh = await reader.storageMetrics()
+        XCTAssertGreaterThan(afterRefresh.metadataReadCalls - beforeRefresh.metadataReadCalls, 1)
+        XCTAssertLessThanOrEqual(
+            afterRefresh.metadataReadCalls - beforeRefresh.metadataReadCalls, 2 * prefixLength + 4
+        )
         var summaries: [NotebookRevisionSummary] = []
         var cursor: UUID?
         while true {
