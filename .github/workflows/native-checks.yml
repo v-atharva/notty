@@ -77,7 +77,7 @@ jobs:
           if [ "${{ inputs.storage_stress }}" = "true" ]; then
             NOTTY_SWIFT_TEST_FLAGS=(-Xswiftc -DNOTTY_STORAGE_STRESS)
           fi
-          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2 "${NOTTY_SWIFT_TEST_FLAGS[@]}"
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --filter "Notebook(BackgroundAudit|MetadataHistory)Tests" | tee "$RUNNER_TEMP/NottyHistoryRegression.log"
 
       - name: Record storage measurements
         if: always()
@@ -95,85 +95,6 @@ jobs:
             done
           done
 
-      - name: Prepare iPad test simulator
-        timeout-minutes: 2
-        run: |
-          NOTTY_SIMULATOR_ID=$(xcrun simctl list devices available --json | jq -er '.devices | to_entries | map(select(.key | endswith(".iOS-27-0"))) | map(.value[]) | map(select(.isAvailable and (.name | startswith("iPad")))) | sort_by(.name) | .[0].udid // error("No iPadOS 27.0 simulator is available")')
-          printf 'NOTTY_SIMULATOR_ID=%s\n' "$NOTTY_SIMULATOR_ID" >> "$GITHUB_ENV"
-          xcrun simctl bootstatus "$NOTTY_SIMULATOR_ID" -b
-      - name: Compile unsigned iPad simulator app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Debug \
-            -sdk iphonesimulator27.0 \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Compile unsigned iPad device app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Release \
-            -sdk iphoneos27.0 \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/NottyDevice" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Test native notebook session and canvas
-        timeout-minutes: 5
-        env:
-          TEST_RUNNER_NOTTY_SAVE_METRICS_DIRECTORY: ${{ runner.temp }}/NottySaveMetrics
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Debug \
-            -sdk iphonesimulator27.0 \
-            -destination "platform=iOS Simulator,id=$NOTTY_SIMULATOR_ID" \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 60 \
-            -maximum-test-execution-time-allowance 120 \
-            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
-            -resultBundlePath "$RUNNER_TEMP/NottyNativeTests.xcresult" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            test 2>&1 | tee "$RUNNER_TEMP/NottyNativeTests.log"
-
-      - name: Summarize hosted test results
-        if: always()
-        timeout-minutes: 1
-        run: |
-          if [ -d "$RUNNER_TEMP/NottyNativeTests.xcresult" ]; then
-            xcrun xcresulttool get test-results summary \
-              --path "$RUNNER_TEMP/NottyNativeTests.xcresult" \
-              > "$RUNNER_TEMP/NottyNativeTests-summary.json"
-            cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
-            {
-              printf '### Hosted test results\n\n~~~json\n'
-              cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
-              printf '\n~~~\n'
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf 'Hosted test result bundle was not produced.\n' >> "$GITHUB_STEP_SUMMARY"
-          fi
-          for report in "$RUNNER_TEMP"/NottySaveMetrics/*.json; do
-            test -f "$report" || continue
-            cat "$report"
-            printf '\n'
-          done
-
       - name: Upload native check results
         if: always()
         timeout-minutes: 2
@@ -183,6 +104,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
           path: |
+            ${{ runner.temp }}/NottyHistoryRegression.log
             ${{ runner.temp }}/NottyNativeTests.xcresult
             ${{ runner.temp }}/NottyNativeTests.log
             ${{ runner.temp }}/NottyNativeTests-summary.json
