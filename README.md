@@ -34,7 +34,7 @@ Library organization, recording, PDF annotation, bookmarks, and export remain su
 
 ## Cloud checks
 
-The suite contains 80 core tests and 24 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
+The suite contains 84 core tests, including 16 native archive cases, and 24 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
 
 The standard GitHub image is currently a preview; the workflow verifies actual host, toolchain and SDK versions and selects an available iPadOS 27.0 tablet simulator. A single job has a fifteen-minute limit and cancels superseded checks on the same pull request.
 

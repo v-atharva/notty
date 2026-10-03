@@ -270,4 +270,113 @@ final class InkCodecTests: XCTestCase {
         XCTAssertEqual(unchanged, assets)
     }
 
+    func testColorAndInkTypeChangesInvalidateCachedArchive() async throws {
+        let codec = InkCodec()
+        var native = stroke()
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+        #if canImport(UIKit)
+        let red = UIColor.red
+        #else
+        let red = NSColor.red
+        #endif
+        native.ink = PKInk(.pen, color: red)
+        let recolored = try await codec.encode(PKDrawing(strokes: [native]))
+        native.ink = PKInk(.marker, color: red)
+        let retyped = try await codec.encode(PKDrawing(strokes: [native]))
+
+        let serialized = await codec.serializedStrokeCount
+        XCTAssertEqual(serialized, 3)
+        XCTAssertNotEqual(recolored[0].data, first[0].data)
+        XCTAssertNotEqual(retyped[0].data, recolored[0].data)
+        XCTAssertEqual(retyped[0].id, native.id)
+        let reopened = try await InkCodec().decode(retyped)
+        XCTAssertEqual(reopened.strokes[0].ink.inkType, .marker)
+        XCTAssertEqual(reopened.strokes[0].id, native.id)
+    }
+
+    func testChangedPointValuesWithUnchangedCountAndDateInvalidateCachedArchive() async throws {
+        let codec = InkCodec()
+        var native = stroke()
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+        let originalDate = native.path.creationDate
+        let shifted = native.path.map { point in
+            PKStrokePoint(
+                location: CGPoint(x: point.location.x + 7, y: point.location.y),
+                timeOffset: point.timeOffset, size: point.size, opacity: point.opacity,
+                force: point.force, azimuth: point.azimuth, altitude: point.altitude
+            )
+        }
+        native.path = PKStrokePath(controlPoints: shifted, creationDate: originalDate)
+        let changed = try await codec.encode(PKDrawing(strokes: [native]))
+
+        let serialized = await codec.serializedStrokeCount
+        XCTAssertEqual(serialized, 2)
+        XCTAssertNotEqual(changed[0].data, first[0].data)
+        XCTAssertEqual(changed[0].id, native.id)
+        let reopened = try await InkCodec().decode(changed)
+        XCTAssertEqual(reopened.strokes[0].path.count, shifted.count)
+        XCTAssertEqual(reopened.strokes[0].path.creationDate, originalDate)
+        for (actual, expected) in zip(reopened.strokes[0].path, shifted) {
+            XCTAssertEqual(actual.location.x, expected.location.x, accuracy: 0.001)
+            XCTAssertEqual(actual.location.y, expected.location.y, accuracy: 0.001)
+        }
+    }
+
+
+    func testInPlaceMaskMutationNeverReusesStaleArchive() async throws {
+        let codec = InkCodec()
+        var native = stroke()
+        #if canImport(UIKit)
+        native.mask = UIBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #else
+        native.mask = NSBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
+        #endif
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+        let liveMask = try XCTUnwrap(native.mask)
+        let originalBounds = liveMask.bounds
+        #if canImport(UIKit)
+        liveMask.apply(CGAffineTransform(translationX: 25, y: 0))
+        #else
+        liveMask.transform(using: AffineTransform(translationByX: 25, byY: 0))
+        #endif
+        let expected = try XCTUnwrap(native.mask?.bounds)
+        XCTAssertNotEqual(expected, originalBounds)
+        let changed = try await codec.encode(PKDrawing(strokes: [native]))
+        let reopened = try await InkCodec().decode(changed)
+
+        let serialized = await codec.serializedStrokeCount
+        XCTAssertEqual(serialized, 2)
+        XCTAssertNotEqual(changed[0].data, first[0].data)
+        XCTAssertEqual(reopened.strokes[0].mask?.bounds, expected)
+        XCTAssertEqual(reopened.strokes[0].id, native.id)
+    }
+
+    func testPointWidthChangeInvalidatesCachedArchive() async throws {
+        let codec = InkCodec()
+        var native = stroke()
+        let first = try await codec.encode(PKDrawing(strokes: [native]))
+        let originalDate = native.path.creationDate
+        let widened = native.path.map { point in
+            PKStrokePoint(
+                location: point.location, timeOffset: point.timeOffset,
+                size: CGSize(width: 9, height: 9), opacity: point.opacity,
+                force: point.force, azimuth: point.azimuth, altitude: point.altitude
+            )
+        }
+        native.path = PKStrokePath(controlPoints: widened, creationDate: originalDate)
+        let changed = try await codec.encode(PKDrawing(strokes: [native]))
+
+        let serialized = await codec.serializedStrokeCount
+        XCTAssertEqual(serialized, 2)
+        XCTAssertNotEqual(changed[0].data, first[0].data)
+        XCTAssertEqual(changed[0].id, native.id)
+        let reopened = try await InkCodec().decode(changed)
+        XCTAssertEqual(reopened.strokes[0].path.count, widened.count)
+        XCTAssertEqual(reopened.strokes[0].path.creationDate, originalDate)
+        for (actual, expected) in zip(reopened.strokes[0].path, widened) {
+            XCTAssertEqual(actual.location, expected.location)
+            XCTAssertEqual(actual.size, expected.size)
+        }
+    }
+
 }
