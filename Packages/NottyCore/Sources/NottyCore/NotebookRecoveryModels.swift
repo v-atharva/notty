@@ -66,4 +66,5 @@ public enum NotebookRecoveryWriteStage: Sendable, Equatable, CaseIterable {
     case manifestSynchronized
     case receiptSynchronized
     case beforePublication
+    case identitiesSynchronized
 }
