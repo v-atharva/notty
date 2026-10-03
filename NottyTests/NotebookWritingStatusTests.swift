@@ -35,6 +35,30 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertEqual(session.inputGate, .open)
     }
 
+    func testBlockedRetryRetainsRecoveryFeedbackAndPendingEdits() async throws {
+        let (session, probe, root) = try await makeSession(failure: .contentLimit)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        session.recordCompletedEdit(
+            PKDrawing(strokes: [NotebookTestFixtures.stroke()]), ownerID: seed.ownerID
+        )
+        await session.waitUntilSettled()
+        await probe.setPreserveFailure(.storageFull)
+        await session.saveRecoveryCopy()
+        let pending = session.pendingEdits
+        let message = session.recoveryMessage
+        let failure = session.recoveryFailure
+        let beforeCalls = await probe.saveCalls
+        session.retrySave()
+        await session.waitUntilSettled()
+        XCTAssertEqual(session.recoveryMessage, message)
+        XCTAssertEqual(session.recoveryFailure, failure)
+        XCTAssertEqual(session.pendingEdits, pending)
+        let afterCalls = await probe.saveCalls
+        XCTAssertEqual(afterCalls, beforeCalls)
+        XCTAssertEqual(session.inputGate, .failed)
+    }
+
     func testRetryClearsSuccessfulPreservationFeedback() async throws {
         let (session, probe, root) = try await makeSession(failure: .storageFull)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -76,144 +100,175 @@ final class NotebookWritingStatusTests: XCTestCase {
         controller.canvasView.setZoomScale(0.75, animated: false)
         controller.canvasView.setContentOffset(CGPoint(x: 0, y: 300), animated: false)
         try await settleLayout(hosting)
-        let originalBounds = controller.canvasView.bounds.size
-        let originalOffset = controller.canvasView.contentOffset
-        let originalZoom = controller.canvasView.zoomScale
-        let controllerID = ObjectIdentifier(controller)
+        let original = WritingViewport(controller)
         let generation = session.canvasGeneration
+        let screenBefore = session.renderDiagnostics.screenBodyCount
+        let canvasBefore = session.renderDiagnostics.canvasUpdateCount
         let owner = try XCTUnwrap(session.canvasOwnerID)
+        await probe.setSuspendSave()
+        session.recordObservation(
+            NotebookCanvasObservation(
+                generation: 1, drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke()]),
+                capturedAt: Date(timeIntervalSince1970: 100), uptime: 10
+            ), ownerID: owner
+        )
+        try await waitForSuspendedSave(probe, after: 0, session: session)
+        do {
+            try await waitForUI { session.statusModel.displayedStatus == .saving }
+            try await settleLayout(hosting)
+            original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
+        } catch {
+            await probe.releaseSave()
+            await session.waitUntilSettled()
+            throw error
+        }
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        try await waitForUI { session.statusModel.state.status == session.saveState }
+        try await settleLayout(hosting)
+        original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
+        XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
+        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
         await probe.setSaveFailure(.storageFull)
         session.recordObservation(
             NotebookCanvasObservation(
-                generation: 1,
-                drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke()]),
-                capturedAt: Date(timeIntervalSince1970: 100), uptime: 10
+                generation: 2, drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke(x: 120)]),
+                capturedAt: Date(timeIntervalSince1970: 101), uptime: 11
             ), ownerID: owner
         )
         await session.waitUntilSettled()
         try await waitForUI { session.statusModel.state.status == .failed(.storageFull) }
         try await settleLayout(hosting)
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(notebookController(in: hosting))), controllerID)
-        XCTAssertEqual(session.canvasGeneration, generation)
-        XCTAssertEqual(controller.canvasView.bounds.size.width, originalBounds.width, accuracy: 0.5)
-        XCTAssertEqual(controller.canvasView.bounds.size.height, originalBounds.height, accuracy: 0.5)
-        XCTAssertEqual(controller.canvasView.contentOffset.x, originalOffset.x, accuracy: 0.5)
-        XCTAssertEqual(controller.canvasView.contentOffset.y, originalOffset.y, accuracy: 0.5)
-        XCTAssertEqual(controller.canvasView.zoomScale, originalZoom, accuracy: 0.001)
+        original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
+        XCTAssertEqual(notebookController(in: hosting).map(ObjectIdentifier.init), original.controllerID)
     }
-
 
     func testSavingCaptionWaitsForDelayAndCancelledEpisodeCannotReturn() async throws {
         let clock = WritingFeedbackClock()
-        let model = NotebookSavePresentationModel(delay: { await clock.wait($0) })
-        let saved = NotebookSaveStatus.saved(Date(timeIntervalSince1970: 100))
-        model.update(presentation(saved))
-        model.update(presentation(.saving))
-        let first = try await waitForRequest(clock, duration: .milliseconds(400))
-        XCTAssertEqual(model.displayedStatus, saved)
-        model.update(presentation(.saved(Date(timeIntervalSince1970: 101))))
-        await clock.release(first)
-        try await settleTasks()
-        XCTAssertEqual(model.displayedStatus, .saved(Date(timeIntervalSince1970: 101)))
-        model.update(presentation(.saving))
-        let second = try await waitForRequest(clock, duration: .milliseconds(400))
-        XCTAssertNotEqual(first, second)
-        XCTAssertNotEqual(model.displayedStatus, .saving)
-        await clock.release(second)
-        try await waitForUI { model.displayedStatus == .saving }
-        model.update(presentation(.failed(.storageFull)))
-        XCTAssertEqual(model.displayedStatus, .failed(.storageFull))
-        model.reset()
-        XCTAssertEqual(model.displayedStatus, .idle)
-        await clock.releaseAll()
+        do {
+            let model = NotebookSavePresentationModel(delay: { await clock.wait($0) })
+            let saved = NotebookSaveStatus.saved(Date(timeIntervalSince1970: 100))
+            model.update(presentation(saved))
+            model.update(presentation(.saving))
+            let first = try await waitForRequest(clock, duration: .milliseconds(400))
+            XCTAssertEqual(model.displayedStatus, saved)
+            model.update(presentation(.saved(Date(timeIntervalSince1970: 101))))
+            await clock.release(first)
+            try await settleTasks()
+            XCTAssertEqual(model.displayedStatus, .saved(Date(timeIntervalSince1970: 101)))
+            model.update(presentation(.saving))
+            let second = try await waitForRequest(clock, duration: .milliseconds(400))
+            XCTAssertNotEqual(first, second)
+            XCTAssertNotEqual(model.displayedStatus, .saving)
+            await clock.release(second)
+            try await waitForUI { model.displayedStatus == .saving }
+            model.update(presentation(.failed(.storageFull)))
+            XCTAssertEqual(model.displayedStatus, .failed(.storageFull))
+            model.reset()
+            XCTAssertEqual(model.displayedStatus, .idle)
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
+        }
     }
 
     func testSuccessExpiryCannotClearNewerFailureAndDoesNotRebuildCanvas() async throws {
         let clock = WritingFeedbackClock()
-        let (session, probe, root) = try await makeSession(
-            failure: .storageFull, feedbackDelay: { await clock.wait($0) }
-        )
-        defer { try? FileManager.default.removeItem(at: root) }
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-        let window = makeWindow(hosting)
-        defer {
-            notebookController(in: hosting)?.tearDown()
-            window.isHidden = true
-            window.rootViewController = nil
+        do {
+            let (session, probe, root) = try await makeSession(
+                failure: .storageFull, feedbackDelay: { await clock.wait($0) }
+            )
+            defer { try? FileManager.default.removeItem(at: root) }
+            let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+            let window = makeWindow(hosting)
+            defer {
+                notebookController(in: hosting)?.tearDown()
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            try await waitForUI { self.notebookController(in: hosting) != nil }
+            let controller = try XCTUnwrap(notebookController(in: hosting))
+            controller.canvasView.delegate = nil
+            let owner = try XCTUnwrap(session.canvasOwnerID)
+            let stroke = NotebookTestFixtures.stroke()
+            session.recordObservation(
+                NotebookCanvasObservation(generation: 1, drawing: PKDrawing(strokes: [stroke]),
+                    capturedAt: Date(timeIntervalSince1970: 100), uptime: 10), ownerID: owner
+            )
+            await session.waitUntilSettled()
+            await session.saveRecoveryCopy()
+            let oldExpiry = try await waitForRequest(clock, duration: .seconds(5))
+            session.recordObservation(
+                NotebookCanvasObservation(
+                    generation: 2, drawing: PKDrawing(strokes: [stroke, NotebookTestFixtures.stroke(x: 120)]),
+                    capturedAt: Date(timeIntervalSince1970: 101), uptime: 11
+                ), ownerID: owner
+            )
+            await probe.setPreserveFailure(.storageFull)
+            await session.saveRecoveryCopy()
+            let failureMessage = session.recoveryMessage
+            await clock.release(oldExpiry)
+            try await settleTasks()
+            XCTAssertEqual(session.recoveryFailure, .storageFull)
+            XCTAssertEqual(session.recoveryMessage, failureMessage)
+            await probe.setPreserveFailure(nil)
+            await session.saveRecoveryCopy()
+            let newExpiry = try await waitForRequest(clock, duration: .seconds(5))
+            try await settleLayout(hosting)
+            let screenBefore = session.renderDiagnostics.screenBodyCount
+            let canvasBefore = session.renderDiagnostics.canvasUpdateCount
+            let controllerID = ObjectIdentifier(controller)
+            await clock.release(newExpiry)
+            try await waitForUI { session.recoveryMessage == nil }
+            try await settleLayout(hosting)
+            XCTAssertNil(session.recoveryFailure)
+            XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
+            XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
+            XCTAssertEqual(notebookController(in: hosting).map(ObjectIdentifier.init), controllerID)
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
         }
-        try await waitForUI { self.notebookController(in: hosting) != nil }
-        let controller = try XCTUnwrap(notebookController(in: hosting))
-        controller.canvasView.delegate = nil
-        let owner = try XCTUnwrap(session.canvasOwnerID)
-        let stroke = NotebookTestFixtures.stroke()
-        session.recordObservation(
-            NotebookCanvasObservation(generation: 1, drawing: PKDrawing(strokes: [stroke]),
-                capturedAt: Date(timeIntervalSince1970: 100), uptime: 10), ownerID: owner
-        )
-        await session.waitUntilSettled()
-        await session.saveRecoveryCopy()
-        let oldExpiry = try await waitForRequest(clock, duration: .seconds(5))
-        session.recordObservation(
-            NotebookCanvasObservation(
-                generation: 2, drawing: PKDrawing(strokes: [stroke, NotebookTestFixtures.stroke(x: 120)]),
-                capturedAt: Date(timeIntervalSince1970: 101), uptime: 11
-            ), ownerID: owner
-        )
-        await probe.setPreserveFailure(.storageFull)
-        await session.saveRecoveryCopy()
-        let failureMessage = session.recoveryMessage
-        await clock.release(oldExpiry)
-        try await settleTasks()
-        XCTAssertEqual(session.recoveryFailure, .storageFull)
-        XCTAssertEqual(session.recoveryMessage, failureMessage)
-        await probe.setPreserveFailure(nil)
-        await session.saveRecoveryCopy()
-        let newExpiry = try await waitForRequest(clock, duration: .seconds(5))
-        try await settleLayout(hosting)
-        let screenBefore = session.renderDiagnostics.screenBodyCount
-        let canvasBefore = session.renderDiagnostics.canvasUpdateCount
-        let controllerID = ObjectIdentifier(controller)
-        await clock.release(newExpiry)
-        try await waitForUI { session.recoveryMessage == nil }
-        try await settleLayout(hosting)
-        XCTAssertNil(session.recoveryFailure)
-        XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
-        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
-        XCTAssertEqual(notebookController(in: hosting).map(ObjectIdentifier.init), controllerID)
-        await clock.releaseAll()
     }
 
     func testReopenInvalidatesPreviousFeedbackExpiryAndClearsFailure() async throws {
         let clock = WritingFeedbackClock()
-        let (session, probe, root) = try await makeSession(
-            failure: .storageFull, feedbackDelay: { await clock.wait($0) }
-        )
-        defer { try? FileManager.default.removeItem(at: root) }
-        let seed = session.makeCanvasSeed()
-        session.recordCompletedEdit(
-            PKDrawing(strokes: [NotebookTestFixtures.stroke()]), ownerID: seed.ownerID
-        )
-        await session.waitUntilSettled()
-        await probe.setPreserveFailure(.storageFull)
-        await session.saveRecoveryCopy()
-        await probe.setPreserveFailure(nil)
-        await session.saveRecoveryCopy()
-        let priorExpiry = try await waitForRequest(clock, duration: .seconds(5))
-        let generation = session.canvasGeneration
-        await session.reopenSavedNotebook()
-        let reopenedExpiry = try await waitForRequest(clock, duration: .seconds(5), excluding: [priorExpiry])
-        XCTAssertNotEqual(session.canvasGeneration, generation)
-        XCTAssertNil(session.recoveryFailure)
-        XCTAssertTrue(session.pendingEdits.isEmpty)
-        let reopenedMessage = session.recoveryMessage
-        XCTAssertNotNil(reopenedMessage)
-        await clock.release(priorExpiry)
-        try await settleTasks()
-        XCTAssertEqual(session.recoveryMessage, reopenedMessage)
-        await clock.release(reopenedExpiry)
-        try await waitForUI { session.recoveryMessage == nil }
-        XCTAssertNil(session.recoveryFailure)
-        await clock.releaseAll()
+        do {
+            let (session, probe, root) = try await makeSession(
+                failure: .storageFull, feedbackDelay: { await clock.wait($0) }
+            )
+            defer { try? FileManager.default.removeItem(at: root) }
+            let seed = session.makeCanvasSeed()
+            session.recordCompletedEdit(
+                PKDrawing(strokes: [NotebookTestFixtures.stroke()]), ownerID: seed.ownerID
+            )
+            await session.waitUntilSettled()
+            await probe.setPreserveFailure(.storageFull)
+            await session.saveRecoveryCopy()
+            await probe.setPreserveFailure(nil)
+            await session.saveRecoveryCopy()
+            let priorExpiry = try await waitForRequest(clock, duration: .seconds(5))
+            let generation = session.canvasGeneration
+            await session.reopenSavedNotebook()
+            let reopenedExpiry = try await waitForRequest(clock, duration: .seconds(5), excluding: [priorExpiry])
+            XCTAssertNotEqual(session.canvasGeneration, generation)
+            XCTAssertNil(session.recoveryFailure)
+            XCTAssertTrue(session.pendingEdits.isEmpty)
+            let reopenedMessage = session.recoveryMessage
+            XCTAssertNotNil(reopenedMessage)
+            await clock.release(priorExpiry)
+            try await settleTasks()
+            XCTAssertEqual(session.recoveryMessage, reopenedMessage)
+            await clock.release(reopenedExpiry)
+            try await waitForUI { session.recoveryMessage == nil }
+            XCTAssertNil(session.recoveryFailure)
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
+        }
     }
 
     func testRecoveryPresentationRechecksNativeActivityBeforeSuppressingPalette() async throws {
@@ -238,6 +293,12 @@ final class NotebookWritingStatusTests: XCTestCase {
         controls.availability = NotebookUndoAvailability(canUndo: true, canRedo: false, isUsingTool: false)
         session.updateUndoAvailability(controls.availability, ownerID: seed.ownerID)
         XCTAssertTrue(session.beginRecoveryCopiesPresentation())
+        XCTAssertFalse(session.canPerformHistoryAction(ownerID: seed.ownerID))
+        XCTAssertFalse(session.reserveHistoryAction(ownerID: seed.ownerID))
+        session.undo()
+        session.redo()
+        XCTAssertEqual(controls.undoCalls, 0)
+        XCTAssertEqual(controls.redoCalls, 0)
         XCTAssertEqual(controls.paletteSuppressions, [false, true])
         session.endRecoveryCopiesPresentation()
         XCTAssertEqual(controls.paletteSuppressions, [false, true, false])
@@ -482,6 +543,233 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertTrue(session.pendingEdits.isEmpty)
     }
 
+
+    func testReopenRejectsActiveNativeToolBeforeAnyRecoveryAwait() async throws {
+        let (session, probe, root) = try await makeSession(failure: .contentLimit)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: controls.controls)
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: nearEndDrawing(),
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        await session.waitUntilSettled()
+        await session.saveRecoveryCopy()
+        XCTAssertTrue(session.canReopenSaved)
+        let pending = session.pendingEdits
+        let generation = session.canvasGeneration
+        let feedback = session.recoveryMessage
+        await probe.setLoadFailure(.corruptData)
+        controls.availability = NotebookUndoAvailability(canUndo: false, canRedo: false, isUsingTool: true)
+        XCTAssertFalse(session.canReopenSaved)
+        await session.reopenSavedNotebook()
+        XCTAssertEqual(session.pendingEdits, pending)
+        XCTAssertEqual(session.canvasGeneration, generation)
+        XCTAssertEqual(session.recoveryMessage, feedback)
+        XCTAssertNil(session.recoveryFailure)
+        XCTAssertFalse(session.isPerformingRecovery)
+        controls.availability = .unavailable
+        session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+        XCTAssertTrue(session.canReopenSaved)
+        await session.reopenSavedNotebook()
+        XCTAssertEqual(session.recoveryFailure, .corruptData)
+        XCTAssertEqual(session.pendingEdits, pending)
+        await probe.setLoadFailure(nil)
+        await session.reopenSavedNotebook()
+        XCTAssertTrue(session.pendingEdits.isEmpty)
+        XCTAssertNotEqual(session.canvasGeneration, generation)
+        XCTAssertNil(session.recoveryFailure)
+    }
+
+    func testManualPageChangeClearsConditionalRequestAndRejectsPriorPageCompletion() async throws {
+        let (session, probe, root) = try await makeSession()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        controls.availability = NotebookUndoAvailability(canUndo: false, canRedo: false, isUsingTool: true)
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: controls.controls)
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: nearEndDrawing(),
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        let drawingEdit = try XCTUnwrap(session.pendingEdits.last)
+        let completion = NotebookToolCompletion(generation: 1, pageCount: 3, nearPaperEnd: true,
+            capturedAt: Date(timeIntervalSince1970: 10), uptime: 10)
+        session.completedTool(completion, ownerID: seed.ownerID)
+        XCTAssertEqual(session.pageCount, 3)
+        session.extendPaper()
+        let manual = try XCTUnwrap(session.pendingEdits.last)
+        XCTAssertNotEqual(manual.id, drawingEdit.id)
+        XCTAssertEqual(session.pageCount, 4)
+        controls.availability = .unavailable
+        session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+        session.completedTool(completion, ownerID: seed.ownerID)
+        await session.waitUntilSettled()
+        XCTAssertEqual(session.pageCount, 4)
+        XCTAssertEqual(controls.appliedPageCounts, [4])
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 2)
+        let storage = await probe.storage(notebookID: session.notebookID)
+        let saved = try await storage.load()
+        XCTAssertEqual(saved?.content.editStamp, manual.stamp)
+        XCTAssertEqual(saved?.content.strokes.map(\.id), drawingEdit.snapshot.drawing.strokes.map(\.id))
+    }
+
+    func testAutomaticExtentAtMaximumRetainsExactDrawingEditWithoutAnotherMetadataEdit() async throws {
+        let id = UUID()
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try await NotebookTestFixtures.stored(id: id)
+        let stored = StoredNotebook(
+            id: id, revisionID: original.revisionID, sequence: original.sequence,
+            content: NotebookContent(title: original.content.title, pageCount: 12, strokes: []),
+            savedAt: original.savedAt
+        )
+        let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
+        await probe.setSuspendSave()
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: controls.controls)
+        var stroke = NotebookTestFixtures.stroke()
+        stroke.transform = CGAffineTransform(
+            translationX: 0, y: CGFloat(NotebookPaperMetrics.geometry.pageHeight) * 11.9
+        )
+        let drawing = PKDrawing(strokes: [stroke])
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: drawing,
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        let accepted = session.pendingEdits
+        session.completedTool(
+            NotebookToolCompletion(generation: 1, pageCount: 12, nearPaperEnd: true,
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        XCTAssertEqual(session.pendingEdits, accepted)
+        XCTAssertEqual(session.pageCount, 12)
+        XCTAssertTrue(controls.appliedPageCounts.isEmpty)
+        try await waitForSuspendedSave(probe, after: 0, session: session)
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 1)
+        let saved = try await storage.load()
+        XCTAssertEqual(saved?.content.editStamp, accepted.last?.stamp)
+        XCTAssertEqual(saved?.content.strokes.map(\.id), drawing.strokes.map(\.id))
+        XCTAssertEqual(saved?.content.pageCount, 12)
+    }
+
+
+    func testInteractionInterruptionCancelsOnlyCurrentOwnersUnacceptedExtent() async throws {
+        let (session, probe, root) = try await makeSession()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        controls.availability = NotebookUndoAvailability(canUndo: false, canRedo: false, isUsingTool: true)
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: controls.controls)
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: nearEndDrawing(),
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        let accepted = try XCTUnwrap(session.pendingEdits.last)
+        session.completedTool(
+            NotebookToolCompletion(generation: 1, pageCount: 3, nearPaperEnd: true,
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        session.cancelCanvasToolCompletion(ownerID: UUID())
+        session.cancelCanvasToolCompletion(ownerID: seed.ownerID)
+        controls.availability = .unavailable
+        session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+        await session.waitUntilSettled()
+        XCTAssertEqual(session.pageCount, 3)
+        XCTAssertTrue(controls.appliedPageCounts.isEmpty)
+        let storage = await probe.storage(notebookID: session.notebookID)
+        let saved = try await storage.load()
+        XCTAssertEqual(saved?.content.editStamp, accepted.stamp)
+        XCTAssertEqual(saved?.content.strokes.map(\.id), accepted.snapshot.drawing.strokes.map(\.id))
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 1)
+    }
+
+
+    func testIntegrityDamageCancelsConditionalExtentWhileAcceptedAndLateEditsStillSave() async throws {
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Library", isDirectory: true)
+        let id = UUID()
+        let repository = try NotebookRepository(rootURL: library)
+        let stored = try await repository.save(
+            id: id, content: NotebookContent(title: "Notebook", pageCount: 3, strokes: []),
+            expectedRevisionID: nil
+        )
+        let opened = try await repository.open(id: id)
+        let pin = try XCTUnwrap(opened).historyPin
+        let probe = try NotebookStorageProbe(
+            stored: stored, recoveryRoot: root.appendingPathComponent("Recovery", isDirectory: true)
+        )
+        await probe.setSuspendSave()
+        let base = await probe.storage(notebookID: id)
+        let gate = WritingAuditGate()
+        let storage = NotebookStorage(
+            load: base.load, save: base.save, preserve: base.preserve,
+            listRecovery: base.listRecovery, loadRecovery: base.loadRecovery,
+            openForEditing: { NotebookOpening(notebook: stored, historyPin: pin) },
+            auditHistory: { _ in
+                await gate.wait()
+                return .damaged(.corruptData)
+            }, saveBatch: base.saveBatch
+        )
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let seed = session.makeCanvasSeed()
+        let controls = WritingCanvasControlsProbe()
+        controls.availability = NotebookUndoAvailability(canUndo: false, canRedo: false, isUsingTool: true)
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: controls.controls)
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: nearEndDrawing(),
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        session.completedTool(
+            NotebookToolCompletion(generation: 1, pageCount: 3, nearPaperEnd: true,
+                capturedAt: Date(timeIntervalSince1970: 10), uptime: 10), ownerID: seed.ownerID
+        )
+        let first = session.pendingEdits
+        do {
+            try await waitForSuspendedSave(probe, after: 0, session: session)
+            await gate.release()
+            try await waitForUI { session.inputGate == .readOnly }
+            let later = nearEndDrawing(x: 120)
+            session.recordObservation(
+                NotebookCanvasObservation(generation: 2, drawing: later,
+                    capturedAt: Date(timeIntervalSince1970: 11), uptime: 11), ownerID: seed.ownerID
+            )
+            let accepted = session.pendingEdits
+            XCTAssertEqual(accepted.prefix(1).map(\.id), first.map(\.id))
+            controls.availability = .unavailable
+            session.updateUndoAvailability(.unavailable, ownerID: seed.ownerID)
+            await probe.releaseSave()
+            await session.waitUntilSettled()
+            XCTAssertEqual(session.pageCount, 3)
+            XCTAssertTrue(controls.appliedPageCounts.isEmpty)
+            XCTAssertEqual(session.integrityModel.state, .damaged(.corruptData))
+            XCTAssertEqual(session.inputGate, .readOnly)
+            XCTAssertTrue(session.pendingEdits.isEmpty)
+            let saved = try await base.load()
+            XCTAssertEqual(saved?.content.editStamp, accepted.last?.stamp)
+            XCTAssertEqual(saved?.content.strokes.map(\.id), later.strokes.map(\.id))
+            let calls = await probe.saveCalls
+            XCTAssertEqual(calls, 2)
+        } catch {
+            await gate.release()
+            await probe.releaseSave()
+            await session.waitUntilSettled()
+            throw error
+        }
+    }
+
     private func presentation(_ status: NotebookSaveStatus) -> NotebookSavePresentation {
         NotebookSavePresentation(
             status: status, inputPaused: false, performingRecovery: false,
@@ -632,5 +920,50 @@ private actor WritingFeedbackClock {
         let requests = Array(pending.values)
         pending.removeAll()
         requests.forEach { $0.continuation.resume() }
+    }
+}
+
+@MainActor
+private struct WritingViewport {
+    let controllerID: ObjectIdentifier
+    let size: CGSize
+    let offset: CGPoint
+    let zoom: CGFloat
+
+    init(_ controller: NotebookViewController) {
+        controllerID = ObjectIdentifier(controller)
+        size = controller.canvasView.bounds.size
+        offset = controller.canvasView.contentOffset
+        zoom = controller.canvasView.zoomScale
+    }
+
+    func assertSame(
+        _ controller: NotebookViewController, generation: UUID, expectedGeneration: UUID,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(ObjectIdentifier(controller), controllerID, file: file, line: line)
+        XCTAssertEqual(generation, expectedGeneration, file: file, line: line)
+        XCTAssertEqual(controller.canvasView.bounds.width, size.width, accuracy: 0.5, file: file, line: line)
+        XCTAssertEqual(controller.canvasView.bounds.height, size.height, accuracy: 0.5, file: file, line: line)
+        XCTAssertEqual(controller.canvasView.contentOffset.x, offset.x, accuracy: 0.5, file: file, line: line)
+        XCTAssertEqual(controller.canvasView.contentOffset.y, offset.y, accuracy: 0.5, file: file, line: line)
+        XCTAssertEqual(controller.canvasView.zoomScale, zoom, accuracy: 0.001, file: file, line: line)
+    }
+}
+
+private actor WritingAuditGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
     }
 }

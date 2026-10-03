@@ -121,7 +121,8 @@ final class NotebookSession: ObservableObject {
             && !pendingEdits.isEmpty && !isPerformingRecovery
     }
     var canReopenSaved: Bool {
-        guard !isPerformingRecovery, let preservedState else { return false }
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard !isPerformingRecovery, !availability.isUsingTool, let preservedState else { return false }
         return matches(preservedState.coverage)
     }
 
@@ -264,13 +265,13 @@ final class NotebookSession: ObservableObject {
     }
 
     func canPerformHistoryAction(ownerID: UUID) -> Bool {
-        guard activeCanvasOwner == ownerID,
+        guard activeCanvasOwner == ownerID, !paletteSuppressed,
               inputGate == .open || inputGate == .capacity else { return false }
         let availability = canvasControls?.currentAvailability() ?? undoAvailability
         return !availability.isUsingTool
     }
 
-    // The native controller reserves its capacity command before requesting authorization.
+    // The native controller owns the capacity reservation; the session checks admission.
     func reserveHistoryAction(ownerID: UUID) -> Bool {
         canPerformHistoryAction(ownerID: ownerID)
     }
@@ -291,12 +292,19 @@ final class NotebookSession: ObservableObject {
         guard !availability.isUsingTool else { return false }
         paletteSuppressed = true
         canvasControls?.setPaletteSuppressed(true)
+        refreshPresentation()
         return true
     }
 
     func endRecoveryCopiesPresentation() {
         paletteSuppressed = false
         canvasControls?.setPaletteSuppressed(false)
+        refreshPresentation()
+    }
+
+    func cancelCanvasToolCompletion(ownerID: UUID) {
+        guard activeCanvasOwner == ownerID else { return }
+        extentIntent = nil
     }
 
     func completedTool(_ completion: NotebookToolCompletion, ownerID: UUID) {
@@ -392,9 +400,10 @@ final class NotebookSession: ObservableObject {
     }
 
     func retrySave() {
-        guard !isPerformingRecovery else { return }
+        guard !isPerformingRecovery, let coordinator,
+              coordinator.failure?.canRetry == true, coordinator.pendingCount > 0 else { return }
         clearRecoveryFeedback()
-        coordinator?.retry()
+        coordinator.retry()
     }
 
     func flush() {
@@ -931,6 +940,21 @@ struct NotebookSavePresentation: Equatable {
     let recoveryMessage: String?
     let recoveryFailure: NotebookSaveFailure?
     let isReady: Bool
+
+    init(
+        status: NotebookSaveStatus, inputPaused: Bool, performingRecovery: Bool,
+        canPreserveRecovery: Bool, canReopenSaved: Bool,
+        recoveryMessage: String?, recoveryFailure: NotebookSaveFailure?, isReady: Bool = true
+    ) {
+        self.status = status
+        self.inputPaused = inputPaused
+        self.performingRecovery = performingRecovery
+        self.canPreserveRecovery = canPreserveRecovery
+        self.canReopenSaved = canReopenSaved
+        self.recoveryMessage = recoveryMessage
+        self.recoveryFailure = recoveryFailure
+        self.isReady = isReady
+    }
 }
 
 @MainActor
