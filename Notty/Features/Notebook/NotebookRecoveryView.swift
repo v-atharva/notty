@@ -150,8 +150,7 @@ private struct ReadOnlyNotebookCanvas: UIViewControllerRepresentable {
     let pageCount: Int
 
     func makeUIViewController(context: Context) -> NotebookViewController {
-        let controller = NotebookViewController(pageCount: pageCount, initialDrawing: drawing)
-        controller.setEditingEnabled(false)
+        let controller = NotebookViewController(pageCount: pageCount, initialDrawing: drawing, allowsEditing: false)
         return controller
     }
 
