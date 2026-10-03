@@ -258,7 +258,7 @@ final class InkArchiveReuseTests: XCTestCase {
         XCTAssertNotEqual(first, changed)
     }
 
-    func testRareNativeEqualityFallbackDeduplicatesAndReportsItsWork() async throws {
+    func testRareWholeNativeEqualityFallbackDeduplicatesAndCodecReencodesOpaqueStroke() async throws {
         var native = stroke()
         native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
         let drawing = PKDrawing(strokes: [native])
@@ -290,11 +290,23 @@ final class InkArchiveReuseTests: XCTestCase {
         let before = await codec.workMetrics
         let same = try await codec.encode(drawing)
         let after = await codec.workMetrics
-        XCTAssertEqual(original, same)
-        XCTAssertEqual(original[0].cachedDigest, same[0].cachedDigest)
-        XCTAssertEqual(after.serializedStrokes, before.serializedStrokes)
-        XCTAssertEqual(after.nativeDrawingEqualityFallbacks - before.nativeDrawingEqualityFallbacks, 1)
-        XCTAssertEqual(after.hashedArchiveBytes, before.hashedArchiveBytes)
+        XCTAssertEqual(original.map(\.id), same.map(\.id))
+        XCTAssertEqual(same[0].cachedDigest, NotebookDigest.sha256(same[0].data))
+        XCTAssertEqual(after.serializedStrokes - before.serializedStrokes, 1)
+        XCTAssertEqual(after.nativeDrawingEqualityFallbacks, before.nativeDrawingEqualityFallbacks)
+        XCTAssertEqual(after.hashedArchiveBytes - before.hashedArchiveBytes, same[0].data.count)
+        XCTAssertEqual(after.copiedArchiveBytes - before.copiedArchiveBytes, same[0].data.count)
+        let restored = try await InkCodec().decode(same)
+        XCTAssertEqual(restored.strokes.map(\.id), drawing.strokes.map(\.id))
+        XCTAssertEqual(restored.strokes[0].path.id, drawing.strokes[0].path.id)
+        XCTAssertEqual(restored.strokes[0].transform, drawing.strokes[0].transform)
+        XCTAssertEqual(restored.strokes[0].randomSeed, drawing.strokes[0].randomSeed)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        XCTAssertEqual(
+            try encoder.encode(restored.strokes[0].renderState),
+            try encoder.encode(drawing.strokes[0].renderState)
+        )
     }
 
     func testOneStrokeChangeMetricsExposeExactFallbackWorkAtOneHundredAndTwoThousand() async throws {

@@ -35,6 +35,7 @@ public actor InkCodec {
         public fileprivate(set) var propertyListRenderStates = 0
         public fileprivate(set) var nativeDrawingFallbackSnapshots = 0
         public fileprivate(set) var nativeDrawingEqualityFallbacks = 0
+        public fileprivate(set) var uncacheableStrokeSignatures = 0
     }
 
     public static let maximumStrokeBytes = 10 * 1_024 * 1_024
@@ -70,7 +71,7 @@ public actor InkCodec {
         let evenOddFill: Bool
         let renderGroupID: UUID?
         let renderState: Data?
-        let nativeDrawingFallback: PKDrawing?
+        let requiresNativeDrawingFallback: Bool
 
         init(
             _ stroke: PKStroke, work: inout WorkMetrics,
@@ -84,7 +85,7 @@ public actor InkCodec {
             color = stroke.ink.color.cgColor
             randomSeed = stroke.randomSeed
             renderGroupID = stroke.renderGroupID
-            var fallback: PKDrawing?
+            var requiresFallback = false
 
             if let state = stroke.renderState {
                 work.encodedRenderStates += 1
@@ -110,8 +111,7 @@ public actor InkCodec {
                         work.renderStateBytes += binary.count
                     } else {
                         renderState = nil
-                        fallback = PKDrawing(strokes: [stroke])
-                        work.nativeDrawingFallbackSnapshots += 1
+                        requiresFallback = true
                     }
                 }
             } else {
@@ -123,10 +123,7 @@ public actor InkCodec {
                 mask = nativeMask.cgPath.copy()
                 if mask == nil {
                     work.maskFallbacks += 1
-                    if fallback == nil {
-                        fallback = PKDrawing(strokes: [stroke])
-                        work.nativeDrawingFallbackSnapshots += 1
-                    }
+                    requiresFallback = true
                 }
                 #if canImport(UIKit)
                 evenOddFill = nativeMask.usesEvenOddFillRule
@@ -137,17 +134,14 @@ public actor InkCodec {
                 mask = nil
                 evenOddFill = false
             }
-            nativeDrawingFallback = fallback
+            requiresNativeDrawingFallback = requiresFallback
+            if requiresFallback { work.uncacheableStrokeSignatures += 1 }
         }
 
         func matches(_ other: Self, work: inout WorkMetrics) -> Bool {
             work.signatureChecks += 1
-            if nativeDrawingFallback != nil || other.nativeDrawingFallback != nil {
-                guard let first = nativeDrawingFallback, let second = other.nativeDrawingFallback else {
-                    return false
-                }
-                work.nativeDrawingEqualityFallbacks += 1
-                return first == second
+            guard !requiresNativeDrawingFallback, !other.requiresNativeDrawingFallback else {
+                return false
             }
             guard path.id == other.path.id,
                   path.creationDate == other.path.creationDate,
@@ -360,6 +354,7 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
     }
 
     private let entries: [Entry]
+    private let nativeDrawingFallback: PKDrawing?
     private let captureID = UUID()
     public let constructionWork: InkCodec.WorkMetrics
 
@@ -386,6 +381,12 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
             entries.append(Entry(id: stroke.id, stroke: signature))
         }
         self.entries = entries
+        if entries.contains(where: { $0.stroke.requiresNativeDrawingFallback }) {
+            nativeDrawingFallback = drawing
+            work.nativeDrawingFallbackSnapshots += 1
+        } else {
+            nativeDrawingFallback = nil
+        }
         constructionWork = work
     }
 
@@ -393,6 +394,13 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
         var work = InkCodec.WorkMetrics()
         if captureID == other.captureID {
             return Comparison(isEqual: true, work: work)
+        }
+        if nativeDrawingFallback != nil || other.nativeDrawingFallback != nil {
+            guard let first = nativeDrawingFallback, let second = other.nativeDrawingFallback else {
+                return Comparison(isEqual: false, work: work)
+            }
+            work.nativeDrawingEqualityFallbacks += 1
+            return Comparison(isEqual: first == second, work: work)
         }
         guard entries.count == other.entries.count else {
             return Comparison(isEqual: false, work: work)
