@@ -267,6 +267,86 @@ final class NotebookControllerTests: XCTestCase {
         }
     }
 
+    func testObservedStatesDuringToolUseKeepGenerationsAndDeferCapacityDisableUntilEnd() {
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
+        let window = present(controller)
+        defer { window.isHidden = true }
+        var observations: [NotebookCanvasObservation] = []
+        controller.onObservation = {
+            observations.append($0)
+            return .capacity
+        }
+        let canvas = controller.canvasView
+        controller.canvasViewDidBeginUsingTool(canvas)
+        let stroke = NotebookTestFixtures.stroke()
+        canvas.drawing = PKDrawing(strokes: [stroke])
+        controller.canvasViewDrawingDidChange(canvas)
+        var moved = stroke
+        moved.transform = CGAffineTransform(translationX: 30, y: 40)
+        canvas.drawing = PKDrawing(strokes: [moved])
+        controller.canvasViewDrawingDidChange(canvas)
+        XCTAssertEqual(observations.map(\.generation), [1, 2])
+        XCTAssertEqual(observations[0].drawing.strokes[0].transform, stroke.transform)
+        XCTAssertEqual(observations[1].drawing.strokes[0].transform, moved.transform)
+        XCTAssertLessThanOrEqual(observations[0].capturedAt, observations[1].capturedAt)
+        XCTAssertLessThanOrEqual(observations[0].uptime, observations[1].uptime)
+        XCTAssertEqual(controller.inputGate, .capacity)
+        XCTAssertTrue(canvas.isDrawingEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertNil(canvas.undoManager)
+        XCTAssertFalse(canvas.canPerformAction(NSSelectorFromString("paste:"), withSender: nil))
+        controller.setInputGate(.failed)
+        XCTAssertTrue(canvas.isDrawingEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertTrue(canvas.isFirstResponder)
+        XCTAssertTrue(controller.drawingToolPicker.isVisible)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertFalse(canvas.isDrawingEnabled)
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(observations.count, 2)
+        XCTAssertFalse(canvas.isFirstResponder)
+        XCTAssertFalse(controller.drawingToolPicker.isVisible)
+        controller.tearDown()
+        XCTAssertEqual(observations.count, 2)
+    }
+
+    func testOmittedEndCallbackAndLateNextToolCallbackRemainDistinctObservedStates() {
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
+        controller.loadViewIfNeeded()
+        var observations: [NotebookCanvasObservation] = []
+        controller.onObservation = {
+            observations.append($0)
+            return .open
+        }
+        let canvas = controller.canvasView
+        let stroke = NotebookTestFixtures.stroke()
+        controller.canvasViewDidBeginUsingTool(canvas)
+        canvas.drawing = PKDrawing(strokes: [stroke])
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(observations.map(\.generation), [1])
+        controller.canvasViewDidBeginUsingTool(canvas)
+        var masked = stroke
+        masked.mask = UIBezierPath(rect: CGRect(x: 20, y: 30, width: 12, height: 25))
+        canvas.drawing = PKDrawing(strokes: [masked])
+        controller.canvasViewDrawingDidChange(canvas)
+        XCTAssertEqual(observations.map(\.generation), [1, 2])
+        XCTAssertNil(observations[0].drawing.strokes[0].mask)
+        XCTAssertEqual(observations[1].drawing.strokes[0].mask?.cgPath, masked.mask?.cgPath)
+        var moved = masked
+        moved.transform = CGAffineTransform(translationX: 50, y: 10)
+        canvas.drawing = PKDrawing(strokes: [moved])
+        _ = controller.captureBarrier()
+        XCTAssertEqual(observations.map(\.generation), [1, 2, 3])
+        controller.canvasViewDidEndUsingTool(canvas)
+        controller.tearDown()
+        XCTAssertEqual(observations.count, 3)
+        XCTAssertGreaterThan(controller.barrierSignatureChecks, 0)
+        let metrics = try? JSONSerialization.data(
+            withJSONObject: controller.observationWork.values, options: [.sortedKeys]
+        )
+        if let metrics { print("NOTTY_BARRIER_METRIC \(String(decoding: metrics, as: UTF8.self))") }
+    }
+
     private func present(_ controller: NotebookViewController) -> UIWindow {
         let window: UIWindow
         if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {

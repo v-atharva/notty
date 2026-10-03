@@ -1,12 +1,66 @@
+import Darwin
 import Foundation
 import NottyCore
 
 struct NotebookStorage: Sendable {
     let load: @Sendable () async throws -> StoredNotebook?
     let save: @Sendable (NotebookContent, UUID?) async throws -> StoredNotebook
+    let saveBatch: @Sendable ([NotebookSaveEdit], UUID?) async throws -> NotebookBatchSaveResult
     let preserve: @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt
     let listRecovery: @Sendable () async throws -> NotebookRecoveryScan
     let loadRecovery: @Sendable (UUID) async throws -> NotebookRecoveryBatch
+
+    init(
+        load: @escaping @Sendable () async throws -> StoredNotebook?,
+        save: @escaping @Sendable (NotebookContent, UUID?) async throws -> StoredNotebook,
+        preserve: @escaping @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt,
+        listRecovery: @escaping @Sendable () async throws -> NotebookRecoveryScan,
+        loadRecovery: @escaping @Sendable (UUID) async throws -> NotebookRecoveryBatch,
+        saveBatch: (@Sendable ([NotebookSaveEdit], UUID?) async throws -> NotebookBatchSaveResult)? = nil
+    ) {
+        self.load = load
+        self.save = save
+        self.preserve = preserve
+        self.listRecovery = listRecovery
+        self.loadRecovery = loadRecovery
+        self.saveBatch = saveBatch ?? { edits, revision in
+            var committed: [NotebookCommittedEdit] = []
+            var cursor = revision
+            for (index, edit) in edits.enumerated() {
+                do {
+                    let result = try await save(edit.content, cursor)
+                    committed.append(NotebookCommittedEdit(
+                        editID: edit.id, revisionID: result.revisionID,
+                        sequence: result.sequence, savedAt: result.savedAt
+                    ))
+                    cursor = result.revisionID
+                } catch {
+                    if committed.isEmpty { throw error }
+                    let cause = Self.repositoryError(error)
+                    return NotebookBatchSaveResult(
+                        committed: committed,
+                        rejection: NotebookBatchFailure(index: index, editID: edit.id, error: cause)
+                    )
+                }
+            }
+            return NotebookBatchSaveResult(committed: committed)
+        }
+    }
+
+    private static func repositoryError(_ error: any Error) -> NotebookRepositoryError {
+        if let error = error as? NotebookRepositoryError { return error }
+        switch NotebookSaveFailure.classify(error) {
+        case .contentLimit: return .sizeLimitExceeded("The edit exceeds storage limits.")
+        case .revisionConflict: return .revisionConflict
+        case .corruptData: return .corruptData("The edit could not be verified.")
+        case .unsupportedFormat: return .unsupportedVersion(0)
+        case .unsafeStorage: return .unsafePath("The storage path is unsafe.")
+        case .storageFull: return .ioFailure(ENOSPC)
+        case .storageUnavailable: return .ioFailure(EIO)
+        case .invalidContent: return .invalidContent("The edit cannot be saved.")
+        case .unexpected: return .ioFailure(0)
+        }
+    }
 
     static func open(
         notebookID: UUID, libraryRoot: URL?, recoveryRoot: URL?
@@ -42,7 +96,8 @@ struct NotebookStorage: Sendable {
                 },
                 preserve: { try await recovery.preserve($0) },
                 listRecovery: { try await recovery.scan(notebookID: notebookID) },
-                loadRecovery: { try await recovery.load(id: $0) }
+                loadRecovery: { try await recovery.load(id: $0) },
+                saveBatch: { try await repository.saveBatch(edits: $0, expectedRevisionID: $1) }
             )
         }.value
     }
@@ -93,6 +148,12 @@ private actor NotebookRepositoryAccess {
 
     func load() async throws -> StoredNotebook? {
         try await openedRepository().load(id: notebookID)
+    }
+
+    func saveBatch(edits: [NotebookSaveEdit], expectedRevisionID: UUID?) async throws -> NotebookBatchSaveResult {
+        try await openedRepository().saveBatch(
+            id: notebookID, edits: edits, expectedRevisionID: expectedRevisionID
+        )
     }
 
     func save(content: NotebookContent, expectedRevisionID: UUID?) async throws -> StoredNotebook {

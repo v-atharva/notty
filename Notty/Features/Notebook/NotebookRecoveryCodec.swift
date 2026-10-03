@@ -7,6 +7,18 @@ struct NotebookDrawingSnapshot: Sendable, Equatable {
     let drawing: PKDrawing
     let pageCount: Int
     let title: String
+    let identity: UUID
+
+    init(drawing: PKDrawing, pageCount: Int, title: String, identity: UUID = UUID()) {
+        self.drawing = drawing
+        self.pageCount = pageCount
+        self.title = title
+        self.identity = identity
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.identity == rhs.identity && lhs.pageCount == rhs.pageCount && lhs.title == rhs.title
+    }
 }
 
 struct NotebookRecoveryFingerprint: Sendable, Equatable {

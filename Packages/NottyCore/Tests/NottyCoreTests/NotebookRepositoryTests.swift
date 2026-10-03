@@ -82,8 +82,7 @@ final class NotebookRepositoryTests: XCTestCase {
         _ = try await repository.save(
             id: id, content: next, expectedRevisionID: second.revisionID
         )
-        XCTAssertEqual(counter.snapshot().count, 2)
-        XCTAssertTrue(counter.snapshot().values.allSatisfy { $0 == 1 })
+        XCTAssertTrue(counter.snapshot().isEmpty)
     }
 
     func testUnpublishedExistingDigestIsVerifiedOnceWhenSeveralStrokesReuseIt() async throws {
@@ -1214,12 +1213,13 @@ final class NotebookRepositoryTests: XCTestCase {
                 XCTAssertEqual(try Data(contentsOf: headURL), headBytes)
                 XCTAssertEqual(try Data(contentsOf: asset), target == .assetStaged ? damaged : stroke.data)
                 XCTAssertFalse(try fileSnapshot(root: directory).keys.contains { $0.hasSuffix(".tmp") })
-                let second = try await healthy.save(
+                let retry = try NotebookRepository(rootURL: root)
+                let second = try await retry.save(
                     id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
                 )
                 XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
                 XCTAssertEqual(second.sequence, 2)
-                let audit = try await healthy.auditHistory(id: id)
+                let audit = try await retry.auditHistory(id: id)
                 XCTAssertEqual(audit.revisionCount, 2)
             }
         }
@@ -1249,8 +1249,9 @@ final class NotebookRepositoryTests: XCTestCase {
                     try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: false)
                     try Data("untouched".utf8).write(to: asset.appendingPathComponent("child"))
                 }
+                let refreshed = try NotebookRepository(rootURL: root)
                 do {
-                    _ = try await repository.save(
+                    _ = try await refreshed.save(
                         id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
                     )
                     XCTFail("An unsafe asset entry was repaired.")

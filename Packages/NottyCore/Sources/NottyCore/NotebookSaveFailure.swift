@@ -70,7 +70,7 @@ public enum NotebookSaveFailure: Error, Sendable, Equatable {
             switch error {
             case .tooManyStrokes, .oversizedStrokeArchive, .oversizedDrawingArchive:
                 return .contentLimit
-            case .invalidSingleStrokeArchive: return .corruptData
+            case .invalidSingleStrokeArchive, .invalidRestoredStrokeIdentity: return .corruptData
             case .duplicateStrokeID, .invalidMaskGeometry: return .invalidContent
             }
         }

@@ -52,10 +52,18 @@ final class NotebookSession: ObservableObject {
     private let backgroundLease: NotebookBackgroundLease
     private var storage: NotebookStorage?
     private var coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>?
-    private var coordinatorObservation: AnyCancellable?
     private var loadStarted = false
     private var activeCanvasOwner: UUID?
     private var snapshotProvider: (() -> PKDrawing?)?
+    private var observationProvider: (() -> NotebookCanvasObservation?)?
+    private var canvasGateSink: ((NotebookInputGate) -> Void)?
+    private var lastPushedCanvasGate: NotebookInputGate?
+    private var latestCanvasGeneration: UInt64 = 0
+    private var workingSignature: InkDrawingSignature?
+    let gateModel = NotebookCanvasGateModel()
+    let statusModel = NotebookSavePresentationModel()
+    let renderDiagnostics = NotebookRenderDiagnostics()
+    private var presentationObservation: AnyCancellable?
     private var preservedState: PreservedState?
     private var preservationTask: Task<Void, Never>?
     private var preservationID: UUID?
@@ -69,6 +77,7 @@ final class NotebookSession: ObservableObject {
     private var backgroundFlush: BackgroundFlush?
     private var backgroundWaiter: Task<Void, Never>?
 
+    var canvasOwnerID: UUID? { activeCanvasOwner }
     var saveState: NotebookSaveStatus { coordinator?.status ?? .idle }
     var pendingEdits: [NotebookPendingEdit<NotebookDrawingSnapshot>] {
         coordinator?.pendingEdits ?? []
@@ -107,6 +116,9 @@ final class NotebookSession: ObservableObject {
                 notebookID: notebookID, libraryRoot: libraryRoot, recoveryRoot: recoveryRoot
             )
         }
+        presentationObservation = objectWillChange.sink { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshPresentation() }
+        }
     }
 
     func load() async {
@@ -137,12 +149,31 @@ final class NotebookSession: ObservableObject {
         let owner = UUID()
         activeCanvasOwner = owner
         snapshotProvider = nil
+        observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
+        latestCanvasGeneration = 0
         return CanvasSeed(ownerID: owner, drawing: workingDrawing, pageCount: pageCount)
     }
 
     func attachCanvas(ownerID: UUID, snapshot: @escaping () -> PKDrawing?) {
         guard activeCanvasOwner == ownerID else { return }
+        observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
         snapshotProvider = snapshot
+    }
+
+    func attachCanvas(
+        ownerID: UUID, observations: @escaping () -> NotebookCanvasObservation?,
+        applyInputGate: @escaping (NotebookInputGate) -> Void = { _ in }
+    ) {
+        guard activeCanvasOwner == ownerID else { return }
+        observationProvider = observations
+        snapshotProvider = nil
+        canvasGateSink = applyInputGate
+        lastPushedCanvasGate = nil
+        refreshPresentation()
     }
 
     func detachCanvas(ownerID: UUID) {
@@ -150,12 +181,33 @@ final class NotebookSession: ObservableObject {
         captureWorkingInk()
         activeCanvasOwner = nil
         snapshotProvider = nil
+        observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
     }
 
     @discardableResult
     func recordCompletedEdit(_ drawing: PKDrawing, ownerID: UUID) -> Bool {
         guard loadState == .ready, activeCanvasOwner == ownerID else { return false }
         retain(drawing)
+        return canEdit
+    }
+
+    @discardableResult
+    func recordObservation(_ observation: NotebookCanvasObservation, ownerID: UUID) -> Bool {
+        guard loadState == .ready, activeCanvasOwner == ownerID,
+              observation.generation > latestCanvasGeneration else { return false }
+        latestCanvasGeneration = observation.generation
+        workingDrawing = observation.drawing
+        if let signature = observation.signature {
+            workingSignature = signature
+        } else {
+            workingSignature = try? InkDrawingSignature(observation.drawing)
+            if let workingSignature { renderDiagnostics.observationWork.add(workingSignature.constructionWork) }
+        }
+        enqueueCurrentDrawing(stamp: NotebookEditStamp(
+            capturedAt: observation.capturedAt, uptime: observation.uptime, sessionID: editSessionID
+        ))
         return canEdit
     }
 
@@ -393,22 +445,35 @@ final class NotebookSession: ObservableObject {
     }
 
     private func captureWorkingInk() {
-        if let drawing = snapshotProvider?() { retain(drawing) }
+        if let observation = observationProvider?(), let ownerID = activeCanvasOwner {
+            recordObservation(observation, ownerID: ownerID)
+        } else if let drawing = snapshotProvider?() {
+            retain(drawing)
+        }
     }
 
     private func retain(_ drawing: PKDrawing) {
-        guard drawing != workingDrawing else { return }
+        let signature = try? InkDrawingSignature(drawing)
+        if let signature { renderDiagnostics.observationWork.add(signature.constructionWork) }
+        if let signature, let workingSignature {
+            let comparison = signature.compared(to: workingSignature)
+            renderDiagnostics.observationWork.add(comparison.work)
+            if comparison.isEqual { return }
+        }
+        workingSignature = signature
         workingDrawing = drawing
         enqueueCurrentDrawing()
     }
 
-    private func enqueueCurrentDrawing() {
-        coordinator?.enqueue(
+    private func enqueueCurrentDrawing(stamp: NotebookEditStamp? = nil) {
+        guard let coordinator else { return }
+        coordinator.enqueue(edit: NotebookPendingEdit(
             snapshot: NotebookDrawingSnapshot(drawing: workingDrawing, pageCount: pageCount, title: title),
-            stamp: NotebookEditStamp(
+            stamp: stamp ?? NotebookEditStamp(
                 capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime, sessionID: editSessionID
             )
-        )
+        ))
+        refreshPresentation()
     }
 
     private func validateExtent(_ count: Int) throws {
@@ -421,26 +486,187 @@ final class NotebookSession: ObservableObject {
         guard let storage else { return }
         if let active = backgroundFlush { finishBackgroundFlush(id: active.id) }
         workingDrawing = drawing
+        workingSignature = try? InkDrawingSignature(drawing)
+        latestCanvasGeneration = 0
+        activeCanvasOwner = nil
+        snapshotProvider = nil
+        observationProvider = nil
         pageCount = stored?.content.pageCount ?? 3
         title = stored?.content.title ?? "Personal notebook"
         let initial = NotebookDrawingSnapshot(drawing: drawing, pageCount: pageCount, title: title)
         let codec = self.codec
         let coordinator = NotebookSaveCoordinator(
             initialSnapshot: stored == nil ? nil : initial,
-            expectedRevisionID: stored?.revisionID, savedAt: stored?.savedAt
-        ) { snapshot, stamp, revision in
-            let strokes = try await codec.encode(snapshot.drawing)
-            let content = NotebookContent(
-                title: snapshot.title, pageCount: snapshot.pageCount, strokes: strokes, editStamp: stamp
-            )
-            let result = try await storage.save(content, revision)
-            return NotebookSaveReceipt(revisionID: result.revisionID, savedAt: result.savedAt)
-        }
-        coordinatorObservation = coordinator.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            expectedRevisionID: stored?.revisionID, savedAt: stored?.savedAt,
+            saveBatch: { edits, revision in
+                var encoded: [NotebookSaveEdit] = []
+                var codecFailure: NotebookPendingFailure?
+                for (index, edit) in edits.enumerated() {
+                    do {
+                        let strokes = try await codec.encode(edit.snapshot.drawing)
+                        encoded.append(NotebookSaveEdit(
+                            id: edit.id,
+                            content: NotebookContent(
+                                title: edit.snapshot.title, pageCount: edit.snapshot.pageCount,
+                                strokes: strokes, editStamp: edit.stamp
+                            )
+                        ))
+                    } catch {
+                        codecFailure = NotebookPendingFailure(
+                            index: index, editID: edit.id, cause: NotebookSaveFailure.classify(error)
+                        )
+                        break
+                    }
+                }
+                if encoded.isEmpty {
+                    return NotebookSaveBatchOutcome(committed: [], rejection: codecFailure)
+                }
+                let result = try await storage.saveBatch(encoded, revision)
+                let rejection = result.rejection.map {
+                    NotebookPendingFailure(
+                        index: $0.index, editID: $0.editID, cause: NotebookSaveFailure.classify($0.error)
+                    )
+                }
+                let reachedCodecFailure = result.committed.count == encoded.count
+                    && result.rejection == nil
+                return NotebookSaveBatchOutcome(
+                    committed: result.committed,
+                    rejection: rejection ?? (reachedCodecFailure ? codecFailure : nil)
+                )
+            }
+        )
+        coordinator.onStateChange = { [weak self, weak coordinator] in
+            guard let self, let coordinator, self.coordinator === coordinator else { return }
+            self.refreshPresentation()
         }
         self.coordinator = coordinator
         canvasGeneration = UUID()
         loadState = .ready
+        refreshPresentation()
+    }
+
+    private func refreshPresentation() {
+        if activeCanvasOwner != nil, let canvasGateSink, lastPushedCanvasGate != inputGate {
+            lastPushedCanvasGate = inputGate
+            canvasGateSink(inputGate)
+        }
+        gateModel.update(pageCount: pageCount, inputGate: inputGate)
+        statusModel.update(NotebookSavePresentation(
+            status: saveState, inputPaused: inputPaused, performingRecovery: isPerformingRecovery,
+            canPreserveRecovery: canPreserveRecovery, canReopenSaved: canReopenSaved,
+            recoveryMessage: recoveryMessage, recoveryFailure: recoveryFailure
+        ))
+    }
+}
+
+struct NotebookCanvasObservation: Sendable {
+    let generation: UInt64
+    let drawing: PKDrawing
+    let capturedAt: Date
+    let uptime: TimeInterval
+    let signature: InkDrawingSignature?
+
+    init(
+        generation: UInt64, drawing: PKDrawing, capturedAt: Date, uptime: TimeInterval,
+        signature: InkDrawingSignature? = nil
+    ) {
+        self.generation = generation
+        self.drawing = drawing
+        self.capturedAt = capturedAt
+        self.uptime = uptime
+        self.signature = signature
+    }
+}
+
+@MainActor
+final class NotebookCanvasGateModel: ObservableObject {
+    struct State: Equatable {
+        let pageCount: Int
+        let inputGate: NotebookInputGate
+    }
+
+    @Published private(set) var state = State(pageCount: 3, inputGate: .failed)
+
+    func update(pageCount: Int, inputGate: NotebookInputGate) {
+        let next = State(pageCount: pageCount, inputGate: inputGate)
+        if next != state { state = next }
+    }
+}
+
+struct NotebookSavePresentation: Equatable {
+    let status: NotebookSaveStatus
+    let inputPaused: Bool
+    let performingRecovery: Bool
+    let canPreserveRecovery: Bool
+    let canReopenSaved: Bool
+    let recoveryMessage: String?
+    let recoveryFailure: NotebookSaveFailure?
+}
+
+@MainActor
+final class NotebookSavePresentationModel: ObservableObject {
+    @Published private(set) var state = NotebookSavePresentation(
+        status: .idle, inputPaused: true, performingRecovery: false,
+        canPreserveRecovery: false, canReopenSaved: false,
+        recoveryMessage: nil, recoveryFailure: nil
+    )
+
+    func update(_ next: NotebookSavePresentation) {
+        if next != state { state = next }
+    }
+}
+
+@MainActor
+final class NotebookRenderDiagnostics {
+    var screenBodyCount = 0
+    var canvasUpdateCount = 0
+    var observationWork = NotebookObservationWork()
+}
+
+struct NotebookObservationWork {
+    private(set) var serializedStrokes = 0
+    private(set) var copiedArchiveBytes = 0
+    private(set) var hashedArchiveBytes = 0
+    private(set) var propertyListRenderStates = 0
+    private(set) var nativeDrawingFallbackSnapshots = 0
+    private(set) var nativeDrawingEqualityFallbacks = 0
+    private(set) var maskFallbacks = 0
+    private(set) var comparedPoints = 0
+    private(set) var signatureChecks = 0
+    private(set) var maskSnapshots = 0
+    private(set) var comparedMaskPaths = 0
+    private(set) var encodedRenderStates = 0
+    private(set) var renderStateBytes = 0
+    private(set) var renderStateFallbacks = 0
+
+    mutating func add(_ work: InkCodec.WorkMetrics) {
+        serializedStrokes += work.serializedStrokes
+        copiedArchiveBytes += work.copiedArchiveBytes
+        hashedArchiveBytes += work.hashedArchiveBytes
+        propertyListRenderStates += work.propertyListRenderStates
+        nativeDrawingFallbackSnapshots += work.nativeDrawingFallbackSnapshots
+        nativeDrawingEqualityFallbacks += work.nativeDrawingEqualityFallbacks
+        maskFallbacks += work.maskFallbacks
+        comparedPoints += work.comparedPoints
+        signatureChecks += work.signatureChecks
+        maskSnapshots += work.maskSnapshots
+        comparedMaskPaths += work.comparedMaskPaths
+        encodedRenderStates += work.encodedRenderStates
+        renderStateBytes += work.renderStateBytes
+        renderStateFallbacks += work.renderStateFallbacks
+    }
+
+    var values: [String: Int] {
+        [
+            "serializations": serializedStrokes, "copiedArchiveBytes": copiedArchiveBytes,
+            "assetSHABytes": hashedArchiveBytes,
+            "propertyListRenderStates": propertyListRenderStates,
+            "nativeDrawingFallbackSnapshots": nativeDrawingFallbackSnapshots,
+            "nativeDrawingEqualityFallbacks": nativeDrawingEqualityFallbacks,
+            "maskFallbacks": maskFallbacks, "pointComparisons": comparedPoints,
+            "signatureChecks": signatureChecks, "maskSnapshots": maskSnapshots,
+            "maskComparisons": comparedMaskPaths, "renderStateEncodings": encodedRenderStates,
+            "renderStateBytes": renderStateBytes, "renderStateFallbacks": renderStateFallbacks
+        ]
     }
 }

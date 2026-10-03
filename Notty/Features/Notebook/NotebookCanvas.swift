@@ -2,21 +2,29 @@ import SwiftUI
 
 @MainActor
 struct NotebookCanvas: UIViewControllerRepresentable {
-    @ObservedObject var session: NotebookSession
+    let session: NotebookSession
+    let pageCount: Int
+
+    init(session: NotebookSession) {
+        self.session = session
+        self.pageCount = session.pageCount
+    }
 
     func makeUIViewController(context: Context) -> NotebookViewController {
         let seed = session.makeCanvasSeed()
         let controller = NotebookViewController(
             pageCount: seed.pageCount, initialDrawing: seed.drawing
         )
-        controller.onCompletedEdit = { [weak session] drawing in
+        controller.onObservation = { [weak session] observation in
             guard let session else { return .readOnly }
-            session.recordCompletedEdit(drawing, ownerID: seed.ownerID)
+            session.recordObservation(observation, ownerID: seed.ownerID)
             return session.inputGateForCanvas(ownerID: seed.ownerID)
         }
-        session.attachCanvas(ownerID: seed.ownerID) { [weak controller] in
-            controller?.currentDrawing
-        }
+        session.attachCanvas(
+            ownerID: seed.ownerID,
+            observations: { [weak controller] in controller?.captureBarrier() },
+            applyInputGate: { [weak controller] in controller?.setInputGate($0) }
+        )
         controller.onDetach = { [weak session] in
             session?.detachCanvas(ownerID: seed.ownerID)
         }
@@ -25,9 +33,8 @@ struct NotebookCanvas: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: NotebookViewController, context: Context) {
-        controller.setPageCount(session.pageCount)
-        let gate = session.inputGate
-        if controller.inputGate != gate { controller.setInputGate(gate) }
+        session.renderDiagnostics.canvasUpdateCount += 1
+        controller.setPageCount(pageCount)
     }
 
     static func dismantleUIViewController(

@@ -23,6 +23,7 @@ final class NotebookViewController: UIViewController {
     private let paper = PaperBackgroundView()
     private let toolPicker: PKToolPicker
 
+    var onObservation: ((NotebookCanvasObservation) -> NotebookInputGate)?
     var onCompletedEdit: ((PKDrawing) -> NotebookInputGate)?
     var onDetach: (() -> Void)?
     var canvasView: PKCanvasView { canvas }
@@ -30,13 +31,18 @@ final class NotebookViewController: UIViewController {
     var currentDrawing: PKDrawing { canvas.drawing }
 
     private let initialDrawing: PKDrawing
-    private var lastDeliveredDrawing: PKDrawing
-    private var isUsingTool = false
+    private var lastDeliveredSignature: InkDrawingSignature?
+    private var observedGeneration: UInt64 = 0
+    private var lastObservation: NotebookCanvasObservation?
+    private(set) var observationWork = NotebookObservationWork()
+    var barrierPointComparisons: Int { observationWork.comparedPoints }
+    var barrierSignatureChecks: Int { observationWork.signatureChecks }
     private(set) var inputGate = NotebookInputGate.open
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
     private var observesToolPicker = false
+    private var paletteKeepsAccess = true
 
     private var logicalHeight: CGFloat {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
@@ -45,9 +51,10 @@ final class NotebookViewController: UIViewController {
     init(pageCount: Int, initialDrawing: PKDrawing, toolPicker: PKToolPicker? = nil) {
         self.toolPicker = toolPicker ?? PKToolPicker()
         self.initialDrawing = initialDrawing
-        self.lastDeliveredDrawing = initialDrawing
+        self.lastDeliveredSignature = try? InkDrawingSignature(initialDrawing)
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
         super.init(nibName: nil, bundle: nil)
+        if let lastDeliveredSignature { observationWork.add(lastDeliveredSignature.constructionWork) }
     }
 
     @available(*, unavailable)
@@ -68,6 +75,7 @@ final class NotebookViewController: UIViewController {
         canvas.drawing = initialDrawing
         canvas.delegate = self
         canvas.permitsMutation = inputGate.allowsMutation
+        paletteKeepsAccess = inputGate.keepsPalette
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.drawingPolicy = .pencilOnly
@@ -165,27 +173,59 @@ final class NotebookViewController: UIViewController {
 
     func setInputGate(_ gate: NotebookInputGate) {
         guard gate != inputGate else { return }
-        let previousGate = inputGate
         inputGate = gate
         guard isViewLoaded else { return }
         canvas.permitsMutation = gate.allowsMutation
-        guard previousGate.keepsPalette != gate.keepsPalette else { return }
-        toolPicker.setVisible(gate.keepsPalette && view.window != nil, forFirstResponder: canvas)
-        if gate.keepsPalette && view.window != nil {
+        applyPaletteGate()
+    }
+
+    private func applyPaletteGate() {
+        guard !canvas.hasActiveTool, paletteKeepsAccess != inputGate.keepsPalette else { return }
+        paletteKeepsAccess = inputGate.keepsPalette
+        toolPicker.setVisible(inputGate.keepsPalette && view.window != nil, forFirstResponder: canvas)
+        if inputGate.keepsPalette && view.window != nil {
             canvas.becomeFirstResponder()
-        } else if !gate.keepsPalette {
+        } else if !inputGate.keepsPalette {
             canvas.resignFirstResponder()
         }
         updateInsets()
     }
 
-    private func deliverCompletedDrawing() {
+    private func observeDrawing(signature: InkDrawingSignature? = nil) {
         let drawing = canvas.drawing
-        guard drawing != lastDeliveredDrawing else { return }
-        lastDeliveredDrawing = drawing
-        if let onCompletedEdit {
-            setInputGate(onCompletedEdit(drawing))
+        let capturedAt = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let capturedSignature: InkDrawingSignature?
+        if let signature {
+            capturedSignature = signature
+        } else {
+            capturedSignature = try? InkDrawingSignature(drawing)
+            if let capturedSignature { observationWork.add(capturedSignature.constructionWork) }
         }
+        let observation = NotebookCanvasObservation(
+            generation: observedGeneration + 1, drawing: drawing,
+            capturedAt: capturedAt, uptime: uptime, signature: capturedSignature
+        )
+        observedGeneration = observation.generation
+        lastObservation = observation
+        lastDeliveredSignature = capturedSignature
+        if let onObservation {
+            setInputGate(onObservation(observation))
+        } else if let onCompletedEdit {
+            setInputGate(onCompletedEdit(observation.drawing))
+        }
+    }
+
+    func captureBarrier() -> NotebookCanvasObservation? {
+        let signature = try? InkDrawingSignature(canvas.drawing)
+        if let signature { observationWork.add(signature.constructionWork) }
+        if let signature, let previous = lastDeliveredSignature {
+            let comparison = signature.compared(to: previous)
+            observationWork.add(comparison.work)
+            if comparison.isEqual { return lastObservation }
+        }
+        observeDrawing(signature: signature)
+        return lastObservation
     }
 
     func setPageCount(_ requestedCount: Int) {
@@ -204,10 +244,11 @@ final class NotebookViewController: UIViewController {
     }
 
     func tearDown() {
-        deliverCompletedDrawing()
+        _ = captureBarrier()
         onDetach?()
         onDetach = nil
         onCompletedEdit = nil
+        onObservation = nil
         guard observesToolPicker else { return }
         toolPicker.setVisible(false, forFirstResponder: canvas)
         toolPicker.removeObserver(canvas)
@@ -269,18 +310,17 @@ final class NotebookViewController: UIViewController {
 
 extension NotebookViewController: PKCanvasViewDelegate {
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-        isUsingTool = true
+        canvas.hasActiveTool = true
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        if !isUsingTool {
-            deliverCompletedDrawing()
-        }
+        observeDrawing()
     }
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-        isUsingTool = false
-        deliverCompletedDrawing()
+        _ = captureBarrier()
+        canvas.hasActiveTool = false
+        applyPaletteGate()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -365,6 +405,9 @@ private final class PaperBackgroundView: UIView {
 private final class NotebookCanvasView: PKCanvasView {
     // Keep the native tool's requested mode across temporary input pauses.
     private var requestedDrawingEnabled = true
+    var hasActiveTool = false {
+        didSet { applyDrawingAdmission() }
+    }
     var permitsMutation = true {
         didSet {
             guard oldValue != permitsMutation else { return }
@@ -381,7 +424,7 @@ private final class NotebookCanvasView: PKCanvasView {
     }
 
     private func applyDrawingAdmission() {
-        let enabled = permitsMutation && requestedDrawingEnabled
+        let enabled = (permitsMutation || hasActiveTool) && requestedDrawingEnabled
         super.isDrawingEnabled = enabled
         drawingGestureRecognizer.isEnabled = enabled
     }
