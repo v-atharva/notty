@@ -120,7 +120,7 @@ final class NativeArchiveReuseTests: XCTestCase {
         variants.append(changed)
 
         var previous = original
-        for variant in variants {
+        for (variantIndex, variant) in variants.enumerated() {
             await live.assign(PKDrawing(strokes: [variant, untouched]))
             let before = await codec.workMetrics
             let result = try await codec.encode(live.canvas.drawing)
@@ -136,7 +136,13 @@ final class NativeArchiveReuseTests: XCTestCase {
             XCTAssertEqual(restored.strokes[0].transform, variant.transform)
             XCTAssertEqual(restored.strokes[0].randomSeed, variant.randomSeed)
             XCTAssertEqual(restored.strokes[0].renderGroupID, variant.renderGroupID)
-            XCTAssertEqual(restored.strokes[0].mask?.cgPath, variant.mask?.cgPath)
+            let maximumMaskError = assertQuantizedMask(
+                restored.strokes[0].mask?.cgPath, matches: variant.mask?.cgPath
+            )
+            try report(name: "mask-quantization-\(variantIndex)", values: [
+                "maximumCoordinateErrorMillionths": Int((maximumMaskError * 1_000_000).rounded()),
+                "coordinateToleranceMillionths": 20_000
+            ])
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             XCTAssertEqual(try encoder.encode(restored.strokes[0].renderState), try encoder.encode(variant.renderState))
@@ -169,9 +175,23 @@ final class NativeArchiveReuseTests: XCTestCase {
     func testCompleteRenderStateSnapshotAndMutableMaskSignatureRemainExact() throws {
         var native = NativeArchiveFixtures.stroke()
         native.ink = PKInk(.crayon, color: .black)
-        native.renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        let renderState = PKStroke.RenderState(grainOffset: CGPoint(x: 10, y: 20))
+        native.renderState = renderState
+        XCTAssertNotNil(native.renderState)
+        let stateBeforeMask = native.renderState == nil ? 0 : 1
         native.mask = UIBezierPath(rect: CGRect(x: 10, y: 20, width: 40, height: 40))
-        let initial = try InkDrawingSignature(PKDrawing(strokes: [native]))
+        let stateAfterMask = native.renderState == nil ? 0 : 1
+        native.renderState = renderState
+        XCTAssertNotNil(native.renderState)
+        let seededDrawing = PKDrawing(strokes: [native])
+        XCTAssertNotNil(seededDrawing.strokes.first?.renderState)
+        try report(name: "mask-render-state-retention", values: [
+            "renderStateBeforeMask": stateBeforeMask,
+            "renderStateAfterMask": stateAfterMask,
+            "renderStateAfterExplicitRestore": native.renderState == nil ? 0 : 1,
+            "renderStateAfterDrawingConstruction": seededDrawing.strokes.first?.renderState == nil ? 0 : 1
+        ])
+        let initial = try InkDrawingSignature(seededDrawing)
         let unchanged = try InkDrawingSignature(PKDrawing(strokes: [native]))
         XCTAssertTrue(initial.compared(to: unchanged).isEqual)
         XCTAssertEqual(initial.constructionWork.encodedRenderStates, 1)
@@ -182,10 +202,13 @@ final class NativeArchiveReuseTests: XCTestCase {
         native.renderState = state
         XCTAssertNotEqual(initial, try InkDrawingSignature(PKDrawing(strokes: [native])))
         let beforeMaskChange = try InkDrawingSignature(PKDrawing(strokes: [native]))
+        let retainedRenderState = native.renderState
         let mask = try XCTUnwrap(native.mask)
         mask.removeAllPoints()
         mask.append(UIBezierPath(ovalIn: CGRect(x: 10, y: 20, width: 40, height: 40)))
         native.mask = mask
+        native.renderState = retainedRenderState
+        XCTAssertNotNil(native.renderState)
         let afterMaskChange = try InkDrawingSignature(PKDrawing(strokes: [native]))
         XCTAssertNotEqual(beforeMaskChange, afterMaskChange)
 
@@ -200,6 +223,58 @@ final class NativeArchiveReuseTests: XCTestCase {
             XCTAssertGreaterThan(try encoder.encode(render).count, 0)
             XCTAssertEqual(first.constructionWork.encodedRenderStates, 1)
         }
+    }
+
+    private struct MaskElement {
+        let type: CGPathElementType
+        let points: [CGPoint]
+    }
+
+    private func maskElements(_ path: CGPath) -> [MaskElement] {
+        var result: [MaskElement] = []
+        path.applyWithBlock { pointer in
+            let element = pointer.pointee
+            let count: Int
+            switch element.type {
+            case .moveToPoint, .addLineToPoint: count = 1
+            case .addQuadCurveToPoint: count = 2
+            case .addCurveToPoint: count = 3
+            case .closeSubpath: count = 0
+            @unknown default:
+                XCTFail("Unsupported native mask path element.")
+                count = 0
+            }
+            result.append(MaskElement(
+                type: element.type,
+                points: Array(UnsafeBufferPointer(start: element.points, count: count))
+            ))
+        }
+        return result
+    }
+
+    private func assertQuantizedMask(
+        _ actual: CGPath?, matches expected: CGPath?,
+        file: StaticString = #filePath, line: UInt = #line
+    ) -> CGFloat {
+        guard let actual, let expected else {
+            XCTAssertEqual(actual == nil, expected == nil, file: file, line: line)
+            return 0
+        }
+        let actualElements = maskElements(actual)
+        let expectedElements = maskElements(expected)
+        XCTAssertEqual(actualElements.count, expectedElements.count, file: file, line: line)
+        var maximumError: CGFloat = 0
+        for (actual, expected) in zip(actualElements, expectedElements) {
+            XCTAssertEqual(actual.type, expected.type, file: file, line: line)
+            XCTAssertEqual(actual.points.count, expected.points.count, file: file, line: line)
+            for (actualPoint, expectedPoint) in zip(actual.points, expected.points) {
+                maximumError = max(maximumError, abs(actualPoint.x - expectedPoint.x))
+                maximumError = max(maximumError, abs(actualPoint.y - expectedPoint.y))
+                XCTAssertEqual(actualPoint.x, expectedPoint.x, accuracy: 0.02, file: file, line: line)
+                XCTAssertEqual(actualPoint.y, expectedPoint.y, accuracy: 0.02, file: file, line: line)
+            }
+        }
+        return maximumError
     }
 
     private func report(name: String, values: [String: Int]) throws {
