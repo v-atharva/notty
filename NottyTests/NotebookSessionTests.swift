@@ -32,6 +32,7 @@ final class NotebookSessionTests: XCTestCase {
         let pending = session.pendingEdits
         XCTAssertEqual(pending.count, 2)
         XCTAssertEqual(session.saveState, .failed(.contentLimit))
+        XCTAssertEqual(session.inputGate, .failed)
         XCTAssertFalse(session.canEdit)
         session.retrySave()
         await session.waitUntilSettled()
@@ -99,6 +100,7 @@ final class NotebookSessionTests: XCTestCase {
         await probe.setSuspendPreserve()
         let preserving = Task { await session.saveRecoveryCopy() }
         await probe.waitForPreserve()
+        XCTAssertEqual(session.inputGate, .recovering)
         session.recordCompletedEdit(PKDrawing(), ownerID: seed.ownerID)
         await probe.releasePreserve()
         await preserving.value
@@ -184,6 +186,44 @@ final class NotebookSessionTests: XCTestCase {
         XCTAssertFalse(session.canReopenSaved)
         await session.refreshRecoveryCopies()
         XCTAssertEqual(session.recoveryCopies.count, 1)
+    }
+
+
+    func testSessionCapacityReasonResumesWithoutLosingQueuedEdits() async throws {
+        let id = UUID()
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stored = try await NotebookTestFixtures.stored(id: id)
+        let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
+        await probe.setSuspendSave()
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let seed = session.makeCanvasSeed()
+        XCTAssertEqual(session.inputGate, .open)
+        XCTAssertEqual(session.inputGateForCanvas(ownerID: seed.ownerID), .open)
+        for _ in 0..<8 { session.extendPaper() }
+        await probe.waitForSave()
+        XCTAssertEqual(session.pendingEdits.count, 8)
+        XCTAssertEqual(session.inputGate, .capacity)
+        XCTAssertEqual(session.inputGateForCanvas(ownerID: seed.ownerID), .capacity)
+        XCTAssertEqual(session.inputGateForCanvas(ownerID: UUID()), .readOnly)
+        XCTAssertFalse(session.canEdit)
+        let pending = session.pendingEdits
+        let pages = session.pageCount
+        session.extendPaper()
+        XCTAssertEqual(session.pageCount, pages)
+        XCTAssertEqual(session.pendingEdits, pending)
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        XCTAssertTrue(session.pendingEdits.isEmpty)
+        XCTAssertEqual(session.inputGate, .open)
+        XCTAssertTrue(session.canEdit)
+        let saved = try await storage.load()
+        XCTAssertEqual(saved?.content.pageCount, pages)
+        XCTAssertEqual(saved?.content.editStamp, pending.last?.stamp)
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 8)
     }
 
 }

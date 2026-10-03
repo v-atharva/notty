@@ -70,10 +70,17 @@ final class NotebookSession: ObservableObject {
     var pendingEdits: [NotebookPendingEdit<NotebookDrawingSnapshot>] {
         coordinator?.pendingEdits ?? []
     }
-    var inputPaused: Bool { !canEdit }
-    var canEdit: Bool {
-        loadState == .ready && !isPerformingRecovery
-            && (coordinator?.canAcceptInput ?? false)
+    var inputGate: NotebookInputGate {
+        guard loadState == .ready else { return .failed }
+        if isPerformingRecovery { return .recovering }
+        guard let coordinator, coordinator.failure == nil else { return .failed }
+        return coordinator.canAcceptInput ? .open : .capacity
+    }
+    var inputPaused: Bool { !inputGate.allowsMutation }
+    var canEdit: Bool { inputGate.allowsMutation }
+
+    func inputGateForCanvas(ownerID: UUID) -> NotebookInputGate {
+        activeCanvasOwner == ownerID ? inputGate : .readOnly
     }
     var canPreserveRecovery: Bool {
         coordinator?.failure != nil && !pendingEdits.isEmpty && !isPerformingRecovery

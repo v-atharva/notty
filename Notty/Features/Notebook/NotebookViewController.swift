@@ -2,6 +2,17 @@ import NottyCore
 import PencilKit
 import UIKit
 
+enum NotebookInputGate: Sendable, Equatable {
+    case open
+    case capacity
+    case failed
+    case recovering
+    case readOnly
+
+    var allowsMutation: Bool { self == .open }
+    var keepsPalette: Bool { self == .open || self == .capacity }
+}
+
 @MainActor
 final class NotebookViewController: UIViewController {
     static let maximumPageCount = 12
@@ -10,17 +21,18 @@ final class NotebookViewController: UIViewController {
     private let logicalWidth: CGFloat = 794
     private let canvas = NotebookCanvasView()
     private let paper = PaperBackgroundView()
-    private let toolPicker = PKToolPicker()
+    private let toolPicker: PKToolPicker
 
-    var onCompletedEdit: ((PKDrawing) -> Bool)?
+    var onCompletedEdit: ((PKDrawing) -> NotebookInputGate)?
     var onDetach: (() -> Void)?
     var canvasView: PKCanvasView { canvas }
+    var drawingToolPicker: PKToolPicker { toolPicker }
     var currentDrawing: PKDrawing { canvas.drawing }
 
     private let initialDrawing: PKDrawing
     private var lastDeliveredDrawing: PKDrawing
     private var isUsingTool = false
-    private var editingEnabled = true
+    private(set) var inputGate = NotebookInputGate.open
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
@@ -30,7 +42,8 @@ final class NotebookViewController: UIViewController {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
     }
 
-    init(pageCount: Int, initialDrawing: PKDrawing) {
+    init(pageCount: Int, initialDrawing: PKDrawing, toolPicker: PKToolPicker? = nil) {
+        self.toolPicker = toolPicker ?? PKToolPicker()
         self.initialDrawing = initialDrawing
         self.lastDeliveredDrawing = initialDrawing
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
@@ -54,7 +67,7 @@ final class NotebookViewController: UIViewController {
 
         canvas.drawing = initialDrawing
         canvas.delegate = self
-        canvas.permitsMutation = editingEnabled
+        canvas.permitsMutation = inputGate.allowsMutation
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.drawingPolicy = .pencilOnly
@@ -134,8 +147,8 @@ final class NotebookViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         guard observesToolPicker else { return }
-        toolPicker.setVisible(editingEnabled, forFirstResponder: canvas)
-        if editingEnabled { canvas.becomeFirstResponder() }
+        toolPicker.setVisible(inputGate.keepsPalette, forFirstResponder: canvas)
+        if inputGate.keepsPalette { canvas.becomeFirstResponder() }
         updateInsets()
         updatePaperViewport()
     }
@@ -147,17 +160,23 @@ final class NotebookViewController: UIViewController {
     }
 
     func setEditingEnabled(_ enabled: Bool) {
-        editingEnabled = enabled
-        if isViewLoaded {
-            canvas.permitsMutation = enabled
-            toolPicker.setVisible(enabled && view.window != nil, forFirstResponder: canvas)
-            if enabled && view.window != nil {
-                canvas.becomeFirstResponder()
-            } else if !enabled {
-                canvas.resignFirstResponder()
-            }
-            updateInsets()
+        setInputGate(enabled ? .open : .readOnly)
+    }
+
+    func setInputGate(_ gate: NotebookInputGate) {
+        guard gate != inputGate else { return }
+        let previousGate = inputGate
+        inputGate = gate
+        guard isViewLoaded else { return }
+        canvas.permitsMutation = gate.allowsMutation
+        guard previousGate.keepsPalette != gate.keepsPalette else { return }
+        toolPicker.setVisible(gate.keepsPalette && view.window != nil, forFirstResponder: canvas)
+        if gate.keepsPalette && view.window != nil {
+            canvas.becomeFirstResponder()
+        } else if !gate.keepsPalette {
+            canvas.resignFirstResponder()
         }
+        updateInsets()
     }
 
     private func deliverCompletedDrawing() {
@@ -165,7 +184,7 @@ final class NotebookViewController: UIViewController {
         guard drawing != lastDeliveredDrawing else { return }
         lastDeliveredDrawing = drawing
         if let onCompletedEdit {
-            setEditingEnabled(onCompletedEdit(drawing))
+            setInputGate(onCompletedEdit(drawing))
         }
     }
 
@@ -344,11 +363,27 @@ private final class PaperBackgroundView: UIView {
 
 @MainActor
 private final class NotebookCanvasView: PKCanvasView {
+    // Keep the native tool's requested mode across temporary input pauses.
+    private var requestedDrawingEnabled = true
     var permitsMutation = true {
         didSet {
-            isDrawingEnabled = permitsMutation
-            drawingGestureRecognizer.isEnabled = permitsMutation
+            guard oldValue != permitsMutation else { return }
+            applyDrawingAdmission()
         }
+    }
+
+    override var isDrawingEnabled: Bool {
+        get { super.isDrawingEnabled }
+        set {
+            requestedDrawingEnabled = newValue
+            applyDrawingAdmission()
+        }
+    }
+
+    private func applyDrawingAdmission() {
+        let enabled = permitsMutation && requestedDrawingEnabled
+        super.isDrawingEnabled = enabled
+        drawingGestureRecognizer.isEnabled = enabled
     }
 
     override func paste(_ sender: Any?) {

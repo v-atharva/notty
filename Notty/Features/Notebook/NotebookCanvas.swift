@@ -10,7 +10,9 @@ struct NotebookCanvas: UIViewControllerRepresentable {
             pageCount: seed.pageCount, initialDrawing: seed.drawing
         )
         controller.onCompletedEdit = { [weak session] drawing in
-            session?.recordCompletedEdit(drawing, ownerID: seed.ownerID) ?? false
+            guard let session else { return .readOnly }
+            session.recordCompletedEdit(drawing, ownerID: seed.ownerID)
+            return session.inputGateForCanvas(ownerID: seed.ownerID)
         }
         session.attachCanvas(ownerID: seed.ownerID) { [weak controller] in
             controller?.currentDrawing
@@ -18,13 +20,14 @@ struct NotebookCanvas: UIViewControllerRepresentable {
         controller.onDetach = { [weak session] in
             session?.detachCanvas(ownerID: seed.ownerID)
         }
-        controller.setEditingEnabled(session.canEdit)
+        controller.setInputGate(session.inputGate)
         return controller
     }
 
     func updateUIViewController(_ controller: NotebookViewController, context: Context) {
         controller.setPageCount(session.pageCount)
-        controller.setEditingEnabled(session.canEdit)
+        let gate = session.inputGate
+        if controller.inputGate != gate { controller.setInputGate(gate) }
     }
 
     static func dismantleUIViewController(
