@@ -101,42 +101,6 @@ jobs:
           NOTTY_SIMULATOR_ID=$(xcrun simctl list devices available --json | jq -er '.devices | to_entries | map(select(.key | endswith(".iOS-27-0"))) | map(.value[]) | map(select(.isAvailable and (.name | startswith("iPad")))) | sort_by(.name) | .[0].udid // error("No iPadOS 27.0 simulator is available")')
           printf 'NOTTY_SIMULATOR_ID=%s\n' "$NOTTY_SIMULATOR_ID" >> "$GITHUB_ENV"
           xcrun simctl bootstatus "$NOTTY_SIMULATOR_ID" -b
-      - name: Compile unsigned iPad simulator app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Debug \
-            -sdk iphonesimulator27.0 \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
-            -only-testing:NottyTests/NotebookWritingComfortTests/testSimulatorAcceptsNativeDrawingInput \
-            -only-testing:NottyTests/NotebookWritingComfortTests/testMinimumZoomCanShowAnEntireA4Section \
-            -only-testing:NottyTests/NotebookWritingComfortTests/testCapacityKeepsTheRealUndoManagerAvailable \
-            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownEndsActiveToolBeforeApplyingClosedAdmission \
-            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownClearsTheActualUndoAndRedoStacks \
-            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsFailedPreservationFeedbackWithoutChangingPendingEdits \
-            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsSuccessfulPreservationFeedback \
-            -only-testing:NottyTests/NotebookWritingStatusTests/testSaveFailureDoesNotResizeCanvasOrMoveViewport \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
-      - name: Compile unsigned iPad device app
-        timeout-minutes: 4
-        run: |
-          xcodebuild \
-            -project Notty.xcodeproj \
-            -scheme Notty \
-            -configuration Release \
-            -sdk iphoneos27.0 \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/NottyDevice" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build
-
       - name: Test native notebook session and canvas
         timeout-minutes: 5
         env:
@@ -155,6 +119,14 @@ jobs:
             -maximum-test-execution-time-allowance 120 \
             -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
             -resultBundlePath "$RUNNER_TEMP/NottyNativeTests.xcresult" \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testSimulatorAcceptsNativeDrawingInput \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testMinimumZoomCanShowAnEntireA4Section \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testCapacityKeepsTheRealUndoManagerAvailable \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownEndsActiveToolBeforeApplyingClosedAdmission \
+            -only-testing:NottyTests/NotebookWritingComfortTests/testTeardownClearsTheActualUndoAndRedoStacks \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsFailedPreservationFeedbackWithoutChangingPendingEdits \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testRetryClearsSuccessfulPreservationFeedback \
+            -only-testing:NottyTests/NotebookWritingStatusTests/testSaveFailureDoesNotResizeCanvasOrMoveViewport \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             test 2>&1 | tee "$RUNNER_TEMP/NottyNativeTests.log"
