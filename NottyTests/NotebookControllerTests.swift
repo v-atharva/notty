@@ -58,4 +58,30 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(controller.currentDrawing.strokes[0].path.creationDate, drawing.strokes[0].path.creationDate)
         controller.tearDown()
     }
+    func testCapacityPauseKeepsFirstResponderAndInsets() {
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
+        let window: UIWindow
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            window = UIWindow(windowScene: scene)
+        } else {
+            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
+        }
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+        controller.setEditingEnabled(true)
+        let canvas = controller.canvasView
+        let firstBefore = canvas.isFirstResponder
+        XCTAssertTrue(firstBefore)
+        let insetsBefore = canvas.contentInset
+        controller.setEditingEnabled(false)
+        let firstPaused = canvas.isFirstResponder
+        let insetsPaused = canvas.contentInset
+        controller.setEditingEnabled(true)
+        XCTAssertEqual(firstPaused, firstBefore, "N1: a pause resigns first responder, hiding the tool picker")
+        XCTAssertEqual(insetsPaused, insetsBefore, "N1: a pause changes content insets")
+        controller.tearDown()
+        window.isHidden = true
+    }
 }
