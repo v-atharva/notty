@@ -250,7 +250,6 @@ public actor NotebookRepository {
     public func history(
         id: UUID, beforeRevisionID: UUID? = nil, limit: Int = 50
     ) throws -> [NotebookRevisionSummary] {
-        validatedGenerations.removeValue(forKey: id)
         guard (1...200).contains(limit) else {
             throw NotebookRepositoryError.invalidContent("History limits must be between 1 and 200.")
         }
@@ -270,7 +269,6 @@ public actor NotebookRepository {
     }
 
     public func loadRevision(id: UUID, revisionID: UUID) throws -> StoredNotebook {
-        validatedGenerations.removeValue(forKey: id)
         do {
             let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
             defer { NotebookFileSystem.releaseWriterLock(lock) }
@@ -659,6 +657,11 @@ public actor NotebookRepository {
         let history = historyStore(id: id, directory: directory)
         guard let snapshot = try history.readHeadSnapshot() else {
             throw NotebookRepositoryError.recoveryRequired
+        }
+        if let cached = validatedGenerations[id] {
+            if cached.snapshot != snapshot { invalidateValidation(id) }
+        } else if let cached = metadataGenerations[id], cached.snapshot != snapshot {
+            invalidateValidation(id)
         }
         return (history, snapshot)
     }

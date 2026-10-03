@@ -450,6 +450,86 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
     }
 
+    func testSuccessfulHistoryBrowsingRetainsSameHeadWarmSaveReceipt() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try NotebookRepository(rootURL: root)
+        let id = UUID()
+        let drawing = content([trustedStroke(1), trustedStroke(2)])
+        var latest = try await repository.save(id: id, content: drawing, expectedRevisionID: nil)
+        for _ in 0..<2 {
+            let summaries = try await repository.history(id: id, limit: 1)
+            XCTAssertEqual(summaries.map(\.revisionID), [latest.revisionID])
+            let before = await repository.storageMetrics()
+            latest = try await repository.save(id: id, content: drawing, expectedRevisionID: latest.revisionID)
+            let after = await repository.storageMetrics()
+            XCTAssertEqual(after.assetReadCalls, before.assetReadCalls)
+            XCTAssertEqual(after.assetReadBytes, before.assetReadBytes)
+            XCTAssertEqual(after.assetHashBytes, before.assetHashBytes)
+            XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
+        }
+    }
+
+    func testSuccessfulHistoricalTargetLoadingRetainsCurrentWarmSaveReceipt() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try NotebookRepository(rootURL: root)
+        let id = UUID()
+        let archive = trustedStroke(1)
+        let first = try await repository.save(id: id, content: content([archive]), expectedRevisionID: nil)
+        let drawing = content([archive, trustedStroke(2)])
+        let second = try await repository.save(id: id, content: drawing, expectedRevisionID: first.revisionID)
+        let historical = try await repository.loadRevision(id: id, revisionID: first.revisionID)
+        XCTAssertEqual(historical.content, first.content)
+        XCTAssertEqual(historical.sequence, first.sequence)
+        let before = await repository.storageMetrics()
+        let saved = try await repository.save(id: id, content: drawing, expectedRevisionID: second.revisionID)
+        let after = await repository.storageMetrics()
+        XCTAssertEqual(saved.sequence, 3)
+        XCTAssertEqual(after.assetReadCalls, before.assetReadCalls)
+        XCTAssertEqual(after.assetReadBytes, before.assetReadBytes)
+        XCTAssertEqual(after.assetHashBytes, before.assetHashBytes)
+        XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
+    }
+
+    func testObservedForeignHistoryHeadDiscardsReceiptsEvenWhenOriginalHeadReturns() async throws {
+        for targetLoad in [false, true] {
+            let root = try makeRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let repository = try NotebookRepository(rootURL: root)
+            let id = UUID()
+            let archive = trustedStroke(1)
+            let drawing = content([archive])
+            let first = try await repository.save(id: id, content: drawing, expectedRevisionID: nil)
+            let headURL = notebook(root, id).appendingPathComponent("HEAD.json")
+            let originalHead = try Data(contentsOf: headURL)
+            let foreign = try await NotebookRepository(rootURL: root).save(
+                id: id, content: content([archive], title: "Foreign"), expectedRevisionID: first.revisionID
+            )
+            if targetLoad {
+                let selected = try await repository.loadRevision(id: id, revisionID: first.revisionID)
+                XCTAssertEqual(selected.content, first.content)
+            } else {
+                let summaries = try await repository.history(id: id, limit: 1)
+                XCTAssertEqual(summaries.map(\.revisionID), [foreign.revisionID])
+            }
+            try originalHead.write(to: headURL)
+            let before = await repository.storageMetrics()
+            let saved = try await repository.save(id: id, content: drawing, expectedRevisionID: first.revisionID)
+            let after = await repository.storageMetrics()
+            XCTAssertEqual(saved.sequence, 2)
+            XCTAssertEqual(after.assetReadCalls - before.assetReadCalls, 1)
+            XCTAssertEqual(after.assetReadBytes - before.assetReadBytes, archive.data.count)
+            XCTAssertEqual(after.assetHashBytes - before.assetHashBytes, archive.data.count)
+            let currentValue = try await repository.load(id: id)
+            let current = try XCTUnwrap(currentValue)
+            XCTAssertEqual(current.revisionID, saved.revisionID)
+            XCTAssertEqual(current.content, drawing)
+            let summaries = try await repository.history(id: id)
+            XCTAssertEqual(summaries.map(\.revisionID), [saved.revisionID, first.revisionID])
+        }
+    }
+
     func testFailedCurrentOpenDiscardsPriorGenerationBeforeCandidateFreeSave() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
