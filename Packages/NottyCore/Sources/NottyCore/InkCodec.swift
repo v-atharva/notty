@@ -8,6 +8,13 @@ import UIKit
 import AppKit
 #endif
 
+public enum InkComparisonMode: Sendable, Equatable {
+    /// Uses native immutable path IDs; reusing an ID for different points is unsupported by PencilKit.
+    case native
+    /// Compares every public point field when complete native signatures are available.
+    case exact
+}
+
 @available(iOS 27.0, macOS 27.0, *)
 public actor InkCodec {
     public enum CodecError: Error, Sendable {
@@ -45,13 +52,14 @@ public actor InkCodec {
     static let maximumRetiredBytes = 8 * 1_024 * 1_024
     public var serializedStrokeCount: Int { workMetrics.serializedStrokes }
 
+    private let comparisonMode: InkComparisonMode
     private let strokeLimit: Int
     private let byteLimit: Int
     private let retiredCountLimit: Int
     private let retiredByteLimit: Int
     private let forceRenderStateEncodingFallback: Bool
     private let forceNativeDrawingEqualityFallback: Bool
-    private(set) var workMetrics = WorkMetrics()
+    public private(set) var workMetrics = WorkMetrics()
     var cachedStrokeCount: Int { cache.count }
     var retiredStrokeCount: Int { retired.count }
     var retiredArchiveBytes: Int { retiredBytes }
@@ -138,7 +146,9 @@ public actor InkCodec {
             if requiresFallback { work.uncacheableStrokeSignatures += 1 }
         }
 
-        func matches(_ other: Self, work: inout WorkMetrics) -> Bool {
+        func matches(
+            _ other: Self, work: inout WorkMetrics, comparisonMode: InkComparisonMode
+        ) -> Bool {
             work.signatureChecks += 1
             guard !requiresNativeDrawingFallback, !other.requiresNativeDrawingFallback else {
                 return false
@@ -159,6 +169,7 @@ public actor InkCodec {
                 work.comparedMaskPaths += 1
             }
             guard mask == other.mask else { return false }
+            if comparisonMode == .native { return true }
             for (first, second) in zip(path, other.path) {
                 work.comparedPoints += 1
                 guard first.location == second.location,
@@ -183,7 +194,8 @@ public actor InkCodec {
     private var retiredOrder: [UUID] = []
     private var retiredBytes = 0
 
-    public init() {
+    public init(comparisonMode: InkComparisonMode = .native) {
+        self.comparisonMode = comparisonMode
         strokeLimit = Self.maximumStrokeCount
         byteLimit = Self.maximumDrawingBytes
         retiredCountLimit = Self.maximumRetiredStrokeCount
@@ -195,6 +207,7 @@ public actor InkCodec {
     init(
         maximumStrokeCount: Int,
         maximumDrawingBytes: Int,
+        comparisonMode: InkComparisonMode = .native,
         maximumRetiredStrokeCount: Int = InkCodec.maximumRetiredStrokeCount,
         maximumRetiredBytes: Int = InkCodec.maximumRetiredBytes,
         forceRenderStateEncodingFallback: Bool = false,
@@ -202,6 +215,7 @@ public actor InkCodec {
     ) {
         precondition(maximumStrokeCount >= 0 && maximumDrawingBytes >= 0)
         precondition(maximumRetiredStrokeCount >= 0 && maximumRetiredBytes >= 0)
+        self.comparisonMode = comparisonMode
         strokeLimit = maximumStrokeCount
         byteLimit = maximumDrawingBytes
         retiredCountLimit = maximumRetiredStrokeCount
@@ -234,7 +248,9 @@ public actor InkCodec {
             )
             let asset: NotebookStroke
             if let existing = cache[stroke.id] ?? retired[stroke.id],
-               existing.signature.matches(signature, work: &workMetrics) {
+               existing.signature.matches(
+                   signature, work: &workMetrics, comparisonMode: comparisonMode
+               ) {
                 asset = existing.asset
             } else {
                 let archive = PKDrawing(strokes: [stroke]).dataRepresentation()
@@ -353,20 +369,24 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
         let stroke: InkCodec.StrokeSignature
     }
 
+    private let comparisonMode: InkComparisonMode
     private let entries: [Entry]
     private let nativeDrawingFallback: PKDrawing?
     private let captureID = UUID()
     public let constructionWork: InkCodec.WorkMetrics
 
-    public init(_ drawing: PKDrawing) throws {
+    public init(
+        _ drawing: PKDrawing, comparisonMode: InkComparisonMode = .native
+    ) throws {
         try self.init(
-            drawing, forceRenderStateEncodingFallback: false,
+            drawing, comparisonMode: comparisonMode, forceRenderStateEncodingFallback: false,
             forceNativeDrawingEqualityFallback: false
         )
     }
 
     init(
-        _ drawing: PKDrawing, forceRenderStateEncodingFallback: Bool,
+        _ drawing: PKDrawing, comparisonMode: InkComparisonMode = .native,
+        forceRenderStateEncodingFallback: Bool,
         forceNativeDrawingEqualityFallback: Bool = false
     ) throws {
         var work = InkCodec.WorkMetrics()
@@ -380,6 +400,7 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
             )
             entries.append(Entry(id: stroke.id, stroke: signature))
         }
+        self.comparisonMode = comparisonMode
         self.entries = entries
         if entries.contains(where: { $0.stroke.requiresNativeDrawingFallback }) {
             nativeDrawingFallback = drawing
@@ -398,6 +419,7 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
         guard entries.count == other.entries.count else {
             return Comparison(isEqual: false, work: work)
         }
+        // Unsupported signature state retains the SDK's original drawing comparison.
         if nativeDrawingFallback != nil || other.nativeDrawingFallback != nil {
             for (first, second) in zip(entries, other.entries) {
                 work.signatureChecks += 1
@@ -413,7 +435,11 @@ public struct InkDrawingSignature: @unchecked Sendable, Equatable {
         }
         for (first, second) in zip(entries, other.entries) {
             guard first.id == second.id,
-                  first.stroke.matches(second.stroke, work: &work) else {
+                  first.stroke.matches(
+                      second.stroke, work: &work,
+                      comparisonMode: comparisonMode == .exact || other.comparisonMode == .exact
+                          ? .exact : .native
+                  ) else {
                 return Comparison(isEqual: false, work: work)
             }
         }
