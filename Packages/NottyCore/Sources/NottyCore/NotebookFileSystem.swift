@@ -7,6 +7,9 @@ enum NotebookFileSystem {
         case notebook
         case assets
         case revisions
+        case historyGeneration
+        case events
+        case checkpoints
         case privateTransaction
     }
 
@@ -179,17 +182,21 @@ enum NotebookFileSystem {
     static func sweepPrivateTransactions(
         in root: URL,
         prefix: String,
+        additionalPrefixes: [String] = [],
         observer: MaintenanceObserver? = nil
     ) throws {
-        guard prefix == ".creation-" || prefix == ".recovery-" else {
+        let prefixes = [prefix] + additionalPrefixes
+        guard prefixes.allSatisfy({ [".creation-", ".recovery-", ".migration-"].contains($0) }) else {
             throw NotebookRepositoryError.unsafePath("Unknown storage transaction namespace.")
         }
         var removed = 0
         try visitChildren(
             in: root, limit: 2_048, location: .library, observer: observer
         ) { entry in
-            guard isTransactionName(entry.lastPathComponent, prefix: prefix) else { return true }
-            try removePrivateTransaction(entry, prefix: prefix, observer: observer)
+            guard let owner = prefixes.first(where: {
+                isTransactionName(entry.lastPathComponent, prefix: $0)
+            }) else { return true }
+            try removePrivateTransaction(entry, prefix: owner, observer: observer)
             removed += 1
             if removed == 16 { observer?(.limitReached) }
             return removed < 16
@@ -240,13 +247,14 @@ enum NotebookFileSystem {
 
     static func sweepNotebookStages(
         in directory: URL,
-        observer: MaintenanceObserver? = nil
+        observer: MaintenanceObserver? = nil,
+        additionalLocations: [(URL, MaintenanceLocation)] = []
     ) throws {
         let locations: [(URL, MaintenanceLocation)] = [
             (directory, .notebook),
             (directory.appendingPathComponent("assets", isDirectory: true), .assets),
             (directory.appendingPathComponent("revisions", isDirectory: true), .revisions)
-        ]
+        ] + additionalLocations
         var removed = 0
         for (location, role) in locations {
             guard try existingDirectory(location) else { continue }

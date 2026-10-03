@@ -100,3 +100,67 @@ public enum NotebookWriteStage: Sendable, Equatable, CaseIterable {
     case beforeHeadPublication
     case beforeNotebookPublication
 }
+
+public struct NotebookRevisionSummary: Sendable, Equatable {
+    public let notebookID: UUID
+    public let revisionID: UUID
+    public let sequence: Int
+    public let title: String
+    public let pageCount: Int
+    public let strokeCount: Int
+    public let editStamp: NotebookEditStamp?
+    public let savedAt: Date
+
+    public init(
+        notebookID: UUID, revisionID: UUID, sequence: Int, title: String,
+        pageCount: Int, strokeCount: Int, editStamp: NotebookEditStamp?, savedAt: Date
+    ) {
+        self.notebookID = notebookID
+        self.revisionID = revisionID
+        self.sequence = sequence
+        self.title = title
+        self.pageCount = pageCount
+        self.strokeCount = strokeCount
+        self.editStamp = editStamp
+        self.savedAt = savedAt
+    }
+}
+
+public struct NotebookHistoryAudit: Sendable, Equatable {
+    public let notebookID: UUID
+    public let headRevisionID: UUID
+    public let revisionCount: Int
+    public let verifiedAssetCount: Int
+
+    public init(notebookID: UUID, headRevisionID: UUID, revisionCount: Int, verifiedAssetCount: Int) {
+        self.notebookID = notebookID
+        self.headRevisionID = headRevisionID
+        self.revisionCount = revisionCount
+        self.verifiedAssetCount = verifiedAssetCount
+    }
+}
+
+public struct NotebookMigrationReceipt: Codable, Sendable, Equatable {
+    public let notebookID: UUID
+    public let revisionID: UUID
+    public let generationID: UUID
+    public let revisionCount: Int
+
+    public init(notebookID: UUID, revisionID: UUID, generationID: UUID, revisionCount: Int) {
+        self.notebookID = notebookID
+        self.revisionID = revisionID
+        self.generationID = generationID
+        self.revisionCount = revisionCount
+    }
+}
+
+public enum NotebookMigrationStage: Sendable, Equatable, CaseIterable {
+    case legacyHeadPreserved
+    case eventPublished
+    case checkpointPublished
+    case generationValidated
+    case beforeGenerationPublication
+    case generationPublished
+    case headStaged
+    case beforeHeadPublication
+}
