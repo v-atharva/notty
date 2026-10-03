@@ -68,6 +68,7 @@ public enum NotebookRepositoryError: Error, Sendable, Equatable, LocalizedError 
     case corruptData(String)
     case unsupportedVersion(Int)
     case revisionConflict
+    case recoveryRequired
     case unsafePath(String)
     case sizeLimitExceeded(String)
     case ioFailure(Int32)
@@ -81,6 +82,8 @@ public enum NotebookRepositoryError: Error, Sendable, Equatable, LocalizedError 
             "Unsupported notebook format version: \(version)."
         case .revisionConflict:
             "The notebook changed since it was loaded."
+        case .recoveryRequired:
+            "The notebook needs recovery before it can be opened."
         case .ioFailure(let code):
             "Notebook storage failed with system error \(code)."
         }
@@ -95,4 +98,5 @@ public enum NotebookWriteStage: Sendable, Equatable, CaseIterable {
     case revisionPublished
     case headStaged
     case beforeHeadPublication
+    case beforeNotebookPublication
 }
