@@ -826,11 +826,7 @@ final class NotebookRepositoryTests: XCTestCase {
         let child = stray.appendingPathComponent("retained")
         try Data("directory contents".utf8).write(to: child)
         let before = try fileSnapshot(root: directory)
-        let counter = NotebookMaintenanceCounter()
-        let reader = try NotebookRepository(
-            rootURL: root, maintenanceObserver: { counter.record($0) }
-        )
-        counter.reset()
+        let reader = try NotebookRepository(rootURL: root)
 
         let loaded = try await requiredNotebook(reader, id: id)
 
@@ -842,7 +838,10 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(try fileSnapshot(root: directory), before)
         XCTAssertEqual(try NotebookFileSystem.kind(stray), .directory)
         XCTAssertEqual(try Data(contentsOf: child), Data("directory contents".utf8))
-        XCTAssertEqual(counter.count(.skippedNonRegularStage), 1)
+        let report = await reader.maintenanceReport()
+        XCTAssertEqual(report[.skippedNonRegularStage], 1)
+        XCTAssertEqual(report[.directoryEnumeration(.library)], 1)
+        XCTAssertNil(report[.failed(.io)])
     }
 
     func testSecondConsecutiveCleanSavePerformsNoMaintenanceEnumeration() async throws {
@@ -1015,6 +1014,8 @@ final class NotebookRepositoryTests: XCTestCase {
             expectedRevisionID: baseline.revisionID
         )
         XCTAssertEqual(counter.count(.failed(.io)), 2)
+        let failedReport = await repository.maintenanceReport()
+        XCTAssertEqual(failedReport[.failed(.io)], 2)
         XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
         counter.reset()
         let second = try await repository.save(
@@ -1025,6 +1026,9 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
         XCTAssertEqual(counter.enumerationCount, 3)
         XCTAssertEqual(counter.count(.removedStage), 1)
+        let recoveredReport = await repository.maintenanceReport()
+        XCTAssertEqual(recoveredReport[.failed(.io)], 2)
+        XCTAssertEqual(recoveredReport[.removedStage], 1)
         counter.reset()
         let third = try await repository.save(
             id: id, content: content(title: "Clean again", strokes: [stroke]),
@@ -1102,6 +1106,18 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(counter.count(.limitReached), 1)
         XCTAssertEqual(stages.filter { FileManager.default.fileExists(atPath: $0.path) }.count, 1)
         XCTAssertEqual(try Data(contentsOf: revision), historyBytes)
+    }
+
+    func testMaintenanceDiagnosticsAggregateRepeatedEventsWithoutGrowingTheReport() {
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        for _ in 0..<10_000 {
+            diagnostics.record(.skippedNonRegularStage)
+            diagnostics.record(.failed(.io))
+        }
+        let report = diagnostics.snapshot()
+        XCTAssertEqual(report.count, 2)
+        XCTAssertEqual(report[.skippedNonRegularStage], 10_000)
+        XCTAssertEqual(report[.failed(.io)], 10_000)
     }
 
     private func digest(_ data: Data) -> String {

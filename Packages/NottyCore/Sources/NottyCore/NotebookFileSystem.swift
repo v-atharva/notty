@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 enum NotebookFileSystem {
-    enum MaintenanceLocation: Sendable, Equatable {
+    enum MaintenanceLocation: Sendable, Hashable {
         case library
         case notebook
         case assets
@@ -10,14 +10,14 @@ enum NotebookFileSystem {
         case privateTransaction
     }
 
-    enum MaintenanceFailure: Sendable, Equatable {
+    enum MaintenanceFailure: Sendable, Hashable {
         case unsafePath
         case sizeLimit
         case io
         case unexpected
     }
 
-    enum MaintenanceEvent: Sendable, Equatable {
+    enum MaintenanceEvent: Sendable, Hashable {
         case directoryEnumeration(MaintenanceLocation)
         case skippedNonRegularStage
         case removedStage
@@ -26,6 +26,25 @@ enum NotebookFileSystem {
     }
 
     typealias MaintenanceObserver = @Sendable (MaintenanceEvent) -> Void
+
+    // Finite event cases bound the report; saturating counters avoid overflow.
+    final class MaintenanceDiagnostics: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: [MaintenanceEvent: Int] = [:]
+
+        func record(_ event: MaintenanceEvent) {
+            lock.lock()
+            defer { lock.unlock() }
+            let previous = counts[event, default: 0]
+            if previous < Int.max { counts[event] = previous + 1 }
+        }
+
+        func snapshot() -> [MaintenanceEvent: Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return counts
+        }
+    }
 
     enum ItemKind: Equatable {
         case directory

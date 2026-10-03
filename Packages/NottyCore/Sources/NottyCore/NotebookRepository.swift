@@ -16,16 +16,20 @@ public actor NotebookRepository {
     private let rootURL: URL
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
     private let assetVerificationObserver: (@Sendable (String) -> Void)?
-    private let maintenanceObserver: NotebookFileSystem.MaintenanceObserver?
+    private let maintenanceObserver: NotebookFileSystem.MaintenanceObserver
+    private let maintenanceDiagnostics: NotebookFileSystem.MaintenanceDiagnostics
     private let maintenanceFaultInjector: (@Sendable () throws -> Void)?
     private var maintainedNotebookIDs = Set<UUID>()
     private var privateMaintenanceRequired = false
 
     public init(rootURL: URL) throws {
-        self.rootURL = try Self.prepareRoot(rootURL)
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        let observer = Self.makeMaintenanceObserver(diagnostics: diagnostics)
+        self.rootURL = try Self.prepareRoot(rootURL, observer: observer)
+        self.maintenanceDiagnostics = diagnostics
         self.faultInjector = nil
         self.assetVerificationObserver = nil
-        self.maintenanceObserver = nil
+        self.maintenanceObserver = observer
         self.maintenanceFaultInjector = nil
     }
 
@@ -34,10 +38,13 @@ public actor NotebookRepository {
         rootURL: URL,
         faultInjector: @escaping @Sendable (NotebookWriteStage) throws -> Void
     ) throws {
-        self.rootURL = try Self.prepareRoot(rootURL)
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        let observer = Self.makeMaintenanceObserver(diagnostics: diagnostics)
+        self.rootURL = try Self.prepareRoot(rootURL, observer: observer)
+        self.maintenanceDiagnostics = diagnostics
         self.faultInjector = faultInjector
         self.assetVerificationObserver = nil
-        self.maintenanceObserver = nil
+        self.maintenanceObserver = observer
         self.maintenanceFaultInjector = nil
     }
 
@@ -45,10 +52,13 @@ public actor NotebookRepository {
         rootURL: URL,
         assetVerificationObserver: @escaping @Sendable (String) -> Void
     ) throws {
-        self.rootURL = try Self.prepareRoot(rootURL)
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        let observer = Self.makeMaintenanceObserver(diagnostics: diagnostics)
+        self.rootURL = try Self.prepareRoot(rootURL, observer: observer)
+        self.maintenanceDiagnostics = diagnostics
         self.faultInjector = nil
         self.assetVerificationObserver = assetVerificationObserver
-        self.maintenanceObserver = nil
+        self.maintenanceObserver = observer
         self.maintenanceFaultInjector = nil
     }
 
@@ -58,11 +68,30 @@ public actor NotebookRepository {
         maintenanceObserver: @escaping NotebookFileSystem.MaintenanceObserver,
         maintenanceFaultInjector: (@Sendable () throws -> Void)? = nil
     ) throws {
-        self.rootURL = try Self.prepareRoot(rootURL, observer: maintenanceObserver)
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        let observer = Self.makeMaintenanceObserver(
+            diagnostics: diagnostics, observer: maintenanceObserver
+        )
+        self.rootURL = try Self.prepareRoot(rootURL, observer: observer)
+        self.maintenanceDiagnostics = diagnostics
         self.faultInjector = faultInjector
         self.assetVerificationObserver = nil
-        self.maintenanceObserver = maintenanceObserver
+        self.maintenanceObserver = observer
         self.maintenanceFaultInjector = maintenanceFaultInjector
+    }
+
+    func maintenanceReport() -> [NotebookFileSystem.MaintenanceEvent: Int] {
+        maintenanceDiagnostics.snapshot()
+    }
+
+    private static func makeMaintenanceObserver(
+        diagnostics: NotebookFileSystem.MaintenanceDiagnostics,
+        observer: NotebookFileSystem.MaintenanceObserver? = nil
+    ) -> NotebookFileSystem.MaintenanceObserver {
+        { event in
+            diagnostics.record(event)
+            observer?(event)
+        }
     }
 
     private static func prepareRoot(
@@ -149,7 +178,7 @@ public actor NotebookRepository {
                         directory, prefix: ".creation-", observer: maintenanceObserver
                     )
                 } catch {
-                    maintenanceObserver?(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
+                    maintenanceObserver(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
                 }
             }
         }
@@ -247,7 +276,7 @@ public actor NotebookRepository {
         return storedNotebook(revision: revision, strokes: content.strokes)
     }
 
-    // Maintenance admission is per notebook; failed passes remain eligible for retry.
+    // Only successful maintenance consumes admission; publication alone does not.
     private func maintainNotebook(id: UUID, directory: URL) {
         guard !maintainedNotebookIDs.contains(id) else { return }
         do {
@@ -257,7 +286,7 @@ public actor NotebookRepository {
             )
             maintainedNotebookIDs.insert(id)
         } catch {
-            maintenanceObserver?(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
+            maintenanceObserver(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
         }
     }
 
