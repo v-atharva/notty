@@ -135,8 +135,8 @@ actor NotebookStorageProbe {
         await withCheckedContinuation { saveWaiters.append($0) }
     }
 
-    func releaseSave() {
-        suspendSave = false
+    func releaseSave(suspendNext: Bool = false) {
+        suspendSave = suspendNext
         let continuation = saveContinuation
         saveContinuation = nil
         continuation?.resume()

@@ -189,12 +189,14 @@ final class NotebookSession: ObservableObject {
             id: id, coordinatorID: coordinatorID, token: backgroundLease.start()
         )
         backgroundWaiter = Task { [self] in
-            await coordinator.waitUntilSettled()
-            guard ownsBackgroundFlush(id: id, coordinator: coordinator) else { return }
-            await waitUntilRecoveryFinished()
-            while ownsBackgroundFlush(id: id, coordinator: coordinator),
-                  coordinator.failure != nil, !coordinator.pendingEdits.isEmpty {
+            while ownsBackgroundFlush(id: id, coordinator: coordinator) {
+                await coordinator.waitUntilSettled()
+                guard ownsBackgroundFlush(id: id, coordinator: coordinator) else { return }
+                await waitUntilRecoveryFinished()
+                guard ownsBackgroundFlush(id: id, coordinator: coordinator) else { return }
                 captureWorkingInk()
+                if coordinator.pendingEdits.isEmpty { break }
+                if coordinator.failure == nil { continue }
                 if let preservedState, matches(preservedState.coverage) { break }
                 await saveRecoveryCopy()
                 if recoveryFailure != nil { break }

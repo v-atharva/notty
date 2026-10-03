@@ -292,6 +292,36 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         XCTAssertEqual(fixture.leases.started, 1)
     }
 
+
+    func testFlushSettlesLateHealthyCanvasWorkBeforeEndingLease() async throws {
+        let fixture = try await failedSession(suspendSave: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.probe.setSaveFailure(nil)
+        let seed = fixture.session.makeCanvasSeed()
+        var canvasDrawing = seed.drawing
+        fixture.session.attachCanvas(ownerID: seed.ownerID) { canvasDrawing }
+        fixture.session.flush()
+        let late = PKDrawing(strokes: [
+            NotebookTestFixtures.stroke(), NotebookTestFixtures.stroke(x: 120)
+        ])
+        canvasDrawing = late
+        await fixture.probe.releaseSave(suspendNext: true)
+        await fixture.probe.waitForSave()
+        let pending = fixture.session.pendingEdits
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.snapshot.drawing.strokes.map(\.id), late.strokes.map(\.id))
+        XCTAssertEqual(fixture.session.saveState, .saving)
+        XCTAssertEqual(fixture.leases.started, 1)
+        XCTAssertTrue(fixture.leases.ended.isEmpty)
+        await fixture.probe.releaseSave()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.pendingEdits.isEmpty)
+        XCTAssertEqual(fixture.session.workingDrawing.strokes.map(\.id), late.strokes.map(\.id))
+        XCTAssertEqual(fixture.leases.ended, [101])
+        let calls = await fixture.probe.saveCalls
+        XCTAssertEqual(calls, 2)
+    }
+
     private struct FailedSession {
         let session: NotebookSession
         let probe: NotebookStorageProbe
