@@ -270,7 +270,10 @@ public actor NotebookRepository {
         if let head = currentHead {
             try migrationStore(history).validateReceipt(head)
             let current = try history.current(head)
-            verifiedDigests = try history.verifyAssets(current.state, candidates: prepared.dataByDigest)
+            verifiedDigests = try history.verifyAssets(current.state, candidates: prepared.dataByDigest) {
+                reference, candidate in
+                try verifyCandidateAsset(reference, candidate: candidate, directory: directory)
+            }
             guard current.sequence < Int.max else {
                 throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
             }
@@ -286,11 +289,7 @@ public actor NotebookRepository {
             }
             let asset = assetsDirectory.appendingPathComponent("\(reference.digest).stroke")
             if try NotebookFileSystem.kind(asset) != nil {
-                let existing = try NotebookFileSystem.read(asset, maximumBytes: Self.maximumAssetBytes)
-                guard Format.digest(existing) == reference.digest, existing == candidate else {
-                    throw NotebookRepositoryError.corruptData("A stored stroke asset failed integrity validation.")
-                }
-                assetVerificationObserver?(reference.digest)
+                _ = try verifyCandidateAsset(reference, candidate: candidate, directory: directory)
             } else {
                 try NotebookFileSystem.withSynchronizedStage(candidate, in: assetsDirectory) { stage in
                     try faultInjector?(.assetStaged)
@@ -385,6 +384,50 @@ public actor NotebookRepository {
             root: rootURL, history: history, fault: migrationFaultInjector,
             maintenanceObserver: maintenanceObserver
         )
+    }
+
+    private func verifyCandidateAsset(
+        _ reference: Format.Reference, candidate: Data, directory: URL
+    ) throws -> Data {
+        guard candidate.count <= Self.maximumAssetBytes, Format.digest(candidate) == reference.digest else {
+            throw NotebookRepositoryError.invalidContent("Candidate archive bytes do not match their digest.")
+        }
+        let assets = directory.appendingPathComponent("assets", isDirectory: true)
+        guard try NotebookFileSystem.existingDirectory(assets) else {
+            throw NotebookRepositoryError.corruptData("The committed asset directory is missing.")
+        }
+        let asset = assets.appendingPathComponent("\(reference.digest).stroke")
+        let existingKind = try NotebookFileSystem.kind(asset)
+        guard existingKind == nil || existingKind == .regularFile else {
+            throw NotebookRepositoryError.unsafePath("A stored stroke asset has an unsafe file type.")
+        }
+        if existingKind == .regularFile {
+            do {
+                let existing = try NotebookFileSystem.read(asset, maximumBytes: Self.maximumAssetBytes)
+                if existing == candidate {
+                    assetVerificationObserver?(reference.digest)
+                    return existing
+                }
+            } catch let error as NotebookRepositoryError {
+                guard case .sizeLimitExceeded = error else { throw error }
+            }
+        }
+        // A verified candidate restores every reference to this content-addressed asset.
+        try NotebookFileSystem.withSynchronizedStage(candidate, in: assets) { stage in
+            try faultInjector?(.assetStaged)
+            if let kind = try NotebookFileSystem.kind(asset) {
+                guard kind == .regularFile else {
+                    throw NotebookRepositoryError.unsafePath("An asset repair destination has an unsafe file type.")
+                }
+                try NotebookFileSystem.replaceAtomically(stage, destination: asset)
+            } else {
+                try NotebookFileSystem.publishImmutable(stage, to: asset)
+            }
+            maintenanceObserver(.repairedAsset)
+            try faultInjector?(.assetPublished)
+        }
+        assetVerificationObserver?(reference.digest)
+        return candidate
     }
 
     private func prepareAssets(

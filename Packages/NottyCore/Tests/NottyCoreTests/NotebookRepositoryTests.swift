@@ -537,7 +537,7 @@ final class NotebookRepositoryTests: XCTestCase {
         }
     }
 
-    func testCorruptedUnpublishedAssetCannotBeReusedDuringRetry() async throws {
+    func testCorruptedUnpublishedAssetIsRepairedDuringRetry() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -562,19 +562,17 @@ final class NotebookRepositoryTests: XCTestCase {
         )
         try Data("tampered".utf8).write(to: asset)
         let healthy = try NotebookRepository(rootURL: root)
-        do {
-            _ = try await healthy.save(
-                id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
-            )
-            XCTFail("A corrupted existing asset was reused.")
-        } catch {
-            guard case .corruptData? = error as? NotebookRepositoryError else {
-                return XCTFail("Unexpected asset error: \(error)")
-            }
-        }
+        let repaired = try await healthy.save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: committed.revisionID
+        )
+        XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
         let loaded = try await requiredNotebook(healthy, id: id)
-        XCTAssertEqual(loaded.revisionID, committed.revisionID)
-        XCTAssertTrue(loaded.content.strokes.isEmpty)
+        XCTAssertEqual(loaded.revisionID, repaired.revisionID)
+        XCTAssertEqual(loaded.content.strokes, [stroke])
+        let history = try await healthy.auditHistory(id: id)
+        XCTAssertEqual(history.revisionCount, 2)
+        let report = await healthy.maintenanceReport()
+        XCTAssertEqual(report[.repairedAsset], 1)
     }
 
     func testOversizedMetadataIsRejectedBeforeDecoding() async throws {
@@ -794,11 +792,12 @@ final class NotebookRepositoryTests: XCTestCase {
         try FileManager.default.removeItem(at: stage)
         let transaction = root.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())")
         try FileManager.default.createSymbolicLink(at: transaction, withDestinationURL: outside)
-        XCTAssertThrowsError(try NotebookRepository(rootURL: root)) {
-            guard case .unsafePath? = $0 as? NotebookRepositoryError else {
-                return XCTFail("Unexpected transaction error: \($0)")
-            }
-        }
+        let tolerant = try NotebookRepository(rootURL: root)
+        let reopened = try await requiredNotebook(tolerant, id: id)
+        XCTAssertEqual(reopened.revisionID, saved.revisionID)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: transaction.path), outside.path)
+        let report = await tolerant.maintenanceReport()
+        XCTAssertEqual(report[.failed(.unsafePath)], 1)
         XCTAssertEqual(try Data(contentsOf: outside), Data("untouched".utf8))
     }
 
@@ -1071,9 +1070,9 @@ final class NotebookRepositoryTests: XCTestCase {
         }
         do {
             _ = try await repository.save(
-                id: id, content: content(strokes: [stroke]), expectedRevisionID: saved.revisionID
+                id: id, content: content(strokes: []), expectedRevisionID: saved.revisionID
             )
-            XCTFail("A corrupt committed asset was replaced.")
+            XCTFail("A corrupt committed asset without candidate bytes was replaced.")
         } catch {
             guard case .corruptData? = error as? NotebookRepositoryError else {
                 return XCTFail("Unexpected corrupt save error: \(error)")
@@ -1120,6 +1119,251 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertEqual(report.count, 2)
         XCTAssertEqual(report[.skippedNonRegularStage], 10_000)
         XCTAssertEqual(report[.failed(.io)], 10_000)
+    }
+
+    func testCandidateRepairsCommittedAssetAndPreservesHistoricalStates() async throws {
+        for oversized in [false, true] {
+            let root = try makeRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let id = UUID()
+            let stroke = NotebookStroke(id: UUID(), data: Data("verified archive".utf8))
+            let repository = try NotebookRepository(rootURL: root)
+            let first = try await repository.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+            )
+            let asset = noteURL(root: root, id: id).appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+            if oversized {
+                try makeSparseFile(asset, size: NotebookRepository.maximumAssetBytes + 1)
+            } else {
+                try Data("wrong bytes".utf8).write(to: asset)
+            }
+            do {
+                _ = try await repository.auditHistory(id: id)
+                XCTFail("Candidate-free audit accepted a damaged archive.")
+            } catch {
+                guard case .corruptData? = error as? NotebookRepositoryError else {
+                    return XCTFail("Unexpected damaged archive error: \(error)")
+                }
+            }
+            let second = try await repository.save(
+                id: id, content: content(title: "Repaired", strokes: [stroke]),
+                expectedRevisionID: first.revisionID
+            )
+            XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
+            let historical = try await repository.loadRevision(id: id, revisionID: first.revisionID)
+            XCTAssertEqual(historical.content, first.content)
+            let loaded = try await requiredNotebook(repository, id: id)
+            XCTAssertEqual(loaded.revisionID, second.revisionID)
+            let audit = try await repository.auditHistory(id: id)
+            XCTAssertEqual(audit.revisionCount, 2)
+            XCTAssertEqual(audit.verifiedAssetCount, 1)
+            let report = await repository.maintenanceReport()
+            XCTAssertEqual(report[.repairedAsset], 1)
+        }
+    }
+
+    func testOversizedUnpublishedAssetIsRepairedFromCandidateBytes() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("candidate archive".utf8))
+        let repository = try NotebookRepository(rootURL: root)
+        let first = try await repository.save(id: id, content: content(), expectedRevisionID: nil)
+        let asset = noteURL(root: root, id: id).appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+        try makeSparseFile(asset, size: NotebookRepository.maximumAssetBytes + 1)
+        let second = try await repository.save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
+        )
+        XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
+        let loaded = try await requiredNotebook(repository, id: id)
+        XCTAssertEqual(loaded.revisionID, second.revisionID)
+        let audit = try await repository.auditHistory(id: id)
+        XCTAssertEqual(audit.verifiedAssetCount, 1)
+        let report = await repository.maintenanceReport()
+        XCTAssertEqual(report[.repairedAsset], 1)
+    }
+
+    func testAssetRepairPublicationFaultsKeepHeadAndPermitRetry() async throws {
+        for committed in [false, true] {
+            for target in [NotebookWriteStage.assetStaged, .assetPublished] {
+                let root = try makeRoot()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let id = UUID()
+                let stroke = NotebookStroke(id: UUID(), data: Data("correct archive".utf8))
+                let healthy = try NotebookRepository(rootURL: root)
+                let first = try await healthy.save(
+                    id: id, content: content(strokes: committed ? [stroke] : []), expectedRevisionID: nil
+                )
+                let directory = noteURL(root: root, id: id)
+                let headURL = directory.appendingPathComponent("HEAD.json")
+                let headBytes = try Data(contentsOf: headURL)
+                let asset = directory.appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+                let damaged = Data("damaged archive".utf8)
+                try damaged.write(to: asset)
+                let faulty = try NotebookRepository(rootURL: root, faultInjector: { stage in
+                    if stage == target { throw InjectedFailure.stop }
+                })
+                do {
+                    _ = try await faulty.save(
+                        id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
+                    )
+                    XCTFail("The asset repair fault did not occur.")
+                } catch {
+                    XCTAssertTrue(error is InjectedFailure)
+                }
+                XCTAssertEqual(try Data(contentsOf: headURL), headBytes)
+                XCTAssertEqual(try Data(contentsOf: asset), target == .assetStaged ? damaged : stroke.data)
+                XCTAssertFalse(try fileSnapshot(root: directory).keys.contains { $0.hasSuffix(".tmp") })
+                let second = try await healthy.save(
+                    id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
+                )
+                XCTAssertEqual(try Data(contentsOf: asset), stroke.data)
+                XCTAssertEqual(second.sequence, 2)
+                let audit = try await healthy.auditHistory(id: id)
+                XCTAssertEqual(audit.revisionCount, 2)
+            }
+        }
+    }
+
+    func testCandidateAssetRepairRefusesDirectoriesAndSymbolicLinks() async throws {
+        for committed in [false, true] {
+            for linked in [false, true] {
+                let root = try makeRoot()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let id = UUID()
+                let stroke = NotebookStroke(id: UUID(), data: Data("candidate".utf8))
+                let repository = try NotebookRepository(rootURL: root)
+                let first = try await repository.save(
+                    id: id, content: content(strokes: committed ? [stroke] : []), expectedRevisionID: nil
+                )
+                let directory = noteURL(root: root, id: id)
+                let headURL = directory.appendingPathComponent("HEAD.json")
+                let headBytes = try Data(contentsOf: headURL)
+                let asset = directory.appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+                if committed { try FileManager.default.removeItem(at: asset) }
+                let outside = root.appendingPathComponent("outside")
+                try Data("untouched".utf8).write(to: outside)
+                if linked {
+                    try FileManager.default.createSymbolicLink(at: asset, withDestinationURL: outside)
+                } else {
+                    try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: false)
+                    try Data("untouched".utf8).write(to: asset.appendingPathComponent("child"))
+                }
+                do {
+                    _ = try await repository.save(
+                        id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
+                    )
+                    XCTFail("An unsafe asset entry was repaired.")
+                } catch {
+                    guard case .unsafePath? = error as? NotebookRepositoryError else {
+                        return XCTFail("Unexpected unsafe repair error: \(error)")
+                    }
+                }
+                XCTAssertEqual(try Data(contentsOf: headURL), headBytes)
+                XCTAssertEqual(try Data(contentsOf: outside), Data("untouched".utf8))
+                if linked {
+                    XCTAssertEqual(
+                        try FileManager.default.destinationOfSymbolicLink(atPath: asset.path), outside.path
+                    )
+                } else {
+                    XCTAssertEqual(
+                        try Data(contentsOf: asset.appendingPathComponent("child")), Data("untouched".utf8)
+                    )
+                }
+            }
+        }
+    }
+
+    func testStaleWriterCannotRepairAnAssetBeforeRevisionAdmission() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("candidate".utf8))
+        let repository = try NotebookRepository(rootURL: root)
+        let first = try await repository.save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+        )
+        let second = try await repository.save(
+            id: id, content: content(title: "Newer", strokes: [stroke]), expectedRevisionID: first.revisionID
+        )
+        let asset = noteURL(root: root, id: id).appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+        let damaged = Data("damaged".utf8)
+        try damaged.write(to: asset)
+        do {
+            _ = try await repository.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: first.revisionID
+            )
+            XCTFail("A stale writer repaired storage.")
+        } catch {
+            XCTAssertEqual(error as? NotebookRepositoryError, .revisionConflict)
+        }
+        XCTAssertEqual(try Data(contentsOf: asset), damaged)
+        let head = try object(at: noteURL(root: root, id: id).appendingPathComponent("HEAD.json"))
+        XCTAssertEqual(head["revisionID"] as? String, second.revisionID.uuidString)
+    }
+
+    func testOversizedAndLinkedPrivateTransactionsDoNotBlockHealthyStorage() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let first = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(), expectedRevisionID: nil
+        )
+        let oversized = root.appendingPathComponent(".migration-\(UUID().uuidString.lowercased())")
+        try FileManager.default.createDirectory(at: oversized, withIntermediateDirectories: false)
+        let large = oversized.appendingPathComponent("large")
+        let size = 600 * 1_024 * 1_024 + 1
+        try makeSparseFile(large, size: size)
+        let linked = root.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())")
+        try FileManager.default.createDirectory(at: linked, withIntermediateDirectories: false)
+        let target = root.appendingPathComponent("outside")
+        try Data("untouched".utf8).write(to: target)
+        let child = linked.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: child, withDestinationURL: target)
+        let healthy = root.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())")
+        try FileManager.default.createDirectory(at: healthy, withIntermediateDirectories: false)
+        try Data("leftover".utf8).write(to: healthy.appendingPathComponent("private"))
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(rootURL: root, maintenanceObserver: { counter.record($0) })
+        XCTAssertEqual(counter.count(.failed(.sizeLimit)), 1)
+        XCTAssertEqual(counter.count(.failed(.unsafePath)), 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: healthy.path))
+        let loaded = try await requiredNotebook(repository, id: id)
+        XCTAssertEqual(loaded.revisionID, first.revisionID)
+        do {
+            _ = try await repository.save(
+                id: id, content: content(title: "Stale"), expectedRevisionID: UUID()
+            )
+            XCTFail("The stale writer was accepted.")
+        } catch {
+            XCTAssertEqual(error as? NotebookRepositoryError, .revisionConflict)
+        }
+        counter.reset()
+        let second = try await repository.save(
+            id: id, content: content(title: "Updated"), expectedRevisionID: first.revisionID
+        )
+        XCTAssertEqual(counter.count(.failed(.sizeLimit)), 1)
+        XCTAssertEqual(counter.count(.failed(.unsafePath)), 1)
+        XCTAssertEqual(
+            (try FileManager.default.attributesOfItem(atPath: large.path)[.size] as? NSNumber)?.intValue, size
+        )
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: child.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: target), Data("untouched".utf8))
+        counter.reset()
+        _ = try await repository.save(
+            id: id, content: content(title: "Clean"), expectedRevisionID: second.revisionID
+        )
+        XCTAssertEqual(counter.enumerationCount, 0)
+        XCTAssertTrue(counter.snapshot().isEmpty)
+    }
+
+    private func makeSparseFile(_ url: URL, size: Int) throws {
+        if !FileManager.default.fileExists(atPath: url.path) {
+            XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: UInt64(size))
     }
 
     private func digest(_ data: Data) -> String {

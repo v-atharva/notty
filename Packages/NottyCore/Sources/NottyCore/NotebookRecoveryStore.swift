@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import PencilKit
 
@@ -35,19 +34,22 @@ public actor NotebookRecoveryStore {
             editCount: batch.edits.count,
             savedAt: Date()
         )
-        let references = batch.edits.map {
-            EditReference(
+        let references = try batch.edits.map {
+            let identityData = try NotebookRecoveryIdentityFormat.encode($0.strokeIDs)
+            return EditReference(
                 id: $0.id,
                 archiveDigest: Self.digest($0.drawingData),
                 archiveBytes: $0.drawingData.count,
-                strokeIDs: $0.strokeIDs,
+                strokeIDs: nil,
+                strokeCount: $0.strokeIDs.count,
+                strokeIDsDigest: Self.digest(identityData),
                 title: $0.title,
                 pageCount: $0.pageCount,
                 stamp: $0.stamp
             )
         }
         let manifest = Manifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             receiptID: receipt.id,
             notebookID: batch.notebookID,
             baseRevisionID: batch.baseRevisionID,
@@ -56,7 +58,7 @@ public actor NotebookRecoveryStore {
         )
         let manifestData = try encodeMetadata(manifest)
         let receiptData = try encodeMetadata(ReceiptRecord(
-            schemaVersion: 1,
+            schemaVersion: 2,
             id: receipt.id,
             notebookID: receipt.notebookID,
             editCount: receipt.editCount,
@@ -65,7 +67,7 @@ public actor NotebookRecoveryStore {
         ))
         for edit in batch.edits {
             try validateNativeArchive(
-                edit.drawingData, strokeCount: edit.strokeIDs.count, stored: false
+                edit.drawingData, strokeIDs: edit.strokeIDs, stored: false
             )
         }
 
@@ -81,7 +83,13 @@ public actor NotebookRecoveryStore {
         }
         let archives = transaction.appendingPathComponent("archives", isDirectory: true)
         try NotebookFileSystem.ensureDirectory(archives)
+        try NotebookFileSystem.ensureDirectory(transaction.appendingPathComponent("identities", isDirectory: true))
         for edit in batch.edits {
+            try NotebookFileSystem.writeSynchronized(
+                try NotebookRecoveryIdentityFormat.encode(edit.strokeIDs),
+                to: identitiesURL(id: edit.id, bundle: transaction)
+            )
+            try faultInjector?(.identitiesSynchronized)
             try NotebookFileSystem.writeSynchronized(
                 edit.drawingData, to: archiveURL(id: edit.id, bundle: transaction)
             )
@@ -109,11 +117,12 @@ public actor NotebookRecoveryStore {
         var edits: [NotebookRecoveryEdit] = []
         edits.reserveCapacity(record.editCount)
         for reference in manifest.edits {
-            let data = try readArchive(reference, bundle: directory)
+            let strokeIDs = try readStrokeIDs(reference, schemaVersion: manifest.schemaVersion, bundle: directory)
+            let data = try readArchive(reference, strokeIDs: strokeIDs, bundle: directory)
             edits.append(NotebookRecoveryEdit(
                 id: reference.id,
                 drawingData: data,
-                strokeIDs: reference.strokeIDs,
+                strokeIDs: strokeIDs,
                 title: reference.title,
                 pageCount: reference.pageCount,
                 stamp: reference.stamp
@@ -140,7 +149,10 @@ public actor NotebookRecoveryStore {
             let (record, manifest, directory) = try readBundle(id: id)
             guard record.notebookID == notebookID else { continue }
             for reference in manifest.edits {
-                _ = try readArchive(reference, bundle: directory)
+                let strokeIDs = try readStrokeIDs(
+                    reference, schemaVersion: manifest.schemaVersion, bundle: directory
+                )
+                _ = try readArchive(reference, strokeIDs: strokeIDs, bundle: directory)
             }
             receipts.append(NotebookRecoveryReceipt(
                 id: record.id,
@@ -168,7 +180,10 @@ public actor NotebookRecoveryStore {
             do {
                 let (record, manifest, directory) = try readBundle(id: id)
                 for reference in manifest.edits {
-                    _ = try readArchive(reference, bundle: directory)
+                    let strokeIDs = try readStrokeIDs(
+                        reference, schemaVersion: manifest.schemaVersion, bundle: directory
+                    )
+                    _ = try readArchive(reference, strokeIDs: strokeIDs, bundle: directory)
                 }
                 if record.notebookID == notebookID {
                     receipts.append(NotebookRecoveryReceipt(
@@ -231,10 +246,9 @@ public actor NotebookRecoveryStore {
         guard try NotebookFileSystem.kind(receiptURL) != nil else {
             throw NotebookRepositoryError.corruptData("The recovery receipt is missing.")
         }
-        let record: ReceiptRecord = try decodeMetadata(NotebookFileSystem.read(
-            receiptURL, maximumBytes: Self.maximumManifestBytes
-        ))
-        try validateVersion(record.schemaVersion)
+        let receiptData = try readCommittedFile(receiptURL, maximumBytes: Self.maximumManifestBytes)
+        try validateVersion(try decodeMetadata(receiptData, as: SchemaEnvelope.self).schemaVersion)
+        let record: ReceiptRecord = try decodeMetadata(receiptData)
         guard record.id == id,
               (1...Self.maximumEditCount).contains(record.editCount),
               record.savedAt.timeIntervalSinceReferenceDate.isFinite,
@@ -245,40 +259,93 @@ public actor NotebookRecoveryStore {
         guard try NotebookFileSystem.kind(manifestURL) != nil else {
             throw NotebookRepositoryError.corruptData("The recovery manifest is missing.")
         }
-        let data = try NotebookFileSystem.read(
-            manifestURL, maximumBytes: Self.maximumManifestBytes
-        )
+        let data = try readCommittedFile(manifestURL, maximumBytes: Self.maximumManifestBytes)
         guard Self.digest(data) == record.manifestDigest else {
             throw NotebookRepositoryError.corruptData("The recovery manifest failed integrity validation.")
         }
+        try validateVersion(try decodeMetadata(data, as: SchemaEnvelope.self).schemaVersion)
         let manifest: Manifest = try decodeMetadata(data)
-        try validateVersion(manifest.schemaVersion)
-        guard manifest.receiptID == record.id,
+        guard manifest.schemaVersion == record.schemaVersion,
+              manifest.receiptID == record.id,
               manifest.notebookID == record.notebookID,
               manifest.savedAt == record.savedAt,
               manifest.edits.count == record.editCount else {
             throw NotebookRepositoryError.corruptData("The recovery copy has inconsistent identities or order metadata.")
         }
-        try validateReferences(manifest.edits)
+        try validateReferences(manifest.edits, schemaVersion: manifest.schemaVersion)
         guard try NotebookFileSystem.existingDirectory(
             directory.appendingPathComponent("archives", isDirectory: true)
         ) else {
             throw NotebookRepositoryError.corruptData("The recovery archive directory is missing.")
         }
+        if manifest.schemaVersion == 2 {
+            guard try NotebookFileSystem.existingDirectory(
+                directory.appendingPathComponent("identities", isDirectory: true)
+            ) else {
+                throw NotebookRepositoryError.corruptData("The recovery identity directory is missing.")
+            }
+        }
         return (record, manifest, directory)
     }
 
-    private func readArchive(_ reference: EditReference, bundle: URL) throws -> Data {
+    private func identitiesURL(id: UUID, bundle: URL) -> URL {
+        bundle.appendingPathComponent("identities", isDirectory: true)
+            .appendingPathComponent("\(id.uuidString.lowercased()).ids")
+    }
+
+    private func referenceStrokeCount(_ reference: EditReference, schemaVersion: Int) throws -> Int {
+        if schemaVersion == 1 {
+            guard let identities = reference.strokeIDs,
+                  reference.strokeCount == nil, reference.strokeIDsDigest == nil else {
+                throw NotebookRepositoryError.corruptData("Legacy recovery identities have an invalid format.")
+            }
+            return identities.count
+        }
+        guard reference.strokeIDs == nil, let count = reference.strokeCount,
+              (0...Self.maximumStrokeIDs).contains(count),
+              let digest = reference.strokeIDsDigest, Self.isDigest(digest) else {
+            throw NotebookRepositoryError.corruptData("Recovery identity references have an invalid format.")
+        }
+        return count
+    }
+
+    private func readStrokeIDs(
+        _ reference: EditReference, schemaVersion: Int, bundle: URL
+    ) throws -> [UUID] {
+        let count = try referenceStrokeCount(reference, schemaVersion: schemaVersion)
+        if schemaVersion == 1, let identities = reference.strokeIDs { return identities }
+        let url = identitiesURL(id: reference.id, bundle: bundle)
+        guard try NotebookFileSystem.kind(url) != nil else {
+            throw NotebookRepositoryError.corruptData("A preserved recovery identity file is missing.")
+        }
+        let data = try readCommittedFile(url, maximumBytes: NotebookRecoveryIdentityFormat.maximumBytes)
+        guard data.count == count * NotebookRecoveryIdentityFormat.bytesPerIdentity,
+              Self.digest(data) == reference.strokeIDsDigest else {
+            throw NotebookRepositoryError.corruptData("A recovery identity file failed integrity validation.")
+        }
+        return try NotebookRecoveryIdentityFormat.decode(data, count: count)
+    }
+
+    private func readCommittedFile(_ url: URL, maximumBytes: Int) throws -> Data {
+        do { return try NotebookFileSystem.read(url, maximumBytes: maximumBytes) }
+        catch NotebookRepositoryError.sizeLimitExceeded {
+            throw NotebookRepositoryError.corruptData("A preserved recovery file exceeds its supported size.")
+        }
+    }
+
+    private func readArchive(
+        _ reference: EditReference, strokeIDs: [UUID], bundle: URL
+    ) throws -> Data {
         let url = archiveURL(id: reference.id, bundle: bundle)
         guard try NotebookFileSystem.kind(url) != nil else {
             throw NotebookRepositoryError.corruptData("A preserved recovery archive is missing.")
         }
-        let data = try NotebookFileSystem.read(url, maximumBytes: Self.maximumArchiveBytes)
+        let data = try readCommittedFile(url, maximumBytes: Self.maximumArchiveBytes)
         guard data.count == reference.archiveBytes,
               Self.digest(data) == reference.archiveDigest else {
             throw NotebookRepositoryError.corruptData("A recovery archive failed integrity validation.")
         }
-        try validateNativeArchive(data, strokeCount: reference.strokeIDs.count, stored: true)
+        try validateNativeArchive(data, strokeIDs: strokeIDs, stored: true)
         return data
     }
 
@@ -309,7 +376,7 @@ public actor NotebookRecoveryStore {
         }
     }
 
-    private func validateReferences(_ references: [EditReference]) throws {
+    private func validateReferences(_ references: [EditReference], schemaVersion: Int) throws {
         var editIDs = Set<UUID>()
         var totalBytes = 0
         for reference in references {
@@ -320,21 +387,35 @@ public actor NotebookRecoveryStore {
             }
             do {
                 try validateEditMetadata(
-                    strokeIDs: reference.strokeIDs, title: reference.title,
-                    pageCount: reference.pageCount, stamp: reference.stamp
+                    strokeCount: try referenceStrokeCount(reference, schemaVersion: schemaVersion),
+                    title: reference.title, pageCount: reference.pageCount, stamp: reference.stamp
                 )
+                if let identities = reference.strokeIDs {
+                    guard Set(identities).count == identities.count else {
+                        throw NotebookRepositoryError.corruptData("Recovery stroke identifiers must be unique.")
+                    }
+                }
             } catch {
                 throw NotebookRepositoryError.corruptData("The recovery manifest has invalid edit metadata.")
             }
             totalBytes += reference.archiveBytes
             guard totalBytes <= Self.maximumBatchBytes else {
-                throw NotebookRepositoryError.sizeLimitExceeded("A recovery copy exceeds 512 MiB.")
+                throw NotebookRepositoryError.corruptData("A preserved recovery copy exceeds 512 MiB.")
             }
         }
     }
 
     private func validateEditMetadata(
         strokeIDs: [UUID], title: String, pageCount: Int, stamp: NotebookEditStamp
+    ) throws {
+        try validateEditMetadata(strokeCount: strokeIDs.count, title: title, pageCount: pageCount, stamp: stamp)
+        guard Set(strokeIDs).count == strokeIDs.count else {
+            throw NotebookRepositoryError.invalidContent("Recovery stroke identifiers must be unique.")
+        }
+    }
+
+    private func validateEditMetadata(
+        strokeCount: Int, title: String, pageCount: Int, stamp: NotebookEditStamp
     ) throws {
         guard title.utf8.count <= Self.maximumTitleBytes else {
             throw NotebookRepositoryError.sizeLimitExceeded("A recovery title exceeds 4 KiB.")
@@ -344,30 +425,34 @@ public actor NotebookRecoveryStore {
               stamp.uptime.isFinite, stamp.uptime >= 0 else {
             throw NotebookRepositoryError.invalidContent("Recovery edit metadata is invalid.")
         }
-        guard strokeIDs.count <= Self.maximumStrokeIDs else {
+        guard (0...Self.maximumStrokeIDs).contains(strokeCount) else {
             throw NotebookRepositoryError.sizeLimitExceeded("A recovery edit exceeds 20,000 strokes.")
-        }
-        guard Set(strokeIDs).count == strokeIDs.count else {
-            throw NotebookRepositoryError.invalidContent("Recovery stroke identifiers must be unique.")
         }
     }
 
     private func validateNativeArchive(
-        _ data: Data, strokeCount: Int, stored: Bool
+        _ data: Data, strokeIDs: [UUID], stored: Bool
     ) throws {
-        let isValid: Bool
-        do {
-            let drawing = try PKDrawing(data: data)
-            isValid = drawing.strokes.count == strokeCount
-                && drawing.strokes.count <= Self.maximumStrokeIDs
-        } catch {
-            isValid = false
+        let isValid = autoreleasepool {
+            do {
+                let drawing = try PKDrawing(data: data)
+                guard drawing.strokes.count == strokeIDs.count,
+                      drawing.strokes.count <= Self.maximumStrokeIDs else { return false }
+                let strokes = zip(drawing.strokes, strokeIDs).map { source, identity in
+                    var stroke = source
+                    stroke.id = identity
+                    return stroke
+                }
+                return PKDrawing(strokes: strokes).strokes.map(\.id) == strokeIDs
+            } catch {
+                return false
+            }
         }
         guard isValid else {
             if stored {
-                throw NotebookRepositoryError.corruptData("A recovery archive has invalid native content or stroke identities.")
+                throw NotebookRepositoryError.corruptData("A recovery archive cannot restore its ordered stroke identities.")
             }
-            throw NotebookRepositoryError.invalidContent("The recovery archive does not match its stroke identifiers.")
+            throw NotebookRepositoryError.invalidContent("The recovery archive cannot restore its ordered stroke identities.")
         }
     }
 
@@ -381,23 +466,27 @@ public actor NotebookRecoveryStore {
         return data
     }
 
-    private func decodeMetadata<T: Decodable>(_ data: Data) throws -> T {
+    private func decodeMetadata<T: Decodable>(_ data: Data, as type: T.Type = T.self) throws -> T {
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw NotebookRepositoryError.corruptData("Recovery metadata is unreadable.") }
     }
 
     private func validateVersion(_ version: Int) throws {
-        guard version == 1 else { throw NotebookRepositoryError.unsupportedVersion(version) }
+        guard version == 1 || version == 2 else { throw NotebookRepositoryError.unsupportedVersion(version) }
     }
 
     private static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        NotebookDigest.sha256(data)
     }
 
     private static func isDigest(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy {
             (48...57).contains($0) || (97...102).contains($0)
         }
+    }
+
+    private struct SchemaEnvelope: Decodable {
+        let schemaVersion: Int
     }
 
     private struct ReceiptRecord: Codable {
@@ -422,7 +511,9 @@ public actor NotebookRecoveryStore {
         let id: UUID
         let archiveDigest: String
         let archiveBytes: Int
-        let strokeIDs: [UUID]
+        let strokeIDs: [UUID]?
+        let strokeCount: Int?
+        let strokeIDsDigest: String?
         let title: String
         let pageCount: Int
         let stamp: NotebookEditStamp

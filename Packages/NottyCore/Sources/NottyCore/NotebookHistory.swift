@@ -273,15 +273,23 @@ struct NotebookHistory {
         return result
     }
 
-    func verifyAssets(_ state: Format.State, candidates: [String: Data]) throws -> Set<String> {
+    func verifyAssets(
+        _ state: Format.State, candidates: [String: Data],
+        candidateAsset: ((Format.Reference, Data) throws -> Data)? = nil
+    ) throws -> Set<String> {
         try validateAssetsDirectory(state)
         var sizes: [String: Int] = [:]
         var total = 0
         for reference in state.strokes {
             if sizes[reference.digest] == nil {
-                let data = try readAsset(reference)
-                if let candidate = candidates[reference.digest], candidate != data {
-                    throw NotebookRepositoryError.corruptData("Equal asset digests have different bytes.")
+                let data: Data
+                if let candidate = candidates[reference.digest], let candidateAsset {
+                    data = try candidateAsset(reference, candidate)
+                } else {
+                    data = try readAsset(reference)
+                    if let candidate = candidates[reference.digest], candidate != data {
+                        throw NotebookRepositoryError.corruptData("Equal asset digests have different bytes.")
+                    }
                 }
                 sizes[reference.digest] = data.count
             }

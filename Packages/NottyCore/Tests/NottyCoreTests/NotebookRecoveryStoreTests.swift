@@ -77,6 +77,10 @@ final class NotebookRecoveryStoreTests: XCTestCase {
     }
 
     func testEachPublicationFaultRetainsOlderCopiesAndRemovesOwnedTransaction() async throws {
+        XCTAssertEqual(NotebookRecoveryWriteStage.allCases, [
+            .archiveSynchronized, .manifestSynchronized, .receiptSynchronized,
+            .beforePublication, .identitiesSynchronized
+        ])
         for target in NotebookRecoveryWriteStage.allCases {
             let root = try makeRoot()
             defer { try? FileManager.default.removeItem(at: root) }
@@ -282,7 +286,7 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         let receipt = try await store.preserve(batch)
         try modifyManifest(root: root, receipt: receipt.id) { manifest in
             var edits = manifest["edits"] as! [[String: Any]]
-            edits[0]["strokeIDs"] = [UUID().uuidString, UUID().uuidString]
+            edits[0]["strokeCount"] = 2
             manifest["edits"] = edits
         }
         do {
@@ -337,7 +341,7 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         }
     }
 
-    func testRootArchiveAndPrivateTransactionLinksAreRejectedWithoutTouchingTargets() async throws {
+    func testRootAndArchiveLinksAreRejectedWhileAbandonedTransactionLinksAreRetained() async throws {
         let parent = try makeRoot()
         defer { try? FileManager.default.removeItem(at: parent) }
         let root = parent.appendingPathComponent("recovery", isDirectory: true)
@@ -359,11 +363,8 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         }
         let transaction = root.appendingPathComponent(".recovery-\(UUID().uuidString.lowercased())")
         try FileManager.default.createSymbolicLink(at: transaction, withDestinationURL: outside)
-        XCTAssertThrowsError(try NotebookRecoveryStore(rootURL: root)) {
-            guard case .unsafePath? = $0 as? NotebookRepositoryError else {
-                return XCTFail("Unexpected transaction link error: \($0)")
-            }
-        }
+        _ = try NotebookRecoveryStore(rootURL: root)
+        XCTAssertTrue(try transaction.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true)
         let rootLink = parent.appendingPathComponent("root-link")
         try FileManager.default.createSymbolicLink(at: rootLink, withDestinationURL: root)
         XCTAssertThrowsError(try NotebookRecoveryStore(rootURL: rootLink))
@@ -496,7 +497,7 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         }
     }
 
-    func testMetadataBudgetRejectsBeforeDecodingADeclaredLargeDrawing() async throws {
+    func testDeclaredLargeStrokeCountMustMatchTheNativeDrawing() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try NotebookRecoveryStore(rootURL: root)
@@ -510,10 +511,10 @@ final class NotebookRecoveryStoreTests: XCTestCase {
             _ = try await store.preserve(NotebookRecoveryBatch(
                 notebookID: UUID(), baseRevisionID: nil, edits: edits
             ))
-            XCTFail("Oversized metadata was published.")
+            XCTFail("A declared stroke count mismatch was published.")
         } catch {
-            guard case .sizeLimitExceeded? = error as? NotebookRepositoryError else {
-                return XCTFail("Unexpected manifest-bound error: \(error)")
+            guard case .invalidContent? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected native-count error: \(error)")
             }
         }
     }
@@ -611,14 +612,20 @@ final class NotebookRecoveryStoreTests: XCTestCase {
     }
 
     private func snapshot(root: URL) throws -> [String: Data] {
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = canonicalRoot.path + "/"
         let enumerator = try XCTUnwrap(
-            FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey])
+            FileManager.default.enumerator(at: canonicalRoot, includingPropertiesForKeys: [.isRegularFileKey])
         )
         var result: [String: Data] = [:]
         for case let url as URL in enumerator {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey])
             guard values.isRegularFile == true else { continue }
-            result[String(url.path.dropFirst(root.path.count + 1))] = try Data(contentsOf: url)
+            let canonicalFile = url.standardizedFileURL.resolvingSymlinksInPath()
+            guard canonicalFile.path.hasPrefix(prefix) else {
+                throw NotebookRepositoryError.unsafePath("A preservation fixture escaped its root.")
+            }
+            result[String(canonicalFile.path.dropFirst(prefix.count))] = try Data(contentsOf: canonicalFile)
         }
         return result
     }

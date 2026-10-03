@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 enum NotebookRevisionFormat {
@@ -111,7 +110,7 @@ enum NotebookRevisionFormat {
     }
 
     static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        NotebookDigest.sha256(data)
     }
 
     static func isDigest(_ value: String) -> Bool {
