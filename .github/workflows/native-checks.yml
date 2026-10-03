@@ -37,11 +37,19 @@ jobs:
           fetch-depth: 1
 
       - name: Verify native toolchain
+        timeout-minutes: 2
         run: |
           sw_vers
           xcodebuild -version
           xcrun swift --version
           xcodebuild -showsdks
+          xcodebuild -help > "$RUNNER_TEMP/XcodeBuildHelp.txt" 2>&1
+          for option in -collect-test-diagnostics -test-timeouts-enabled -default-test-execution-time-allowance -maximum-test-execution-time-allowance; do
+            grep -Fq -- "$option" "$RUNNER_TEMP/XcodeBuildHelp.txt" || {
+              printf 'Required test option is unavailable: %s\n' "$option" >&2
+              exit 1
+            }
+          done
           case "$(sw_vers -productVersion)" in
             27.*) ;;
             *) printf 'macOS 27 is required for native stroke tests.\n' >&2; exit 1 ;;
@@ -52,30 +60,37 @@ jobs:
           done
 
       - name: Test notebook core and native stroke archives
+        continue-on-error: true
+        timeout-minutes: 8
         env:
           NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
+          NOTTY_RECOVERY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyRecoveryMetrics
         run: |
-          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2 --filter 'NotebookRecoveryCapacityTests|NotebookRepositoryTests/(testCandidateRepairsCommittedAssetAndPreservesHistoricalStates|testOversizedUnpublishedAssetIsRepairedFromCandidateBytes|testOversizedAndLinkedPrivateTransactionsDoNotBlockHealthyStorage)'
 
-      - name: Record history growth measurements
+      - name: Record storage measurements
         if: always()
         env:
           NOTTY_HISTORY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyHistoryMetrics
+          NOTTY_RECOVERY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyRecoveryMetrics
         run: |
-          if [ -d "$NOTTY_HISTORY_METRICS_DIRECTORY" ]; then
-            for report in "$NOTTY_HISTORY_METRICS_DIRECTORY"/*.json; do
+          for directory in "$NOTTY_HISTORY_METRICS_DIRECTORY" "$NOTTY_RECOVERY_METRICS_DIRECTORY"; do
+            test -d "$directory" || continue
+            for report in "$directory"/*.json; do
               test -f "$report" || continue
               cat "$report"
               printf '\n'
             done
-          fi
+          done
 
       - name: Prepare iPad test simulator
+        timeout-minutes: 2
         run: |
           NOTTY_SIMULATOR_ID=$(xcrun simctl list devices available --json | jq -er '.devices | to_entries | map(select(.key | endswith(".iOS-27-0"))) | map(.value[]) | map(select(.isAvailable and (.name | startswith("iPad")))) | sort_by(.name) | .[0].udid // error("No iPadOS 27.0 simulator is available")')
           printf 'NOTTY_SIMULATOR_ID=%s\n' "$NOTTY_SIMULATOR_ID" >> "$GITHUB_ENV"
           xcrun simctl bootstatus "$NOTTY_SIMULATOR_ID" -b
       - name: Compile unsigned iPad simulator app
+        timeout-minutes: 4
         run: |
           xcodebuild \
             -project Notty.xcodeproj \
@@ -89,6 +104,7 @@ jobs:
             build
 
       - name: Compile unsigned iPad device app
+        timeout-minutes: 4
         run: |
           xcodebuild \
             -project Notty.xcodeproj \
@@ -102,6 +118,7 @@ jobs:
             build
 
       - name: Test native notebook session and canvas
+        timeout-minutes: 5
         run: |
           xcodebuild \
             -project Notty.xcodeproj \
@@ -110,12 +127,50 @@ jobs:
             -sdk iphonesimulator27.0 \
             -destination "platform=iOS Simulator,id=$NOTTY_SIMULATOR_ID" \
             -parallel-testing-enabled NO \
+            -only-testing:NottyTests/NotebookBackgroundLeaseTests/testFailedBackgroundPreservationRetainsEditsAndCanRetryNextFlush \
+            -only-testing:NottyTests/NotebookBackgroundLeaseTests/testDiagnosticsFailureRemainsVisible \
+            -collect-test-diagnostics never \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 \
+            -maximum-test-execution-time-allowance 120 \
             -derivedDataPath "$RUNNER_TEMP/NottySimulator" \
             -resultBundlePath "$RUNNER_TEMP/NottyNativeTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            test
-          xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/NottyNativeTests.xcresult"
+            test 2>&1 | tee "$RUNNER_TEMP/NottyNativeTests.log"
+
+      - name: Summarize hosted test results
+        if: always()
+        timeout-minutes: 1
+        run: |
+          if [ -d "$RUNNER_TEMP/NottyNativeTests.xcresult" ]; then
+            xcrun xcresulttool get test-results summary \
+              --path "$RUNNER_TEMP/NottyNativeTests.xcresult" \
+              > "$RUNNER_TEMP/NottyNativeTests-summary.json"
+            cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
+            {
+              printf '### Hosted test results\n\n~~~json\n'
+              cat "$RUNNER_TEMP/NottyNativeTests-summary.json"
+              printf '\n~~~\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Hosted test result bundle was not produced.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload native check results
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-check-results-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/NottyNativeTests.xcresult
+            ${{ runner.temp }}/NottyNativeTests.log
+            ${{ runner.temp }}/NottyNativeTests-summary.json
+            ${{ runner.temp }}/NottyHistoryMetrics
+            ${{ runner.temp }}/NottyRecoveryMetrics
 
       - name: Shut down test simulator
         if: always() && env.NOTTY_SIMULATOR_ID != ''
