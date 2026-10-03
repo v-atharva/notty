@@ -225,7 +225,6 @@ final class NativeArchiveReuseTests: XCTestCase {
         }
     }
 
-
     private struct MaskElement {
         let type: CGPathElementType
         let points: [CGPoint]
@@ -241,7 +240,9 @@ final class NativeArchiveReuseTests: XCTestCase {
             case .addQuadCurveToPoint: count = 2
             case .addCurveToPoint: count = 3
             case .closeSubpath: count = 0
-            @unknown default: count = 0
+            @unknown default:
+                XCTFail("Unsupported native mask path element.")
+                count = 0
             }
             result.append(MaskElement(
                 type: element.type,
