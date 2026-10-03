@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import NottyCore
 
@@ -65,7 +66,7 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
         await saver.fail()
         await coordinator.waitUntilSettled()
 
-        XCTAssertEqual(coordinator.status, .failed)
+        XCTAssertEqual(coordinator.status, .failed(.storageUnavailable))
         XCTAssertEqual(coordinator.pendingCount, 2)
         XCTAssertFalse(coordinator.canAcceptInput)
         XCTAssertNil(coordinator.expectedRevisionID)
@@ -134,6 +135,87 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
         let requests = await saver.requests
         XCTAssertEqual(requests.map(\.stamp), [stamp(1), stamp(3)])
     }
+
+    func testPermanentFailuresRetainIdentitiesStampsAndCursorWithoutRetrying() async {
+        for cause in [NotebookSaveFailure.contentLimit, .revisionConflict, .corruptData,
+                      .unsupportedFormat, .unsafeStorage, .invalidContent, .unexpected] {
+            let saver = SuspendedNotebookSaver()
+            let baseRevision = UUID()
+            let coordinator = NotebookSaveCoordinator<String>(
+                initialSnapshot: "", expectedRevisionID: baseRevision
+            ) { snapshot, stamp, revision in
+                try await saver.save(snapshot: snapshot, stamp: stamp, revision: revision)
+            }
+            coordinator.enqueue(snapshot: "A", stamp: stamp(1))
+            coordinator.enqueue(snapshot: "B", stamp: stamp(2))
+            let original = coordinator.pendingEdits
+            let generation = coordinator.generation
+            await saver.waitForRequests(1)
+            await saver.fail(cause)
+            await coordinator.waitUntilSettled()
+            coordinator.retry()
+            await coordinator.waitUntilSettled()
+            XCTAssertEqual(coordinator.status, .failed(cause))
+            XCTAssertEqual(coordinator.pendingEdits, original)
+            XCTAssertEqual(coordinator.generation, generation)
+            XCTAssertEqual(coordinator.expectedRevisionID, baseRevision)
+            XCTAssertFalse(coordinator.canAcceptInput)
+            let requests = await saver.requests
+            XCTAssertEqual(requests.count, 1)
+        }
+    }
+
+    func testGenerationAndStableIDsDistinguishEqualCountsAndLateCompletedEdits() async {
+        let saver = SuspendedNotebookSaver()
+        let coordinator = coordinator(saver: saver)
+        coordinator.enqueue(snapshot: "A", stamp: stamp(1))
+        coordinator.enqueue(snapshot: "B", stamp: stamp(2))
+        let captured = coordinator.pendingEdits
+        let generation = coordinator.generation
+        await saver.waitForRequests(1)
+        await saver.fail(.storageFull)
+        await coordinator.waitUntilSettled()
+        coordinator.enqueue(snapshot: "A", stamp: stamp(3))
+        XCTAssertEqual(Array(coordinator.pendingEdits.prefix(2)), captured)
+        XCTAssertEqual(coordinator.pendingEdits.map(\.stamp), [stamp(1), stamp(2), stamp(3)])
+        XCTAssertEqual(Set(coordinator.pendingEdits.map(\.id)).count, 3)
+        XCTAssertGreaterThan(coordinator.generation, generation)
+        coordinator.retry()
+        await saver.waitForRequests(2)
+        await saver.succeed(NotebookSaveReceipt(revisionID: UUID(), savedAt: Date()))
+        await saver.waitForRequests(3)
+        XCTAssertEqual(coordinator.pendingCount, captured.count)
+        XCTAssertNotEqual(coordinator.pendingEdits.map(\.id), captured.map(\.id))
+        XCTAssertGreaterThan(coordinator.generation, generation)
+        await saver.succeed(NotebookSaveReceipt(revisionID: UUID(), savedAt: Date()))
+        await saver.waitForRequests(4)
+        await saver.succeed(NotebookSaveReceipt(revisionID: UUID(), savedAt: Date()))
+        await coordinator.waitUntilSettled()
+    }
+
+    func testFailuresUseTypedRepositoryCodecAndUnderlyingOperatingSystemCodes() {
+        XCTAssertEqual(NotebookSaveFailure.classify(NotebookRepositoryError.recoveryRequired), .corruptData)
+        XCTAssertEqual(NotebookSaveFailure.classify(NotebookRepositoryError.revisionConflict), .revisionConflict)
+        XCTAssertEqual(NotebookSaveFailure.classify(NotebookRepositoryError.unsafePath("path")), .unsafeStorage)
+        XCTAssertEqual(NotebookSaveFailure.classify(InkCodec.CodecError.tooManyStrokes), .contentLimit)
+        XCTAssertEqual(NotebookSaveFailure.classify(InkCodec.CodecError.duplicateStrokeID), .invalidContent)
+        XCTAssertEqual(NotebookSaveFailure.classify(
+            NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteOutOfSpace.rawValue)
+        ), .storageFull)
+        XCTAssertEqual(NotebookSaveFailure.classify(
+            NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteVolumeReadOnly.rawValue)
+        ), .storageUnavailable)
+        let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        let wrapped = NSError(
+            domain: NSCocoaErrorDomain, code: CocoaError.fileWriteUnknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: underlying]
+        )
+        XCTAssertEqual(NotebookSaveFailure.classify(wrapped), .storageFull)
+        XCTAssertFalse(NotebookSaveFailure.contentLimit.canRetry)
+        XCTAssertTrue(NotebookSaveFailure.storageFull.canRetry)
+        XCTAssertTrue(NotebookSaveFailure.storageUnavailable.canRetry)
+    }
+
 }
 
 private actor SuspendedNotebookSaver {
@@ -141,10 +223,6 @@ private actor SuspendedNotebookSaver {
         let snapshot: String
         let stamp: NotebookEditStamp
         let revision: UUID?
-    }
-
-    enum Failure: Error {
-        case injected
     }
 
     private(set) var requests: [Request] = []
@@ -190,9 +268,9 @@ private actor SuspendedNotebookSaver {
         pending?.resume(returning: receipt)
     }
 
-    func fail() {
+    func fail(_ error: any Error = NotebookSaveFailure.storageUnavailable) {
         let pending = continuation
         continuation = nil
-        pending?.resume(throwing: Failure.injected)
+        pending?.resume(throwing: error)
     }
 }
