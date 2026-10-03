@@ -188,7 +188,12 @@ final class NotebookSession: ObservableObject {
               observation.generation > latestCanvasGeneration else { return false }
         latestCanvasGeneration = observation.generation
         workingDrawing = observation.drawing
-        workingSignature = try? InkDrawingSignature(observation.drawing)
+        if let signature = observation.signature {
+            workingSignature = signature
+        } else {
+            workingSignature = try? InkDrawingSignature(observation.drawing)
+            if let workingSignature { renderDiagnostics.observationWork.add(workingSignature.constructionWork) }
+        }
         enqueueCurrentDrawing(stamp: NotebookEditStamp(
             capturedAt: observation.capturedAt, uptime: observation.uptime, sessionID: editSessionID
         ))
@@ -438,10 +443,10 @@ final class NotebookSession: ObservableObject {
 
     private func retain(_ drawing: PKDrawing) {
         let signature = try? InkDrawingSignature(drawing)
+        if let signature { renderDiagnostics.observationWork.add(signature.constructionWork) }
         if let signature, let workingSignature {
             let comparison = signature.compared(to: workingSignature)
-            renderDiagnostics.barrierPointComparisons += comparison.work.comparedPoints
-            renderDiagnostics.barrierSignatureChecks += comparison.work.signatureChecks
+            renderDiagnostics.observationWork.add(comparison.work)
             if comparison.isEqual { return }
         }
         workingSignature = signature
@@ -543,6 +548,18 @@ struct NotebookCanvasObservation: Sendable {
     let drawing: PKDrawing
     let capturedAt: Date
     let uptime: TimeInterval
+    let signature: InkDrawingSignature?
+
+    init(
+        generation: UInt64, drawing: PKDrawing, capturedAt: Date, uptime: TimeInterval,
+        signature: InkDrawingSignature? = nil
+    ) {
+        self.generation = generation
+        self.drawing = drawing
+        self.capturedAt = capturedAt
+        self.uptime = uptime
+        self.signature = signature
+    }
 }
 
 @MainActor
@@ -587,7 +604,47 @@ final class NotebookSavePresentationModel: ObservableObject {
 final class NotebookRenderDiagnostics {
     var screenBodyCount = 0
     var canvasUpdateCount = 0
-    var barrierPointComparisons = 0
-    var barrierSignatureChecks = 0
+    var observationWork = NotebookObservationWork()
 }
 
+
+struct NotebookObservationWork {
+    private(set) var serializedStrokes = 0
+    private(set) var copiedArchiveBytes = 0
+    private(set) var hashedArchiveBytes = 0
+    private(set) var fallbackArchiveBytes = 0
+    private(set) var maskFallbacks = 0
+    private(set) var comparedPoints = 0
+    private(set) var signatureChecks = 0
+    private(set) var maskSnapshots = 0
+    private(set) var comparedMaskPaths = 0
+    private(set) var encodedRenderStates = 0
+    private(set) var renderStateBytes = 0
+    private(set) var renderStateFallbacks = 0
+
+    mutating func add(_ work: InkCodec.WorkMetrics) {
+        serializedStrokes += work.serializedStrokes
+        copiedArchiveBytes += work.copiedArchiveBytes
+        hashedArchiveBytes += work.hashedArchiveBytes
+        fallbackArchiveBytes += work.fallbackArchiveBytes
+        maskFallbacks += work.maskFallbacks
+        comparedPoints += work.comparedPoints
+        signatureChecks += work.signatureChecks
+        maskSnapshots += work.maskSnapshots
+        comparedMaskPaths += work.comparedMaskPaths
+        encodedRenderStates += work.encodedRenderStates
+        renderStateBytes += work.renderStateBytes
+        renderStateFallbacks += work.renderStateFallbacks
+    }
+
+    var values: [String: Int] {
+        [
+            "serializations": serializedStrokes, "copiedArchiveBytes": copiedArchiveBytes,
+            "assetSHABytes": hashedArchiveBytes, "fallbackArchiveBytes": fallbackArchiveBytes,
+            "maskFallbacks": maskFallbacks, "pointComparisons": comparedPoints,
+            "signatureChecks": signatureChecks, "maskSnapshots": maskSnapshots,
+            "maskComparisons": comparedMaskPaths, "renderStateEncodings": encodedRenderStates,
+            "renderStateBytes": renderStateBytes, "renderStateFallbacks": renderStateFallbacks
+        ]
+    }
+}

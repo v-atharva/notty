@@ -34,8 +34,9 @@ final class NotebookViewController: UIViewController {
     private var lastDeliveredSignature: InkDrawingSignature?
     private var observedGeneration: UInt64 = 0
     private var lastObservation: NotebookCanvasObservation?
-    private(set) var barrierPointComparisons = 0
-    private(set) var barrierSignatureChecks = 0
+    private(set) var observationWork = NotebookObservationWork()
+    var barrierPointComparisons: Int { observationWork.comparedPoints }
+    var barrierSignatureChecks: Int { observationWork.signatureChecks }
     private var isUsingTool = false
     private(set) var inputGate = NotebookInputGate.open
     private var pageCount: Int
@@ -53,6 +54,7 @@ final class NotebookViewController: UIViewController {
         self.lastDeliveredSignature = try? InkDrawingSignature(initialDrawing)
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
         super.init(nibName: nil, bundle: nil)
+        if let lastDeliveredSignature { observationWork.add(lastDeliveredSignature.constructionWork) }
     }
 
     @available(*, unavailable)
@@ -184,14 +186,24 @@ final class NotebookViewController: UIViewController {
         updateInsets()
     }
 
-    private func observeDrawing() {
+    private func observeDrawing(signature: InkDrawingSignature? = nil) {
+        let drawing = canvas.drawing
+        let capturedAt = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let capturedSignature: InkDrawingSignature?
+        if let signature {
+            capturedSignature = signature
+        } else {
+            capturedSignature = try? InkDrawingSignature(drawing)
+            if let capturedSignature { observationWork.add(capturedSignature.constructionWork) }
+        }
         let observation = NotebookCanvasObservation(
-            generation: observedGeneration + 1, drawing: canvas.drawing,
-            capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime
+            generation: observedGeneration + 1, drawing: drawing,
+            capturedAt: capturedAt, uptime: uptime, signature: capturedSignature
         )
         observedGeneration = observation.generation
         lastObservation = observation
-        lastDeliveredSignature = try? InkDrawingSignature(observation.drawing)
+        lastDeliveredSignature = capturedSignature
         if let onObservation {
             setInputGate(onObservation(observation))
         } else if let onCompletedEdit {
@@ -201,13 +213,13 @@ final class NotebookViewController: UIViewController {
 
     func captureBarrier() -> NotebookCanvasObservation? {
         let signature = try? InkDrawingSignature(canvas.drawing)
+        if let signature { observationWork.add(signature.constructionWork) }
         if let signature, let previous = lastDeliveredSignature {
             let comparison = signature.compared(to: previous)
-            barrierPointComparisons += comparison.work.comparedPoints
-            barrierSignatureChecks += comparison.work.signatureChecks
+            observationWork.add(comparison.work)
             if comparison.isEqual { return lastObservation }
         }
-        observeDrawing()
+        observeDrawing(signature: signature)
         return lastObservation
     }
 

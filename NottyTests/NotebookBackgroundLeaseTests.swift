@@ -322,6 +322,52 @@ final class NotebookBackgroundLeaseTests: XCTestCase {
         XCTAssertEqual(calls, 2)
     }
 
+    func testAttachedOversizedDrawingRepeatedFlushDoesNotCreateAnUnendingRecoveryTail() async throws {
+        let fixture = try await failedSession(
+            suspendPreserve: false, enqueueDrawing: false
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let seed = fixture.session.makeCanvasSeed()
+        let controller = NotebookViewController(pageCount: seed.pageCount, initialDrawing: seed.drawing)
+        controller.loadViewIfNeeded()
+        controller.onObservation = { [weak session = fixture.session] observation in
+            guard let session else { return .readOnly }
+            session.recordObservation(observation, ownerID: seed.ownerID)
+            return session.inputGateForCanvas(ownerID: seed.ownerID)
+        }
+        fixture.session.attachCanvas(ownerID: seed.ownerID, observations: { [weak controller] in
+            controller?.captureBarrier()
+        })
+        defer { controller.tearDown() }
+        let template = NotebookTestFixtures.stroke()
+        let strokes = (0...InkCodec.maximumStrokeCount).map { _ in
+            var stroke = template
+            stroke.id = UUID()
+            return stroke
+        }
+        controller.canvasView.drawing = PKDrawing(strokes: strokes)
+        _ = controller.captureBarrier()
+        await fixture.session.waitUntilSettled()
+        XCTAssertEqual(fixture.session.saveState, .failed(.contentLimit))
+        fixture.session.flush()
+        await fixture.session.waitUntilSettled()
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        let protected = fixture.session.pendingEdits
+        let copies = await fixture.probe.preserveCalls
+        XCTAssertFalse(protected.isEmpty)
+        XCTAssertEqual(copies, 1)
+        for _ in 0..<4 {
+            fixture.session.flush()
+            await fixture.session.waitUntilSettled()
+        }
+        XCTAssertEqual(fixture.session.pendingEdits, protected)
+        XCTAssertTrue(fixture.session.canReopenSaved)
+        let after = await fixture.probe.preserveCalls
+        XCTAssertEqual(after, copies)
+        XCTAssertEqual(fixture.leases.started, 1)
+        XCTAssertEqual(fixture.leases.ended, [101])
+    }
+
     private struct FailedSession {
         let session: NotebookSession
         let probe: NotebookStorageProbe

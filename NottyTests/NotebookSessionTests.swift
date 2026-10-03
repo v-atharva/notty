@@ -330,6 +330,8 @@ final class NotebookSessionTests: XCTestCase {
                 && session.renderDiagnostics.canvasUpdateCount > 0
                 && self.notebookController(in: hosting) != nil
         }
+        try await Task.sleep(for: .milliseconds(80))
+        hosting.view.layoutIfNeeded()
         let controller = try XCTUnwrap(notebookController(in: hosting))
         let controllerID = ObjectIdentifier(controller)
         let screenBefore = session.renderDiagnostics.screenBodyCount

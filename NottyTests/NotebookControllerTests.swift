@@ -333,7 +333,10 @@ final class NotebookControllerTests: XCTestCase {
         controller.tearDown()
         XCTAssertEqual(observations.count, 3)
         XCTAssertGreaterThan(controller.barrierSignatureChecks, 0)
-        print("Notty generation barriers: observations=3 points=\(controller.barrierPointComparisons) signatures=\(controller.barrierSignatureChecks)")
+        let metrics = try? JSONSerialization.data(
+            withJSONObject: controller.observationWork.values, options: [.sortedKeys]
+        )
+        if let metrics { print("NOTTY_BARRIER_METRIC \(String(decoding: metrics, as: UTF8.self))") }
     }
 
     private func present(_ controller: NotebookViewController) -> UIWindow {
