@@ -78,10 +78,10 @@ struct NotebookHistoryWriter {
             try NotebookFileSystem.ensureDirectory(checkpoints)
             let destination = checkpoints.appendingPathComponent("\(digest).json")
             if try NotebookFileSystem.kind(destination) != nil {
+                metrics?.record(\.metadataReadCalls)
                 let existing = try NotebookFileSystem.read(
                     destination, maximumBytes: NotebookRepository.maximumMetadataBytes
                 )
-                metrics?.record(\.metadataReadCalls)
                 metrics?.record(\.metadataReadBytes, existing.count)
                 guard existing == data else {
                     throw NotebookRepositoryError.corruptData("An immutable checkpoint has different bytes.")

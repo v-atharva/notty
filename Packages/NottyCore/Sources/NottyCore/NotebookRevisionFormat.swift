@@ -181,7 +181,7 @@ enum NotebookRevisionFormat {
             }
         }
         var useReplacement = false
-        if !moves.isEmpty { useReplacement = try encode(moves).count > encode(target).count }
+        if !moves.isEmpty { useReplacement = try encode(moves, metrics: metrics).count > encode(target, metrics: metrics).count }
         return Delta(
             removedIDs: removed.isEmpty ? nil : removed,
             upserts: upserts.isEmpty ? nil : upserts,

@@ -382,8 +382,8 @@ struct NotebookHistory {
             throw NotebookRepositoryError.corruptData("A committed history file is missing.")
         }
         do {
-            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
             metrics?.record(\.metadataReadCalls)
+            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
             metrics?.record(\.metadataReadBytes, data.count)
             return data
         } catch let error as NotebookRepositoryError {
@@ -405,8 +405,8 @@ struct NotebookHistory {
             throw NotebookRepositoryError.corruptData("A committed stroke asset is missing.")
         }
         do {
-            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
             metrics?.record(\.assetReadCalls)
+            let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
             metrics?.record(\.assetReadBytes, data.count)
             return data
         } catch let error as NotebookRepositoryError {
