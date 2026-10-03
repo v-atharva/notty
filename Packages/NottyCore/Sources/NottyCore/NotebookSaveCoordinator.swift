@@ -66,6 +66,7 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
     @Published public private(set) var pendingCount = 0
     @Published public private(set) var generation: UInt64 = 0
 
+    public var onStateChange: (() -> Void)?
     public let capacity: Int
     public private(set) var expectedRevisionID: UUID?
     public var pendingEdits: [NotebookPendingEdit<Snapshot>] { pending }
@@ -154,12 +155,14 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
             if status != .saving { status = .saving }
             startWriter()
         }
+        onStateChange?()
     }
 
     public func retry() {
         guard failure?.canRetry == true, !pending.isEmpty else { return }
         status = .saving
         startWriter()
+        onStateChange?()
     }
 
     public func waitUntilSettled() async {
@@ -184,6 +187,7 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
             let submitted = Array(pending.prefix(min(capacity, batchLimit)))
             do {
                 let result = try await saveBatch(submitted, expectedRevisionID)
+                defer { onStateChange?() }
                 guard validates(result, submitted: submitted),
                       pending.starts(with: submitted) else {
                     status = .failed(.corruptData)
@@ -206,6 +210,7 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
                 }
             } catch {
                 status = .failed(NotebookSaveFailure.classify(error))
+                onStateChange?()
                 return
             }
         }
@@ -221,6 +226,8 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
               result.committed.allSatisfy({
                   $0.sequence > 0 && $0.savedAt.timeIntervalSinceReferenceDate.isFinite
               }) else { return false }
+        if let expectedRevisionID,
+           result.committed.contains(where: { $0.revisionID == expectedRevisionID }) { return false }
         for pair in zip(result.committed, result.committed.dropFirst()) {
             guard pair.0.sequence < Int.max, pair.1.sequence == pair.0.sequence + 1 else { return false }
         }

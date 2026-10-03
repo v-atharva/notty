@@ -37,12 +37,12 @@ final class NotebookViewController: UIViewController {
     private(set) var observationWork = NotebookObservationWork()
     var barrierPointComparisons: Int { observationWork.comparedPoints }
     var barrierSignatureChecks: Int { observationWork.signatureChecks }
-    private var isUsingTool = false
     private(set) var inputGate = NotebookInputGate.open
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
     private var observesToolPicker = false
+    private var paletteKeepsAccess = true
 
     private var logicalHeight: CGFloat {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
@@ -75,6 +75,7 @@ final class NotebookViewController: UIViewController {
         canvas.drawing = initialDrawing
         canvas.delegate = self
         canvas.permitsMutation = inputGate.allowsMutation
+        paletteKeepsAccess = inputGate.keepsPalette
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.drawingPolicy = .pencilOnly
@@ -172,15 +173,19 @@ final class NotebookViewController: UIViewController {
 
     func setInputGate(_ gate: NotebookInputGate) {
         guard gate != inputGate else { return }
-        let previousGate = inputGate
         inputGate = gate
         guard isViewLoaded else { return }
         canvas.permitsMutation = gate.allowsMutation
-        guard previousGate.keepsPalette != gate.keepsPalette else { return }
-        toolPicker.setVisible(gate.keepsPalette && view.window != nil, forFirstResponder: canvas)
-        if gate.keepsPalette && view.window != nil {
+        applyPaletteGate()
+    }
+
+    private func applyPaletteGate() {
+        guard !canvas.hasActiveTool, paletteKeepsAccess != inputGate.keepsPalette else { return }
+        paletteKeepsAccess = inputGate.keepsPalette
+        toolPicker.setVisible(inputGate.keepsPalette && view.window != nil, forFirstResponder: canvas)
+        if inputGate.keepsPalette && view.window != nil {
             canvas.becomeFirstResponder()
-        } else if !gate.keepsPalette {
+        } else if !inputGate.keepsPalette {
             canvas.resignFirstResponder()
         }
         updateInsets()
@@ -305,7 +310,6 @@ final class NotebookViewController: UIViewController {
 
 extension NotebookViewController: PKCanvasViewDelegate {
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-        isUsingTool = true
         canvas.hasActiveTool = true
     }
 
@@ -315,8 +319,8 @@ extension NotebookViewController: PKCanvasViewDelegate {
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         _ = captureBarrier()
-        isUsingTool = false
         canvas.hasActiveTool = false
+        applyPaletteGate()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {

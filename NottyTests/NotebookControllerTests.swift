@@ -269,7 +269,8 @@ final class NotebookControllerTests: XCTestCase {
 
     func testObservedStatesDuringToolUseKeepGenerationsAndDeferCapacityDisableUntilEnd() {
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
-        controller.loadViewIfNeeded()
+        let window = present(controller)
+        defer { window.isHidden = true }
         var observations: [NotebookCanvasObservation] = []
         controller.onObservation = {
             observations.append($0)
@@ -294,10 +295,17 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertNil(canvas.undoManager)
         XCTAssertFalse(canvas.canPerformAction(NSSelectorFromString("paste:"), withSender: nil))
+        controller.setInputGate(.failed)
+        XCTAssertTrue(canvas.isDrawingEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertTrue(canvas.isFirstResponder)
+        XCTAssertTrue(controller.drawingToolPicker.isVisible)
         controller.canvasViewDidEndUsingTool(canvas)
         XCTAssertFalse(canvas.isDrawingEnabled)
         XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertEqual(observations.count, 2)
+        XCTAssertFalse(canvas.isFirstResponder)
+        XCTAssertFalse(controller.drawingToolPicker.isVisible)
         controller.tearDown()
         XCTAssertEqual(observations.count, 2)
     }

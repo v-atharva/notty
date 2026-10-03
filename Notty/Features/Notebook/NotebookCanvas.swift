@@ -3,11 +3,11 @@ import SwiftUI
 @MainActor
 struct NotebookCanvas: UIViewControllerRepresentable {
     let session: NotebookSession
-    @ObservedObject var gateModel: NotebookCanvasGateModel
+    let pageCount: Int
 
     init(session: NotebookSession) {
         self.session = session
-        self.gateModel = session.gateModel
+        self.pageCount = session.pageCount
     }
 
     func makeUIViewController(context: Context) -> NotebookViewController {
@@ -20,9 +20,11 @@ struct NotebookCanvas: UIViewControllerRepresentable {
             session.recordObservation(observation, ownerID: seed.ownerID)
             return session.inputGateForCanvas(ownerID: seed.ownerID)
         }
-        session.attachCanvas(ownerID: seed.ownerID, observations: { [weak controller] in
-            controller?.captureBarrier()
-        })
+        session.attachCanvas(
+            ownerID: seed.ownerID,
+            observations: { [weak controller] in controller?.captureBarrier() },
+            applyInputGate: { [weak controller] in controller?.setInputGate($0) }
+        )
         controller.onDetach = { [weak session] in
             session?.detachCanvas(ownerID: seed.ownerID)
         }
@@ -32,9 +34,7 @@ struct NotebookCanvas: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: NotebookViewController, context: Context) {
         session.renderDiagnostics.canvasUpdateCount += 1
-        controller.setPageCount(gateModel.state.pageCount)
-        let gate = gateModel.state.inputGate
-        if controller.inputGate != gate { controller.setInputGate(gate) }
+        controller.setPageCount(pageCount)
     }
 
     static func dismantleUIViewController(

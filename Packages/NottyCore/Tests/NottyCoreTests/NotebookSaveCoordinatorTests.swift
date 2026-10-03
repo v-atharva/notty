@@ -255,7 +255,7 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
     }
 
     func testMalformedBatchOutcomesAcknowledgeNothingAndNeverSpin() async {
-        for variant in 0..<6 {
+        for variant in 0..<7 {
             let saver = SuspendedNotebookBatchSaver()
             let base = UUID()
             let coordinator = NotebookSaveCoordinator<String>(
@@ -287,9 +287,14 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
                     index: 1, editID: UUID(), cause: .storageFull
                 )
             )
-            default: outcome = NotebookSaveBatchOutcome(committed: [
+            case 5: outcome = NotebookSaveBatchOutcome(committed: [
                 NotebookCommittedEdit(
                     editID: original[0].id, revisionID: UUID(), sequence: 0, savedAt: Date()
+                )
+            ])
+            default: outcome = NotebookSaveBatchOutcome(committed: [
+                NotebookCommittedEdit(
+                    editID: original[0].id, revisionID: base, sequence: 1, savedAt: Date()
                 )
             ])
             }

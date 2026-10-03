@@ -362,6 +362,69 @@ final class NotebookSessionTests: XCTestCase {
         print("Notty UI generation work: edits=20 screenBodies=\(session.renderDiagnostics.screenBodyCount - screenBefore) canvasUpdates=\(session.renderDiagnostics.canvasUpdateCount - canvasBefore)")
     }
 
+    func testAsyncSaveCompletionPushesGateDirectlyWithoutAnyRepresentableUpdate() async throws {
+        let (session, probe, root) = try await setup()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await probe.setSaveFailure(nil)
+        await probe.setSuspendSave()
+        let seed = session.makeCanvasSeed()
+        let controller = NotebookViewController(pageCount: seed.pageCount, initialDrawing: seed.drawing)
+        controller.loadViewIfNeeded()
+        session.attachCanvas(
+            ownerID: seed.ownerID,
+            observations: { [weak controller] in controller?.captureBarrier() },
+            applyInputGate: { [weak controller] in controller?.setInputGate($0) }
+        )
+        defer { controller.tearDown() }
+        for index in 1...8 {
+            session.recordObservation(
+                NotebookCanvasObservation(
+                    generation: UInt64(index),
+                    drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke(x: CGFloat(index))]),
+                    capturedAt: Date(timeIntervalSince1970: Double(index)), uptime: Double(index)
+                ), ownerID: seed.ownerID
+            )
+        }
+        await probe.waitForSave()
+        XCTAssertEqual(controller.inputGate, .capacity)
+        XCTAssertFalse(controller.canvasView.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, 0)
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        XCTAssertTrue(session.pendingEdits.isEmpty)
+        XCTAssertEqual(controller.inputGate, .open)
+        XCTAssertTrue(controller.canvasView.isDrawingEnabled)
+        XCTAssertTrue(controller.canvasView.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, 0)
+        let replacement = session.makeCanvasSeed()
+        let newer = NotebookViewController(pageCount: replacement.pageCount, initialDrawing: replacement.drawing)
+        newer.loadViewIfNeeded()
+        session.attachCanvas(
+            ownerID: replacement.ownerID, observations: { nil },
+            applyInputGate: { [weak newer] in newer?.setInputGate($0) }
+        )
+        session.detachCanvas(ownerID: seed.ownerID)
+        await probe.setSuspendSave()
+        for index in 1...8 {
+            session.recordObservation(
+                NotebookCanvasObservation(
+                    generation: UInt64(index),
+                    drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke(x: CGFloat(index + 20))]),
+                    capturedAt: Date(timeIntervalSince1970: Double(index + 20)), uptime: Double(index + 20)
+                ), ownerID: replacement.ownerID
+            )
+        }
+        await probe.waitForSave()
+        XCTAssertEqual(newer.inputGate, .capacity)
+        XCTAssertEqual(controller.inputGate, .open)
+        await probe.releaseSave()
+        await session.waitUntilSettled()
+        XCTAssertEqual(newer.inputGate, .open)
+        XCTAssertEqual(controller.inputGate, .open)
+        session.detachCanvas(ownerID: replacement.ownerID)
+        newer.tearDown()
+    }
+
     private func notebookController(in controller: UIViewController) -> NotebookViewController? {
         if let notebook = controller as? NotebookViewController { return notebook }
         for child in controller.children {

@@ -52,11 +52,12 @@ final class NotebookSession: ObservableObject {
     private let backgroundLease: NotebookBackgroundLease
     private var storage: NotebookStorage?
     private var coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>?
-    private var coordinatorObservation: AnyCancellable?
     private var loadStarted = false
     private var activeCanvasOwner: UUID?
     private var snapshotProvider: (() -> PKDrawing?)?
     private var observationProvider: (() -> NotebookCanvasObservation?)?
+    private var canvasGateSink: ((NotebookInputGate) -> Void)?
+    private var lastPushedCanvasGate: NotebookInputGate?
     private var latestCanvasGeneration: UInt64 = 0
     private var workingSignature: InkDrawingSignature?
     let gateModel = NotebookCanvasGateModel()
@@ -149,6 +150,8 @@ final class NotebookSession: ObservableObject {
         activeCanvasOwner = owner
         snapshotProvider = nil
         observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
         latestCanvasGeneration = 0
         return CanvasSeed(ownerID: owner, drawing: workingDrawing, pageCount: pageCount)
     }
@@ -156,15 +159,21 @@ final class NotebookSession: ObservableObject {
     func attachCanvas(ownerID: UUID, snapshot: @escaping () -> PKDrawing?) {
         guard activeCanvasOwner == ownerID else { return }
         observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
         snapshotProvider = snapshot
     }
 
     func attachCanvas(
-        ownerID: UUID, observations: @escaping () -> NotebookCanvasObservation?
+        ownerID: UUID, observations: @escaping () -> NotebookCanvasObservation?,
+        applyInputGate: @escaping (NotebookInputGate) -> Void = { _ in }
     ) {
         guard activeCanvasOwner == ownerID else { return }
         observationProvider = observations
         snapshotProvider = nil
+        canvasGateSink = applyInputGate
+        lastPushedCanvasGate = nil
+        refreshPresentation()
     }
 
     func detachCanvas(ownerID: UUID) {
@@ -173,6 +182,8 @@ final class NotebookSession: ObservableObject {
         activeCanvasOwner = nil
         snapshotProvider = nil
         observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
     }
 
     @discardableResult
@@ -524,8 +535,9 @@ final class NotebookSession: ObservableObject {
                 )
             }
         )
-        coordinatorObservation = coordinator.objectWillChange.sink { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshPresentation() }
+        coordinator.onStateChange = { [weak self, weak coordinator] in
+            guard let self, let coordinator, self.coordinator === coordinator else { return }
+            self.refreshPresentation()
         }
         self.coordinator = coordinator
         canvasGeneration = UUID()
@@ -534,6 +546,10 @@ final class NotebookSession: ObservableObject {
     }
 
     private func refreshPresentation() {
+        if activeCanvasOwner != nil, let canvasGateSink, lastPushedCanvasGate != inputGate {
+            lastPushedCanvasGate = inputGate
+            canvasGateSink(inputGate)
+        }
         gateModel.update(pageCount: pageCount, inputGate: inputGate)
         statusModel.update(NotebookSavePresentation(
             status: saveState, inputPaused: inputPaused, performingRecovery: isPerformingRecovery,
@@ -607,12 +623,13 @@ final class NotebookRenderDiagnostics {
     var observationWork = NotebookObservationWork()
 }
 
-
 struct NotebookObservationWork {
     private(set) var serializedStrokes = 0
     private(set) var copiedArchiveBytes = 0
     private(set) var hashedArchiveBytes = 0
-    private(set) var fallbackArchiveBytes = 0
+    private(set) var propertyListRenderStates = 0
+    private(set) var nativeDrawingFallbackSnapshots = 0
+    private(set) var nativeDrawingEqualityFallbacks = 0
     private(set) var maskFallbacks = 0
     private(set) var comparedPoints = 0
     private(set) var signatureChecks = 0
@@ -626,7 +643,9 @@ struct NotebookObservationWork {
         serializedStrokes += work.serializedStrokes
         copiedArchiveBytes += work.copiedArchiveBytes
         hashedArchiveBytes += work.hashedArchiveBytes
-        fallbackArchiveBytes += work.fallbackArchiveBytes
+        propertyListRenderStates += work.propertyListRenderStates
+        nativeDrawingFallbackSnapshots += work.nativeDrawingFallbackSnapshots
+        nativeDrawingEqualityFallbacks += work.nativeDrawingEqualityFallbacks
         maskFallbacks += work.maskFallbacks
         comparedPoints += work.comparedPoints
         signatureChecks += work.signatureChecks
@@ -640,7 +659,10 @@ struct NotebookObservationWork {
     var values: [String: Int] {
         [
             "serializations": serializedStrokes, "copiedArchiveBytes": copiedArchiveBytes,
-            "assetSHABytes": hashedArchiveBytes, "fallbackArchiveBytes": fallbackArchiveBytes,
+            "assetSHABytes": hashedArchiveBytes,
+            "propertyListRenderStates": propertyListRenderStates,
+            "nativeDrawingFallbackSnapshots": nativeDrawingFallbackSnapshots,
+            "nativeDrawingEqualityFallbacks": nativeDrawingEqualityFallbacks,
             "maskFallbacks": maskFallbacks, "pointComparisons": comparedPoints,
             "signatureChecks": signatureChecks, "maskSnapshots": maskSnapshots,
             "maskComparisons": comparedMaskPaths, "renderStateEncodings": encodedRenderStates,
