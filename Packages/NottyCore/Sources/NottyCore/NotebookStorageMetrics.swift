@@ -31,11 +31,17 @@ public struct NotebookStorageMetrics: Sendable, Equatable {
 final class NotebookStorageMetricsRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var value = NotebookStorageMetrics()
+    private let parent: NotebookStorageMetricsRecorder?
+
+    init(parent: NotebookStorageMetricsRecorder? = nil) {
+        self.parent = parent
+    }
 
     func record(_ key: WritableKeyPath<NotebookStorageMetrics, Int>, _ amount: Int = 1) {
         lock.lock()
-        defer { lock.unlock() }
         value[keyPath: key] += amount
+        lock.unlock()
+        parent?.record(key, amount)
     }
 
     func snapshot() -> NotebookStorageMetrics {

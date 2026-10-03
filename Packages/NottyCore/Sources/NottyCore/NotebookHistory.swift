@@ -9,6 +9,55 @@ struct NotebookHistory {
         let sequence: Int
     }
 
+    /// A single contiguous authenticated metadata prefix, scoped to one exact HEAD.
+    final class MetadataIndex {
+        struct Entry {
+            let link: Link
+            let parentID: UUID?
+            let parentDigest: String?
+            let checkpointDigest: String?
+        }
+
+        var entries: [Entry] = []
+        var visited = Set<UUID>()
+        var offsets: [UUID: Int] = [:]
+        var reachedGenesis = false
+        var summaries: [UUID: NotebookRevisionSummary] = [:]
+    }
+
+    private struct SummaryReplay {
+        var ids: Set<UUID>
+        var title: String
+        var pageCount: Int
+
+        init(_ state: Format.State) {
+            ids = Set(state.strokes.map(\.id))
+            title = state.title
+            pageCount = state.pageCount
+        }
+
+        mutating func apply(_ delta: Format.Delta) throws {
+            try Format.validateDeltaShape(delta)
+            let removed = delta.removedIDs ?? []
+            guard removed.allSatisfy({ ids.contains($0) }) else {
+                throw NotebookRepositoryError.corruptData("A history delta removes an unknown stroke.")
+            }
+            for id in removed { ids.remove(id) }
+            for reference in delta.upserts ?? [] { ids.insert(reference.id) }
+            guard ids.count <= NotebookRepository.maximumStrokeCount,
+                  (delta.placements ?? []).allSatisfy({
+                    ids.contains($0.id) && (0..<ids.count).contains($0.index)
+                  }) else {
+                throw NotebookRepositoryError.corruptData("A history delta has an invalid placement.")
+            }
+            if let replacement = delta.replacementOrder, Set(replacement) != ids {
+                throw NotebookRepositoryError.corruptData("A history delta has an inconsistent replacement order.")
+            }
+            title = delta.titleChange ?? title
+            pageCount = delta.pageCountChange ?? pageCount
+        }
+    }
+
     struct AuditResult {
         let report: NotebookHistoryAudit
         let summaries: [NotebookRevisionSummary]
@@ -278,11 +327,140 @@ struct NotebookHistory {
         )
     }
 
-    func materializeRevision(_ id: UUID, head: Format.Head) throws -> Format.Materialized {
-        let links = try selectedLinks(head)
-        guard let link = links.first(where: { $0.revisionID == id }) else {
-            throw NotebookRepositoryError.invalidContent("The requested revision is not committed.")
+    private func extendIndex(
+        _ index: MetadataIndex, through offset: Int, head: Format.Head
+    ) throws {
+        let generation = head.schemaVersion == 2 ? try generationDirectory(head) : nil
+        while index.entries.count <= offset && !index.reachedGenesis {
+            try auditCancellation?.check()
+            let previous = index.entries.last
+            let id = previous?.parentID ?? head.revisionID
+            let digest = previous?.parentDigest ?? (previous == nil ? head.revisionDigest : nil)
+            guard index.visited.insert(id).inserted else {
+                throw NotebookRepositoryError.corruptData("The committed history contains a cycle.")
+            }
+            let entry: MetadataIndex.Entry
+            if let generation {
+                guard let digest else {
+                    throw NotebookRepositoryError.corruptData("An authenticated parent digest is missing.")
+                }
+                let event = try readEvent(id: id, digest: digest, generation: generation).0
+                entry = MetadataIndex.Entry(
+                    link: Link(revisionID: id, digest: digest, sequence: event.sequence),
+                    parentID: event.parentRevisionID, parentDigest: event.parentDigest,
+                    checkpointDigest: event.checkpointDigest
+                )
+            } else {
+                let revisions = directory.appendingPathComponent("revisions", isDirectory: true)
+                try requireDirectory(revisions)
+                let data = try readMetadata(revisions.appendingPathComponent("\(id.uuidString.lowercased()).json"))
+                let actual = Format.digest(data, metrics: metrics)
+                guard digest == nil || digest == actual else {
+                    throw NotebookRepositoryError.corruptData("The selected legacy revision failed integrity validation.")
+                }
+                let revision: Format.LegacyRevision = try Format.decode(data)
+                try validateLegacy(revision, id: id)
+                entry = MetadataIndex.Entry(
+                    link: Link(revisionID: id, digest: actual, sequence: revision.sequence),
+                    parentID: revision.parentRevisionID, parentDigest: nil, checkpointDigest: nil
+                )
+            }
+            if let previous, entry.link.sequence != previous.link.sequence - 1 {
+                throw NotebookRepositoryError.corruptData("The committed history has a sequence gap.")
+            }
+            index.offsets[id] = index.entries.count
+            index.entries.append(entry)
+            index.reachedGenesis = entry.parentID == nil
         }
+    }
+
+    private func selectedOffset(
+        _ revisionID: UUID, head: Format.Head, index: MetadataIndex
+    ) throws -> Int {
+        while true {
+            if let offset = index.offsets[revisionID] {
+                return offset
+            }
+            guard !index.reachedGenesis else {
+                throw NotebookRepositoryError.invalidContent("The requested revision is not committed.")
+            }
+            try extendIndex(index, through: index.entries.count, head: head)
+        }
+    }
+
+    func summaries(
+        head: Format.Head, beforeRevisionID: UUID?, limit: Int, index: MetadataIndex
+    ) throws -> [NotebookRevisionSummary] {
+        let start = try beforeRevisionID.map { try selectedOffset($0, head: head, index: index) + 1 } ?? 0
+        try extendIndex(index, through: start + limit - 1, head: head)
+        let end = min(start + limit, index.entries.count)
+        guard start < end else { return [] }
+        let requested = start..<end
+        if requested.allSatisfy({ index.summaries[index.entries[$0].link.revisionID] != nil }) {
+            return requested.compactMap { index.summaries[index.entries[$0].link.revisionID] }
+        }
+        if head.schemaVersion == 1 {
+            for offset in requested {
+                let revision = try readLegacy(index.entries[offset].link)
+                index.summaries[revision.revisionID] = summary(
+                    index.entries[offset].link, title: revision.title, pageCount: revision.pageCount,
+                    count: revision.strokes.count, stamp: revision.editStamp, savedAt: revision.savedAt
+                )
+            }
+        } else {
+            let generation = try generationDirectory(head)
+            var baseline = end - 1
+            while index.entries[baseline].checkpointDigest == nil {
+                guard !index.reachedGenesis || baseline + 1 < index.entries.count else {
+                    throw NotebookRepositoryError.corruptData("The committed history has no initial checkpoint.")
+                }
+                baseline += 1
+                try extendIndex(index, through: baseline, head: head)
+            }
+            let base = index.entries[baseline]
+            let event = try readEvent(
+                id: base.link.revisionID, digest: base.link.digest, generation: generation
+            ).0
+            guard let digest = event.checkpointDigest else {
+                throw NotebookRepositoryError.corruptData("The history checkpoint is missing.")
+            }
+            var replay = SummaryReplay(try readCheckpoint(digest, event: event, generation: generation))
+            index.summaries[event.revisionID] = summary(
+                base.link, title: replay.title, pageCount: replay.pageCount, count: replay.ids.count,
+                stamp: event.editStamp, savedAt: event.savedAt
+            )
+            if baseline > start {
+                for offset in stride(from: baseline - 1, through: start, by: -1) {
+                    let entry = index.entries[offset]
+                    let event = try readEvent(
+                        id: entry.link.revisionID, digest: entry.link.digest, generation: generation
+                    ).0
+                    try replay.apply(event.delta)
+                    index.summaries[event.revisionID] = summary(
+                        entry.link, title: replay.title, pageCount: replay.pageCount, count: replay.ids.count,
+                        stamp: event.editStamp, savedAt: event.savedAt
+                    )
+                }
+            }
+        }
+        return requested.compactMap { index.summaries[index.entries[$0].link.revisionID] }
+    }
+
+    private func summary(
+        _ link: Link, title: String, pageCount: Int, count: Int,
+        stamp: NotebookEditStamp?, savedAt: Date
+    ) -> NotebookRevisionSummary {
+        NotebookRevisionSummary(
+            notebookID: notebookID, revisionID: link.revisionID, sequence: link.sequence,
+            title: title, pageCount: pageCount, strokeCount: count, editStamp: stamp, savedAt: savedAt
+        )
+    }
+
+    func materializeRevision(
+        _ id: UUID, head: Format.Head, index: MetadataIndex
+    ) throws -> Format.Materialized {
+        let offset = try selectedOffset(id, head: head, index: index)
+        let link = index.entries[offset].link
         let selected = Format.Head(
             schemaVersion: head.schemaVersion, notebookID: notebookID,
             revisionID: link.revisionID, revisionDigest: link.digest,
@@ -387,6 +565,7 @@ struct NotebookHistory {
               event.checkpointDigest.map(Format.isDigest) ?? true else {
             throw NotebookRepositoryError.corruptData("A history event has invalid digest links.")
         }
+        try Format.validateDeltaShape(event.delta)
         return (event, data.count)
     }
 

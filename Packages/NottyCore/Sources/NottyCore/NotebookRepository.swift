@@ -21,6 +21,12 @@ public actor NotebookRepository {
         let verificationEpoch: UUID
     }
 
+    private struct MetadataGeneration {
+        let snapshot: NotebookHistory.HeadSnapshot
+        let verificationEpoch: UUID
+        let index: NotebookHistory.MetadataIndex
+    }
+
     private struct PreparedContent {
         let edit: NotebookSaveEdit
         let references: [Format.Reference]
@@ -31,6 +37,7 @@ public actor NotebookRepository {
     private let repositoryID = UUID()
     private let verificationEpochs = NotebookVerificationEpochs()
     private var validatedGenerations: [UUID: ValidatedGeneration] = [:]
+    private var metadataGenerations: [UUID: MetadataGeneration] = [:]
     private let rootURL: URL
     private let migrationFaultInjector: (@Sendable (NotebookMigrationStage) throws -> Void)?
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
@@ -214,14 +221,15 @@ public actor NotebookRepository {
 
     nonisolated func auditHistory(
         pin: NotebookHistoryPin,
-        progress: (@Sendable (NotebookHistoryAuditProgress) -> Void)?
+        progress: (@Sendable (NotebookHistoryAuditProgress) -> Void)?,
+        metricsObserver: (@Sendable (NotebookStorageMetrics) -> Void)? = nil
     ) async throws -> NotebookHistoryAudit {
         guard pin.repositoryID == repositoryID, pin.root == rootURL else {
             throw NotebookRepositoryError.invalidContent("The history pin belongs to another repository.")
         }
         return try await NotebookHistoryAuditWorker.audit(
             pin: pin, epochs: verificationEpochs, metrics: metrics,
-            assetObserver: assetVerificationObserver, progress: progress
+            assetObserver: assetVerificationObserver, progress: progress, metricsObserver: metricsObserver
         )
     }
 
@@ -235,33 +243,60 @@ public actor NotebookRepository {
 
     private func invalidateValidation(_ id: UUID) {
         validatedGenerations.removeValue(forKey: id)
+        metadataGenerations.removeValue(forKey: id)
         verificationEpochs.invalidate(id)
     }
 
     public func history(
         id: UUID, beforeRevisionID: UUID? = nil, limit: Int = 50
     ) throws -> [NotebookRevisionSummary] {
-        invalidateValidation(id)
+        validatedGenerations.removeValue(forKey: id)
         guard (1...200).contains(limit) else {
             throw NotebookRepositoryError.invalidContent("History limits must be between 1 and 200.")
         }
-        let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
-        defer { NotebookFileSystem.releaseWriterLock(lock) }
-        let (history, head) = try selectedHistory(id: id)
-        let result = try history.audit(head, beforeRevisionID: beforeRevisionID, summaryLimit: limit)
-        try migrationStore(history).validateReceipt(head)
-        return result.summaries
+        do {
+            let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
+            defer { NotebookFileSystem.releaseWriterLock(lock) }
+            let (history, snapshot) = try selectedHistorySnapshot(id: id)
+            try migrationStore(history).validateReceiptRecord(snapshot.head)
+            return try history.summaries(
+                head: snapshot.head, beforeRevisionID: beforeRevisionID, limit: limit,
+                index: metadataIndex(id: id, snapshot: snapshot)
+            )
+        } catch {
+            invalidateValidation(id)
+            throw error
+        }
     }
 
     public func loadRevision(id: UUID, revisionID: UUID) throws -> StoredNotebook {
-        invalidateValidation(id)
-        let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
-        defer { NotebookFileSystem.releaseWriterLock(lock) }
-        let (history, head) = try selectedHistory(id: id)
-        _ = try history.audit(head)
-        try migrationStore(history).validateReceipt(head)
-        let revision = try history.materializeRevision(revisionID, head: head)
-        return storedNotebook(revision, id: id, strokes: try history.readAssets(revision.state))
+        validatedGenerations.removeValue(forKey: id)
+        do {
+            let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
+            defer { NotebookFileSystem.releaseWriterLock(lock) }
+            let (history, snapshot) = try selectedHistorySnapshot(id: id)
+            try migrationStore(history).validateReceiptRecord(snapshot.head)
+            let revision = try history.materializeRevision(
+                revisionID, head: snapshot.head, index: metadataIndex(id: id, snapshot: snapshot)
+            )
+            return storedNotebook(revision, id: id, strokes: try history.readAssets(revision.state))
+        } catch {
+            invalidateValidation(id)
+            throw error
+        }
+    }
+
+    private func metadataIndex(
+        id: UUID, snapshot: NotebookHistory.HeadSnapshot
+    ) -> NotebookHistory.MetadataIndex {
+        let epoch = verificationEpochs.token(for: id)
+        if let cached = metadataGenerations[id],
+           cached.snapshot == snapshot, cached.verificationEpoch == epoch { return cached.index }
+        let index = NotebookHistory.MetadataIndex()
+        metadataGenerations[id] = MetadataGeneration(
+            snapshot: snapshot, verificationEpoch: epoch, index: index
+        )
+        return index
     }
 
     public func auditHistory(id: UUID) async throws -> NotebookHistoryAudit {
@@ -270,13 +305,9 @@ public actor NotebookRepository {
         do {
             let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
             defer { NotebookFileSystem.releaseWriterLock(lock) }
-            let (history, head) = try selectedHistory(id: id)
-            let directory = notebookDirectory(id: id)
-            guard let snapshot = try history.readHeadSnapshot(), snapshot.head == head else {
-                throw NotebookRepositoryError.revisionConflict
-            }
-            let sequence = try history.selectedSequence(head)
-            try migrationStore(history).validateReceiptRecord(head, selectedSequence: sequence)
+            let (history, snapshot) = try selectedHistorySnapshot(id: id)
+            let sequence = try history.selectedSequence(snapshot.head)
+            try migrationStore(history).validateReceiptRecord(snapshot.head, selectedSequence: sequence)
             pin = makePin(snapshot, sequence: sequence)
         }
         return try await auditHistory(pin: pin)
@@ -616,6 +647,20 @@ public actor NotebookRepository {
         } catch {
             maintenanceObserver(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
         }
+    }
+
+    private func selectedHistorySnapshot(
+        id: UUID
+    ) throws -> (NotebookHistory, NotebookHistory.HeadSnapshot) {
+        let directory = notebookDirectory(id: id)
+        guard try NotebookFileSystem.existingDirectory(directory) else {
+            throw NotebookRepositoryError.invalidContent("The notebook is not committed.")
+        }
+        let history = historyStore(id: id, directory: directory)
+        guard let snapshot = try history.readHeadSnapshot() else {
+            throw NotebookRepositoryError.recoveryRequired
+        }
+        return (history, snapshot)
     }
 
     private func selectedHistory(id: UUID) throws -> (NotebookHistory, Format.Head) {

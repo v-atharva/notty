@@ -158,6 +158,33 @@ enum NotebookRevisionFormat {
         catch { throw NotebookRepositoryError.corruptData("A committed edit timestamp is invalid.") }
     }
 
+    static func validateDeltaShape(_ delta: Delta) throws {
+        let removed = delta.removedIDs ?? []
+        let upserts = delta.upserts ?? []
+        let placements = delta.placements ?? []
+        let replacement = delta.replacementOrder
+        guard removed.count <= NotebookRepository.maximumStrokeCount,
+              upserts.count <= NotebookRepository.maximumStrokeCount,
+              placements.count <= NotebookRepository.maximumStrokeCount,
+              Set(removed).count == removed.count,
+              Set(upserts.map(\.id)).count == upserts.count,
+              Set(placements.map(\.id)).count == placements.count,
+              Set(removed).isDisjoint(with: upserts.map(\.id)),
+              replacement == nil || placements.isEmpty,
+              upserts.allSatisfy({ isDigest($0.digest) }),
+              placements.allSatisfy({ $0.index >= 0 && $0.index < NotebookRepository.maximumStrokeCount }),
+              delta.titleChange.map({ $0.utf8.count <= NotebookRepository.maximumTitleBytes }) ?? true,
+              delta.pageCountChange.map({ (1...12).contains($0) }) ?? true else {
+            throw NotebookRepositoryError.corruptData("A history delta has invalid operations.")
+        }
+        if let replacement {
+            guard replacement.count <= NotebookRepository.maximumStrokeCount,
+                  Set(replacement).count == replacement.count else {
+                throw NotebookRepositoryError.corruptData("A history delta has an invalid replacement order.")
+            }
+        }
+    }
+
     static func delta(
         from old: State, to new: State, metrics: NotebookStorageMetricsRecorder? = nil
     ) throws -> Delta {
