@@ -8,7 +8,7 @@ Notty uses SwiftUI for navigation and PencilKit inside a UIKit editor. Paper is 
 
 The writing study contains native PencilKit input, finger scrolling, pinch zoom, the drawing palette, and continuous paper that can grow from three to twelve A4 sections. It saves and reopens one notebook. Save failures distinguish content limits, changed revisions, damaged or unsupported files, and unavailable storage. Pending edits retain their original order and timestamps.
 
-Writing pauses while saves catch up or a failure needs attention. Reading, scrolling and zoom remain available. Errors explain the available actions; retry is offered when the underlying condition can recover.
+Writing pauses while saves catch up or a failure needs attention. Brief capacity pauses keep the drawing palette, focus and viewport stable; failure and recovery screens suspend palette access. Reading, scrolling and zoom remain available. Errors explain the available actions; retry is offered when the underlying condition can recover.
 
 ## Recovery copies
 
@@ -34,7 +34,7 @@ Library organization, recording, PDF annotation, bookmarks, and export remain su
 
 ## Cloud checks
 
-The suite contains 80 core tests and 17 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
+The suite contains 80 core tests and 24 hosted iPad tests. The Native checks workflow runs geometry, persistence/fault, recovery, and native PencilKit archive tests on macOS 27. It compiles unsigned iPad Simulator and iPad device applications using Xcode 27 and runs hosted notebook session, canvas and lifecycle tests in an iPadOS 27 Simulator.
 
 The standard GitHub image is currently a preview; the workflow verifies actual host, toolchain and SDK versions and selects an available iPadOS 27.0 tablet simulator. A single job has a fifteen-minute limit and cancels superseded checks on the same pull request.
 
