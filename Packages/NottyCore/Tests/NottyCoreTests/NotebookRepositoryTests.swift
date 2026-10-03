@@ -590,7 +590,7 @@ final class NotebookRepositoryTests: XCTestCase {
             _ = try await repository.load(id: id)
             XCTFail("Oversized metadata was accepted.")
         } catch {
-            guard case .sizeLimitExceeded? = error as? NotebookRepositoryError else {
+            guard case .corruptData? = error as? NotebookRepositoryError else {
                 return XCTFail("Unexpected metadata error: \(error)")
             }
         }

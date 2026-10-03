@@ -353,7 +353,14 @@ struct NotebookHistory {
         guard try NotebookFileSystem.kind(url) != nil else {
             throw NotebookRepositoryError.corruptData("A committed history file is missing.")
         }
-        return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
+        do {
+            return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
+        } catch let error as NotebookRepositoryError {
+            if case .sizeLimitExceeded = error {
+                throw NotebookRepositoryError.corruptData("Committed history metadata exceeds supported bounds.")
+            }
+            throw error
+        }
     }
 
     func requireDirectory(_ url: URL) throws {
@@ -366,7 +373,14 @@ struct NotebookHistory {
         guard try NotebookFileSystem.kind(url) != nil else {
             throw NotebookRepositoryError.corruptData("A committed stroke asset is missing.")
         }
-        return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
+        do {
+            return try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
+        } catch let error as NotebookRepositoryError {
+            if case .sizeLimitExceeded = error {
+                throw NotebookRepositoryError.corruptData("A committed stroke asset exceeds supported bounds.")
+            }
+            throw error
+        }
     }
 
     private func validateLegacy(_ revision: Format.LegacyRevision, id: UUID) throws {
