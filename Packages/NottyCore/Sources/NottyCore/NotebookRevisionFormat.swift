@@ -93,9 +93,21 @@ enum NotebookRevisionFormat {
         return data
     }
 
+    private struct Envelope: Decodable { let schemaVersion: Int }
+
     static func decode<T: Decodable>(_ data: Data) throws -> T {
-        do { return try JSONDecoder().decode(T.self, from: data) }
-        catch { throw NotebookRepositoryError.corruptData("Notebook metadata is unreadable.") }
+        do {
+            let decoder = JSONDecoder()
+            let envelope = try decoder.decode(Envelope.self, from: data)
+            guard envelope.schemaVersion == 1 || envelope.schemaVersion == 2 else {
+                throw NotebookRepositoryError.unsupportedVersion(envelope.schemaVersion)
+            }
+            return try decoder.decode(T.self, from: data)
+        } catch let error as NotebookRepositoryError {
+            throw error
+        } catch {
+            throw NotebookRepositoryError.corruptData("Notebook metadata is unreadable.")
+        }
     }
 
     static func digest(_ data: Data) -> String {
@@ -174,62 +186,78 @@ enum NotebookRevisionFormat {
         )
     }
 
-    static func apply(_ delta: Delta, to old: State) throws -> State {
-        let removed = delta.removedIDs ?? []
-        let updates = delta.upserts ?? []
-        let moves = delta.placements ?? []
-        guard Set(removed).count == removed.count,
-              Set(updates.map(\.id)).count == updates.count,
-              Set(moves.map(\.id)).count == moves.count,
-              Set(removed).isDisjoint(with: updates.map(\.id)),
-              delta.replacementOrder == nil || moves.isEmpty else {
-            throw NotebookRepositoryError.corruptData("A history delta contains contradictory operations.")
+    /// Mutates a single ordered state during audit without copying every historic drawing.
+    final class Replay {
+        private var order: [UUID]
+        private var references: [UUID: Reference]
+        private(set) var title: String
+        private(set) var pageCount: Int
+
+        init(_ state: State = .empty) {
+            title = state.title
+            pageCount = state.pageCount
+            order = state.strokes.map(\.id)
+            references = Dictionary(uniqueKeysWithValues: state.strokes.map { ($0.id, $0) })
         }
-        var references = old.strokes
-        let existingIDs = Set(references.map(\.id))
-        guard Set(removed).isSubset(of: existingIDs) else {
-            throw NotebookRepositoryError.corruptData("A history delta removes missing strokes.")
+
+        var count: Int { order.count }
+        var state: State {
+            State(title: title, pageCount: pageCount, strokes: order.compactMap { references[$0] })
         }
-        let removedSet = Set(removed)
-        references.removeAll { removedSet.contains($0.id) }
-        var positions = Dictionary(uniqueKeysWithValues: references.enumerated().map { ($0.element.id, $0.offset) })
-        for update in updates {
-            guard isDigest(update.digest) else {
-                throw NotebookRepositoryError.corruptData("A history delta has an invalid asset digest.")
+
+        func reference(_ id: UUID) -> Reference? { references[id] }
+
+        func apply(_ delta: Delta) throws {
+            let removed = delta.removedIDs ?? []
+            let updates = delta.upserts ?? []
+            let moves = delta.placements ?? []
+            let removedSet = Set(removed)
+            guard removedSet.count == removed.count,
+                  Set(updates.map(\.id)).count == updates.count,
+                  Set(moves.map(\.id)).count == moves.count,
+                  removedSet.isDisjoint(with: updates.map(\.id)),
+                  delta.replacementOrder == nil || moves.isEmpty,
+                  removed.allSatisfy({ references[$0] != nil }) else {
+                throw NotebookRepositoryError.corruptData("A history delta contains contradictory operations.")
             }
-            if let index = positions[update.id] {
-                references[index] = update
-            } else {
-                positions[update.id] = references.count
-                references.append(update)
+            if !removed.isEmpty {
+                order.removeAll { removedSet.contains($0) }
+                for id in removed { references.removeValue(forKey: id) }
             }
-        }
-        for move in moves {
-            guard references.indices.contains(move.index),
-                  let index = references.firstIndex(where: { $0.id == move.id }) else {
-                throw NotebookRepositoryError.corruptData("A history delta has an invalid placement.")
-            }
-            let reference = references.remove(at: index)
-            references.insert(reference, at: move.index)
-        }
-        if let order = delta.replacementOrder {
-            guard order.count == references.count, Set(order).count == order.count,
-                  Set(order) == Set(references.map(\.id)) else {
-                throw NotebookRepositoryError.corruptData("A history delta has an invalid replacement order.")
-            }
-            let byID = Dictionary(uniqueKeysWithValues: references.map { ($0.id, $0) })
-            references = try order.map {
-                guard let reference = byID[$0] else {
-                    throw NotebookRepositoryError.corruptData("A reordered stroke is missing.")
+            for update in updates {
+                guard isDigest(update.digest) else {
+                    throw NotebookRepositoryError.corruptData("A history delta has an invalid asset digest.")
                 }
-                return reference
+                if references[update.id] == nil { order.append(update.id) }
+                references[update.id] = update
+            }
+            for move in moves {
+                guard order.indices.contains(move.index),
+                      let source = order.firstIndex(of: move.id) else {
+                    throw NotebookRepositoryError.corruptData("A history delta has an invalid placement.")
+                }
+                let id = order.remove(at: source)
+                order.insert(id, at: move.index)
+            }
+            if let replacement = delta.replacementOrder {
+                guard replacement.count == order.count, Set(replacement).count == replacement.count,
+                      replacement.allSatisfy({ references[$0] != nil }) else {
+                    throw NotebookRepositoryError.corruptData("A history delta has an invalid replacement order.")
+                }
+                order = replacement
+            }
+            title = delta.titleChange ?? title
+            pageCount = delta.pageCountChange ?? pageCount
+            guard (1...12).contains(pageCount), title.utf8.count <= NotebookRepository.maximumTitleBytes,
+                  order.count <= NotebookRepository.maximumStrokeCount else {
+                throw NotebookRepositoryError.corruptData("The notebook state exceeds supported bounds.")
             }
         }
-        let state = State(
-            title: delta.titleChange ?? old.title,
-            pageCount: delta.pageCountChange ?? old.pageCount, strokes: references
-        )
-        try validateState(state)
-        return state
+    }
+
+    static func apply(_ delta: Delta, to old: State) throws -> State {
+        let replay = Replay(old)
+        try replay.apply(delta)
+        return replay.state
     }
 }

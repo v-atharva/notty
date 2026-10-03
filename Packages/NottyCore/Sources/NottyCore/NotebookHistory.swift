@@ -148,10 +148,10 @@ struct NotebookHistory {
                 throw NotebookRepositoryError.corruptData("The active history has a sequence gap.")
             }
             if let checkpoint = event.checkpointDigest {
-                var state = try readCheckpoint(checkpoint, event: event, generation: generation)
+                let replay = Format.Replay(try readCheckpoint(checkpoint, event: event, generation: generation))
                 var credit = 0
                 for (later, bytes) in tail.reversed() {
-                    state = try Format.apply(later.delta, to: state)
+                    try replay.apply(later.delta)
                     credit = try addingCredit(credit, bytes)
                 }
                 guard let newest else {
@@ -160,7 +160,7 @@ struct NotebookHistory {
                 return Format.Materialized(
                     revisionID: newest.revisionID, sequence: newest.sequence,
                     editStamp: newest.editStamp, savedAt: newest.savedAt,
-                    state: state, checkpointCredit: credit
+                    state: replay.state, checkpointCredit: credit
                 )
             }
             tail.append((event, bytes))
@@ -189,9 +189,11 @@ struct NotebookHistory {
             upperBound = links.count
         }
         let lowerBound = max(0, upperBound - summaryLimit)
+        try validateAssetsDirectory(.empty)
         var summaries: [NotebookRevisionSummary] = []
-        var state = Format.State.empty
+        var replay = Format.Replay()
         var sizes: [String: Int] = [:]
+        var totalBytes = 0
         var credit = 0
         let generation = head.schemaVersion == 2 ? try generationDirectory(head) : nil
         for (index, link) in links.enumerated() {
@@ -199,11 +201,12 @@ struct NotebookHistory {
             let savedAt: Date
             if let generation {
                 let (event, bytes) = try readEvent(id: link.revisionID, digest: link.digest, generation: generation)
-                state = try Format.apply(event.delta, to: state)
+                try verifyDeltaAssets(event.delta, replay: replay, sizes: &sizes, totalBytes: &totalBytes)
+                try replay.apply(event.delta)
                 credit = try addingCredit(credit, bytes)
                 if let checkpoint = event.checkpointDigest {
                     let checkpointState = try readCheckpoint(checkpoint, event: event, generation: generation)
-                    guard checkpointState == state else {
+                    guard checkpointState == replay.state else {
                         throw NotebookRepositoryError.corruptData("A history checkpoint does not match its event replay.")
                     }
                     let checkpointBytes = try readMetadata(
@@ -220,15 +223,15 @@ struct NotebookHistory {
                 savedAt = event.savedAt
             } else {
                 let revision = try readLegacy(link)
-                state = revision.state
+                replay = Format.Replay(revision.state)
+                try verifyStateAssets(revision.state, sizes: &sizes)
                 stamp = revision.editStamp
                 savedAt = revision.savedAt
             }
-            try verifyStateAssets(state, sizes: &sizes)
             if summaryLimit > 0, (lowerBound..<upperBound).contains(index) {
                 summaries.append(NotebookRevisionSummary(
                     notebookID: notebookID, revisionID: link.revisionID, sequence: link.sequence,
-                    title: state.title, pageCount: state.pageCount, strokeCount: state.strokes.count,
+                    title: replay.title, pageCount: replay.pageCount, strokeCount: replay.count,
                     editStamp: stamp, savedAt: savedAt
                 ))
             }
@@ -387,6 +390,43 @@ struct NotebookHistory {
         }
     }
 
+    private func verifyDeltaAssets(
+        _ delta: Format.Delta, replay: Format.Replay,
+        sizes: inout [String: Int], totalBytes: inout Int
+    ) throws {
+        let removed = delta.removedIDs ?? []
+        let updates = delta.upserts ?? []
+        guard Set(removed).count == removed.count,
+              Set(updates.map(\.id)).count == updates.count,
+              Set(removed).isDisjoint(with: updates.map(\.id)) else {
+            throw NotebookRepositoryError.corruptData("A history delta contains contradictory asset changes.")
+        }
+        for id in removed {
+            guard let reference = replay.reference(id), let bytes = sizes[reference.digest] else {
+                throw NotebookRepositoryError.corruptData("A history delta removes an unverified stroke.")
+            }
+            totalBytes -= bytes
+        }
+        for reference in updates {
+            guard Format.isDigest(reference.digest) else {
+                throw NotebookRepositoryError.corruptData("A history delta has an invalid asset digest.")
+            }
+            if let previous = replay.reference(reference.id) {
+                guard let bytes = sizes[previous.digest] else {
+                    throw NotebookRepositoryError.corruptData("A changed historical stroke was not verified.")
+                }
+                totalBytes -= bytes
+            }
+            if sizes[reference.digest] == nil {
+                sizes[reference.digest] = try readAsset(reference).count
+            }
+            totalBytes += sizes[reference.digest] ?? 0
+        }
+        guard (0...NotebookRepository.maximumNotebookBytes).contains(totalBytes) else {
+            throw NotebookRepositoryError.corruptData("A historical state exceeds 64 MiB.")
+        }
+    }
+
     private func verifyStateAssets(_ state: Format.State, sizes: inout [String: Int]) throws {
         try validateAssetsDirectory(state)
         var total = 0
@@ -394,7 +434,7 @@ struct NotebookHistory {
             if sizes[reference.digest] == nil { sizes[reference.digest] = try readAsset(reference).count }
             total += sizes[reference.digest] ?? 0
             guard total <= NotebookRepository.maximumNotebookBytes else {
-                throw NotebookRepositoryError.sizeLimitExceeded("A historical state exceeds 64 MiB.")
+                throw NotebookRepositoryError.corruptData("A historical state exceeds 64 MiB.")
             }
         }
     }

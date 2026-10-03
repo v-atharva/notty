@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct NotebookHistoryMigration {
@@ -8,6 +9,7 @@ struct NotebookHistoryMigration {
         let receipt: NotebookMigrationReceipt
         let legacyHeadDigest: String
         let anchor: Format.Head
+        let legacyChainDigest: String
     }
 
     let root: URL
@@ -110,7 +112,8 @@ struct NotebookHistoryMigration {
         )
         let record = Record(
             schemaVersion: 1, receipt: publicReceipt,
-            legacyHeadDigest: Format.digest(oldHeadData), anchor: anchor
+            legacyHeadDigest: Format.digest(oldHeadData), anchor: anchor,
+            legacyChainDigest: chainDigest(links)
         )
         let recordData = try Format.encode(record)
         try NotebookFileSystem.writeSynchronized(
@@ -149,6 +152,11 @@ struct NotebookHistoryMigration {
         guard legacy.schemaVersion == 1 else {
             throw NotebookRepositoryError.corruptData("The retained rollback HEAD is not legacy history.")
         }
+        let legacyLinks = try history.selectedLinks(legacy)
+        guard legacyLinks.count == stored.record.receipt.revisionCount,
+              chainDigest(legacyLinks) == stored.record.legacyChainDigest else {
+            throw NotebookRepositoryError.corruptData("Retained legacy history differs from the migration receipt.")
+        }
         _ = try history.audit(legacy)
         let current = try history.current(legacy)
         let strokes = try history.readAssets(current.state)
@@ -170,6 +178,10 @@ struct NotebookHistoryMigration {
             ),
             savedAt: current.savedAt
         )
+    }
+
+    func validateReceipt(_ head: Format.Head) throws {
+        if head.migrationReceiptDigest != nil { _ = try receipt(head) }
     }
 
     private func receipt(_ head: Format.Head) throws -> (
@@ -207,7 +219,22 @@ struct NotebookHistoryMigration {
               legacy.generationID == nil, legacy.migrationReceiptDigest == nil else {
             throw NotebookRepositoryError.corruptData("The preserved legacy HEAD has inconsistent identities.")
         }
+        let links = try history.selectedLinks(head)
+        guard Format.isDigest(record.legacyChainDigest),
+              let anchorIndex = links.firstIndex(where: { $0.revisionID == record.anchor.revisionID }),
+              anchorIndex + 1 == record.receipt.revisionCount,
+              links[anchorIndex].digest == record.anchor.revisionDigest else {
+            throw NotebookRepositoryError.corruptData("The migration receipt is not anchored in selected history.")
+        }
         return (record, digest, legacyData)
+    }
+
+    private func chainDigest(_ links: [NotebookHistory.Link]) -> String {
+        var hash = SHA256()
+        for link in links {
+            hash.update(data: Data("\(link.revisionID.uuidString.lowercased()):\(link.digest)\n".utf8))
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func selectedHead(_ record: Record, digest: String) -> Format.Head {
