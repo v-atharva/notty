@@ -430,7 +430,7 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(historical.content, baseline.content)
     }
 
-    func testSuccessfulFullOpenSeedsFirstSaveWithOnlyHeadRead() async throws {
+    func testSuccessfulCurrentOpenSeedsFirstSaveWithOnlyHeadRead() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -450,7 +450,7 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         XCTAssertEqual(after.metadataReadCalls - before.metadataReadCalls, 1)
     }
 
-    func testFailedFullOpenDiscardsPriorGenerationBeforeCandidateFreeSave() async throws {
+    func testFailedCurrentOpenDiscardsPriorGenerationBeforeCandidateFreeSave() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -461,7 +461,7 @@ final class NotebookIncrementalStorageTests: XCTestCase {
         try Data("damaged".utf8).write(to: asset)
         do {
             _ = try await repository.load(id: id)
-            XCTFail("Full open trusted cached verification.")
+            XCTFail("Current open trusted cached verification.")
         } catch NotebookRepositoryError.corruptData {}
         let headURL = notebook(root, id).appendingPathComponent("HEAD.json")
         let bytes = try Data(contentsOf: headURL)

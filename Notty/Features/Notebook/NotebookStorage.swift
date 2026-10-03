@@ -9,6 +9,9 @@ struct NotebookStorage: Sendable {
     let preserve: @Sendable (NotebookRecoveryBatch) async throws -> NotebookRecoveryReceipt
     let listRecovery: @Sendable () async throws -> NotebookRecoveryScan
     let loadRecovery: @Sendable (UUID) async throws -> NotebookRecoveryBatch
+    let openForEditing: (@Sendable () async throws -> NotebookOpening)?
+    let captureHistoryPin: (@Sendable (UUID) async throws -> NotebookHistoryPin)?
+    let auditHistory: (@Sendable (NotebookHistoryPin) async -> NotebookIntegrityOutcome)?
     let storageMetrics: (@Sendable () async throws -> NotebookStorageMetrics)?
 
     init(
@@ -18,6 +21,9 @@ struct NotebookStorage: Sendable {
         listRecovery: @escaping @Sendable () async throws -> NotebookRecoveryScan,
         loadRecovery: @escaping @Sendable (UUID) async throws -> NotebookRecoveryBatch,
         storageMetrics: (@Sendable () async throws -> NotebookStorageMetrics)? = nil,
+        openForEditing: (@Sendable () async throws -> NotebookOpening)? = nil,
+        captureHistoryPin: (@Sendable (UUID) async throws -> NotebookHistoryPin)? = nil,
+        auditHistory: (@Sendable (NotebookHistoryPin) async -> NotebookIntegrityOutcome)? = nil,
         saveBatch: (@Sendable ([NotebookSaveEdit], UUID?) async throws -> NotebookBatchSaveResult)? = nil
     ) {
         self.load = load
@@ -26,6 +32,9 @@ struct NotebookStorage: Sendable {
         self.listRecovery = listRecovery
         self.loadRecovery = loadRecovery
         self.storageMetrics = storageMetrics
+        self.openForEditing = openForEditing
+        self.captureHistoryPin = captureHistoryPin
+        self.auditHistory = auditHistory
         self.saveBatch = saveBatch ?? { edits, revision in
             var committed: [NotebookCommittedEdit] = []
             var cursor = revision
@@ -101,6 +110,9 @@ struct NotebookStorage: Sendable {
                 listRecovery: { try await recovery.scan(notebookID: notebookID) },
                 loadRecovery: { try await recovery.load(id: $0) },
                 storageMetrics: { try await repository.currentMetrics() },
+                openForEditing: { try await repository.openForEditing() },
+                captureHistoryPin: { try await repository.captureHistoryPin(expectedRevisionID: $0) },
+                auditHistory: { await repository.auditHistory(pin: $0) },
                 saveBatch: { try await repository.saveBatch(edits: $0, expectedRevisionID: $1) }
             )
         }.value
@@ -154,6 +166,30 @@ private actor NotebookRepositoryAccess {
         try await openedRepository().load(id: notebookID)
     }
 
+    func openForEditing() async throws -> NotebookOpening {
+        if let result = try await openedRepository().open(id: notebookID) {
+            return NotebookOpening(notebook: result.notebook, historyPin: result.historyPin)
+        }
+        return NotebookOpening(notebook: nil, historyPin: nil)
+    }
+
+    func captureHistoryPin(expectedRevisionID: UUID) async throws -> NotebookHistoryPin {
+        try await openedRepository().captureHistoryPin(
+            id: notebookID, expectedRevisionID: expectedRevisionID
+        )
+    }
+
+    func auditHistory(pin: NotebookHistoryPin) async -> NotebookIntegrityOutcome {
+        do {
+            let repository = try openedRepository()
+            return .verified(try await repository.auditHistory(pin: pin))
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            return NotebookIntegrityOutcome.failure(error)
+        }
+    }
+
     func currentMetrics() async throws -> NotebookStorageMetrics {
         try await openedRepository().storageMetrics()
     }
@@ -168,5 +204,31 @@ private actor NotebookRepositoryAccess {
         try await openedRepository().save(
             id: notebookID, content: content, expectedRevisionID: expectedRevisionID
         )
+    }
+}
+
+struct NotebookOpening: Sendable {
+    let notebook: StoredNotebook?
+    let historyPin: NotebookHistoryPin?
+
+    var requiresFirstPublicationRefresh: Bool {
+        notebook == nil || historyPin?.requiresFirstPublicationRefresh == true
+    }
+}
+
+enum NotebookIntegrityOutcome: Sendable {
+    case verified(NotebookHistoryAudit)
+    case damaged(NotebookSaveFailure)
+    case incomplete(NotebookSaveFailure)
+    case cancelled
+
+    static func failure(_ error: any Error) -> Self {
+        let failure = NotebookSaveFailure.classify(error)
+        switch failure {
+        case .corruptData, .unsupportedFormat, .unsafeStorage:
+            return .damaged(failure)
+        default:
+            return .incomplete(failure)
+        }
     }
 }

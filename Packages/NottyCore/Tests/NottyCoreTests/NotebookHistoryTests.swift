@@ -121,7 +121,7 @@ final class NotebookHistoryTests: XCTestCase {
         XCTAssertEqual(audit.verifiedAssetCount, digests.count)
     }
 
-    func testCorruptReachableOldEventCheckpointAndHistoricalAssetFailCurrentLoad() async throws {
+    func testCorruptHistoricalFilesOutsideCurrentPathOpenAndFailFullAudit() async throws {
         let root = try Fixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -146,7 +146,8 @@ final class NotebookHistoryTests: XCTestCase {
             let original = try Data(contentsOf: url)
             try Data([0, 1, 2, 3]).write(to: url)
             let reader = try NotebookRepository(rootURL: root)
-            await assertCorruptLoad(reader, id: id)
+            let opened = try await reader.load(id: id)
+            Fixtures.assertSame(try XCTUnwrap(opened), try XCTUnwrap(saved.last))
             do {
                 _ = try await reader.auditHistory(id: id)
                 XCTFail("The historical audit must reject reachable corruption.")
@@ -158,7 +159,7 @@ final class NotebookHistoryTests: XCTestCase {
         }
     }
 
-    func testOversizedReachableHistoricalFilesFailAsCorruptionWithoutChangingHead() async throws {
+    func testOversizedHistoricalFilesOutsideCurrentPathFailAuditWithoutChangingHead() async throws {
         let root = try Fixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -190,7 +191,8 @@ final class NotebookHistoryTests: XCTestCase {
             let original = try Data(contentsOf: url)
             try Data(repeating: 0, count: bytes).write(to: url)
             let reader = try NotebookRepository(rootURL: root)
-            await assertCorruptLoad(reader, id: id)
+            let opened = try await reader.load(id: id)
+            Fixtures.assertSame(try XCTUnwrap(opened), try XCTUnwrap(saved.last))
             do {
                 _ = try await reader.auditHistory(id: id)
                 XCTFail("Oversized retained history is corrupt committed data.")
@@ -304,7 +306,7 @@ final class NotebookHistoryTests: XCTestCase {
         Fixtures.assertSame(try XCTUnwrap(current), saved)
     }
 
-    func testOversizedLegacyHistoricalStateCannotHideBehindSmallHeadAndSharedAsset() async throws {
+    func testOversizedLegacyHistoricalStateOpensSmallHeadAndFailsAuditAndMigration() async throws {
         let root = try Fixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
         let shared = Fixtures.asset(index: 1, bytes: 4 * 1_024 * 1_024).data
@@ -316,7 +318,12 @@ final class NotebookHistoryTests: XCTestCase {
         let current = NotebookContent(title: "Empty head", pageCount: 3, strokes: [])
         let fixture = try Fixtures.writeLegacy(root: root, contents: [oversized, current])
         let repository = try NotebookRepository(rootURL: root)
-        await assertCorruptLoad(repository, id: fixture.notebookID)
+        let opened = try await repository.load(id: fixture.notebookID)
+        Fixtures.assertSame(try XCTUnwrap(opened), try XCTUnwrap(fixture.states.last))
+        do {
+            _ = try await repository.auditHistory(id: fixture.notebookID)
+            XCTFail("The full audit must reject an oversized historical logical state.")
+        } catch NotebookRepositoryError.corruptData(_) {}
         do {
             _ = try await repository.migrateHistory(
                 id: fixture.notebookID, expectedRevisionID: fixture.states.last!.revisionID
@@ -384,7 +391,7 @@ final class NotebookHistoryTests: XCTestCase {
         Fixtures.assertSame(try XCTUnwrap(current), saved)
     }
 
-    func testAuthenticatedCheckpointWithoutSufficientByteCreditFailsPublicOpen() async throws {
+    func testAuthenticatedUnfundedCheckpointOpensCurrentStateAndFailsFullAudit() async throws {
         let root = try Fixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
@@ -413,16 +420,12 @@ final class NotebookHistoryTests: XCTestCase {
         head["revisionDigest"] = Fixtures.digest(eventData)
         try Fixtures.writeObject(head, to: headURL)
         let reopened = try NotebookRepository(rootURL: root)
-        await assertCorruptLoad(reopened, id: id)
+        let opened = try await reopened.load(id: id)
+        Fixtures.assertSame(try XCTUnwrap(opened), latest)
+        do {
+            _ = try await reopened.auditHistory(id: id)
+            XCTFail("The full audit must reject an unfunded authenticated checkpoint.")
+        } catch NotebookRepositoryError.corruptData(_) {}
     }
 
-    private func assertCorruptLoad(_ repository: NotebookRepository, id: UUID) async {
-        do {
-            _ = try await repository.load(id: id)
-            XCTFail("Current load must audit reachable historical corruption.")
-        } catch NotebookRepositoryError.corruptData(_) {
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
-    }
 }

@@ -50,6 +50,7 @@ struct NotebookScreen: View {
                     } label: {
                         Label("Recovery copies", systemImage: "clock.arrow.circlepath")
                     }
+                    NotebookIntegrityIndicator(session: session, model: session.integrityModel)
                     NotebookExtendPaperButton(session: session, model: session.gateModel)
                 }
             }
@@ -131,6 +132,77 @@ private struct NotebookSaveStatusView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(Color(red: 0.98, green: 0.96, blue: 0.91))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+@MainActor
+private struct NotebookIntegrityIndicator: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookIntegrityPresentationModel
+    @State private var showsDetails = false
+
+    var body: some View {
+        Button {
+            showsDetails = true
+        } label: {
+            Group {
+                switch model.state {
+                case .checking:
+                    ProgressView().controlSize(.small)
+                case .verified:
+                    Image(systemName: "checkmark.shield")
+                case .damaged:
+                    Image(systemName: "exclamationmark.shield")
+                case .incomplete:
+                    Image(systemName: "questionmark.circle")
+                case nil:
+                    Image(systemName: "checkmark.shield").hidden()
+                }
+            }
+            .frame(width: 28, height: 28)
+        }
+        .disabled(model.state == nil)
+        .accessibilityLabel(model.state?.label ?? "Notebook history")
+        .accessibilityHidden(model.state == nil)
+        .popover(isPresented: $showsDetails) {
+            NotebookIntegrityDetails(session: session, integrity: model, saves: session.statusModel)
+        }
+        .onChange(of: model.state) { _, state in
+            guard let state, state != .checking else { return }
+            AccessibilityNotification.Announcement(state.label).post()
+        }
+    }
+}
+
+@MainActor
+private struct NotebookIntegrityDetails: View {
+    let session: NotebookSession
+    @ObservedObject var integrity: NotebookIntegrityPresentationModel
+    @ObservedObject var saves: NotebookSavePresentationModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let state = integrity.state {
+                Text(state.label).font(.headline)
+                Text(state.detail)
+                if case .damaged = state {
+                    Button("Preserve recovery copy") {
+                        Task { await session.saveRecoveryCopy() }
+                    }
+                    .disabled(!saves.state.canPreserveRecovery)
+                    if saves.state.canReopenSaved {
+                        Button("Reopen saved notebook") {
+                            Task { await session.reopenSavedNotebook() }
+                        }
+                    }
+                }
+                if let message = saves.state.recoveryMessage { Text(message) }
+                if let failure = saves.state.recoveryFailure { Text(failure.message) }
+            }
+        }
+        .padding(20)
+        .frame(idealWidth: 320, alignment: .leading)
         .accessibilityElement(children: .contain)
     }
 }

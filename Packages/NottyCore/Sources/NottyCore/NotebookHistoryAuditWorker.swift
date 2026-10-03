@@ -36,12 +36,14 @@ enum NotebookHistoryAuditWorker {
         pin: NotebookHistoryPin, epochs: NotebookVerificationEpochs,
         metrics: NotebookStorageMetricsRecorder,
         assetObserver: (@Sendable (String) -> Void)?,
-        progress: (@Sendable (NotebookHistoryAuditProgress) -> Void)?
+        progress: (@Sendable (NotebookHistoryAuditProgress) -> Void)?,
+        metricsObserver: (@Sendable (NotebookStorageMetrics) -> Void)?
     ) async throws -> NotebookHistoryAudit {
         let cancellation = NotebookHistoryAuditCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
+                    let operationMetrics = NotebookStorageMetricsRecorder(parent: metrics)
                     do {
                         try cancellation.check()
                         progress?(.willBeginAudit)
@@ -51,7 +53,7 @@ enum NotebookHistoryAuditWorker {
                         )
                         let history = NotebookHistory(
                             directory: directory, notebookID: pin.notebookID,
-                            assetVerificationObserver: assetObserver, metrics: metrics,
+                            assetVerificationObserver: assetObserver, metrics: operationMetrics,
                             auditCancellation: cancellation, auditProgress: progress
                         )
                         try history.requireDirectory(pin.root)
@@ -63,14 +65,17 @@ enum NotebookHistoryAuditWorker {
                         try migration.validateReceipt(pin.snapshot.head, links: result.links)
                         progress?(.willReturnReport)
                         try cancellation.check()
+                        metricsObserver?(operationMetrics.snapshot())
                         continuation.resume(returning: result.report)
                     } catch {
                         do { try cancellation.check() }
                         catch {
+                            metricsObserver?(operationMetrics.snapshot())
                             continuation.resume(throwing: error)
                             return
                         }
                         if !(error is CancellationError) { epochs.invalidate(pin.notebookID) }
+                        metricsObserver?(operationMetrics.snapshot())
                         continuation.resume(throwing: error)
                     }
                 }
