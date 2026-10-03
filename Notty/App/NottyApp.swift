@@ -4,7 +4,11 @@ import SwiftUI
 struct NottyApp: App {
     var body: some Scene {
         WindowGroup {
-            NotebookScreen()
+            if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+                Color.clear
+            } else {
+                NotebookScreen()
+            }
         }
     }
 }
