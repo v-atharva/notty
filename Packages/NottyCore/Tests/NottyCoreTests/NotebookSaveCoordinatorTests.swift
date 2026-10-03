@@ -193,6 +193,133 @@ final class NotebookSaveCoordinatorTests: XCTestCase {
         await coordinator.waitUntilSettled()
     }
 
+    func testBatchBudgetPrefixDrainsLateTailWithoutChangingIdentitiesOrStamps() async {
+        let saver = SuspendedNotebookBatchSaver()
+        let base = UUID()
+        let coordinator = NotebookSaveCoordinator<String>(
+            expectedRevisionID: base, saveBatch: { try await saver.save($0, revision: $1) }
+        )
+        coordinator.enqueue(edit: NotebookPendingEdit(snapshot: "0", stamp: stamp(0)))
+        await saver.waitForRequests(1)
+        for index in 1...8 {
+            coordinator.enqueue(edit: NotebookPendingEdit(snapshot: String(index), stamp: stamp(index)))
+        }
+        let original = coordinator.pendingEdits
+        await saver.succeed(committedCount: 1)
+        await saver.waitForRequests(2)
+        let second = await saver.requests[1]
+        XCTAssertEqual(second.edits.map(\.id), Array(original.dropFirst()).map(\.id))
+        XCTAssertEqual(second.edits.map(\.stamp), Array(original.dropFirst()).map(\.stamp))
+        XCTAssertEqual(second.edits.count, 8)
+        coordinator.enqueue(edit: NotebookPendingEdit(snapshot: "late", stamp: stamp(99)))
+        let tail = coordinator.pendingEdits
+        await saver.succeed(committedCount: 3)
+        await saver.waitForRequests(3)
+        let third = await saver.requests[2]
+        XCTAssertEqual(third.edits, Array(tail.dropFirst(3)))
+        XCTAssertEqual(coordinator.pendingEdits, third.edits)
+        await saver.succeed(committedCount: third.edits.count)
+        await coordinator.waitUntilSettled()
+        let requests = await saver.requests
+        XCTAssertEqual(requests[0].revision, base)
+        XCTAssertNotEqual(requests[1].revision, base)
+        XCTAssertNotEqual(requests[2].revision, requests[1].revision)
+        XCTAssertTrue(coordinator.pendingEdits.isEmpty)
+        XCTAssertTrue(coordinator.canAcceptInput)
+    }
+
+    func testBatchIndexedFailureCommitsOnlyMatchingPrefixAndRetryKeepsTail() async {
+        let saver = SuspendedNotebookBatchSaver()
+        let coordinator = NotebookSaveCoordinator<String>(
+            saveBatch: { try await saver.save($0, revision: $1) }
+        )
+        for index in 0..<4 {
+            coordinator.enqueue(edit: NotebookPendingEdit(snapshot: String(index), stamp: stamp(index)))
+        }
+        let original = coordinator.pendingEdits
+        await saver.waitForRequests(1)
+        await saver.succeed(committedCount: 2, failure: .storageUnavailable)
+        await coordinator.waitUntilSettled()
+        XCTAssertEqual(coordinator.pendingEdits, Array(original.dropFirst(2)))
+        XCTAssertEqual(coordinator.status, .failed(.storageUnavailable))
+        let revision = coordinator.expectedRevisionID
+        XCTAssertNotNil(revision)
+        coordinator.retry()
+        await saver.waitForRequests(2)
+        let request = await saver.requests[1]
+        XCTAssertEqual(request.edits, Array(original.dropFirst(2)))
+        XCTAssertEqual(request.revision, revision)
+        await saver.succeed(committedCount: 2)
+        await coordinator.waitUntilSettled()
+        XCTAssertTrue(coordinator.pendingEdits.isEmpty)
+    }
+
+    func testMalformedBatchOutcomesAcknowledgeNothingAndNeverSpin() async {
+        for variant in 0..<6 {
+            let saver = SuspendedNotebookBatchSaver()
+            let base = UUID()
+            let coordinator = NotebookSaveCoordinator<String>(
+                expectedRevisionID: base, saveBatch: { try await saver.save($0, revision: $1) }
+            )
+            for index in 0..<3 {
+                coordinator.enqueue(edit: NotebookPendingEdit(snapshot: String(index), stamp: stamp(index)))
+            }
+            let original = coordinator.pendingEdits
+            await saver.waitForRequests(1)
+            let first = NotebookCommittedEdit(
+                editID: original[0].id, revisionID: UUID(), sequence: 1, savedAt: Date()
+            )
+            let wrong = NotebookCommittedEdit(
+                editID: original[1].id, revisionID: first.revisionID, sequence: 1, savedAt: Date()
+            )
+            let outcome: NotebookSaveBatchOutcome
+            switch variant {
+            case 0: outcome = NotebookSaveBatchOutcome(committed: [])
+            case 1: outcome = NotebookSaveBatchOutcome(committed: [wrong])
+            case 2: outcome = NotebookSaveBatchOutcome(committed: [first, wrong])
+            case 3: outcome = NotebookSaveBatchOutcome(
+                committed: [first], rejection: NotebookPendingFailure(
+                    index: 2, editID: original[2].id, cause: .storageFull
+                )
+            )
+            case 4: outcome = NotebookSaveBatchOutcome(
+                committed: [first], rejection: NotebookPendingFailure(
+                    index: 1, editID: UUID(), cause: .storageFull
+                )
+            )
+            default: outcome = NotebookSaveBatchOutcome(committed: [
+                NotebookCommittedEdit(
+                    editID: original[0].id, revisionID: UUID(), sequence: 0, savedAt: Date()
+                )
+            ])
+            }
+            await saver.finish(outcome)
+            await coordinator.waitUntilSettled()
+            XCTAssertEqual(coordinator.pendingEdits, original)
+            XCTAssertEqual(coordinator.expectedRevisionID, base)
+            XCTAssertEqual(coordinator.status, .failed(.corruptData))
+            let requests = await saver.requests
+            XCTAssertEqual(requests.count, 1)
+        }
+    }
+
+    func testExplicitObservedEditsKeepEqualStatesWithDifferentIDsAndStamps() async {
+        let saver = SuspendedNotebookBatchSaver()
+        let coordinator = NotebookSaveCoordinator<String>(
+            saveBatch: { try await saver.save($0, revision: $1) }
+        )
+        let edits = (0..<3).map {
+            NotebookPendingEdit(snapshot: "same", stamp: stamp($0))
+        }
+        edits.forEach { coordinator.enqueue(edit: $0) }
+        await saver.waitForRequests(1)
+        let request = await saver.requests[0]
+        XCTAssertEqual(request.edits, edits)
+        await saver.succeed(committedCount: 3)
+        await coordinator.waitUntilSettled()
+        XCTAssertTrue(coordinator.pendingEdits.isEmpty)
+    }
+
     func testFailuresUseTypedRepositoryCodecAndUnderlyingOperatingSystemCodes() {
         XCTAssertEqual(NotebookSaveFailure.classify(NotebookRepositoryError.recoveryRequired), .corruptData)
         XCTAssertEqual(NotebookSaveFailure.classify(NotebookRepositoryError.revisionConflict), .revisionConflict)
@@ -272,5 +399,57 @@ private actor SuspendedNotebookSaver {
         let pending = continuation
         continuation = nil
         pending?.resume(throwing: error)
+    }
+}
+
+private actor SuspendedNotebookBatchSaver {
+    struct Request: Sendable {
+        let edits: [NotebookPendingEdit<String>]
+        let revision: UUID?
+    }
+
+    private(set) var requests: [Request] = []
+    private var continuation: CheckedContinuation<NotebookSaveBatchOutcome, Error>?
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func save(
+        _ edits: [NotebookPendingEdit<String>], revision: UUID?
+    ) async throws -> NotebookSaveBatchOutcome {
+        requests.append(Request(edits: edits, revision: revision))
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            let ready = waiters.filter { requests.count >= $0.0 }
+            waiters.removeAll { requests.count >= $0.0 }
+            ready.forEach { $0.1.resume() }
+        }
+    }
+
+    func waitForRequests(_ count: Int) async {
+        if requests.count >= count { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+
+    func succeed(committedCount: Int, failure: NotebookSaveFailure? = nil) {
+        guard let request = requests.last else { return }
+        let receipts = request.edits.prefix(committedCount).enumerated().map {
+            NotebookCommittedEdit(
+                editID: $0.element.id, revisionID: UUID(),
+                sequence: $0.offset + 1, savedAt: Date()
+            )
+        }
+        finish(NotebookSaveBatchOutcome(
+            committed: receipts,
+            rejection: failure.map {
+                NotebookPendingFailure(
+                    index: committedCount, editID: request.edits[committedCount].id, cause: $0
+                )
+            }
+        ))
+    }
+
+    func finish(_ outcome: NotebookSaveBatchOutcome) {
+        let pending = continuation
+        continuation = nil
+        pending?.resume(returning: outcome)
     }
 }

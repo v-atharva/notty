@@ -30,11 +30,37 @@ public struct NotebookPendingEdit<Snapshot: Sendable & Equatable>: Sendable, Equ
     }
 }
 
+public struct NotebookPendingFailure: Sendable, Equatable {
+    public let index: Int
+    public let editID: UUID
+    public let cause: NotebookSaveFailure
+
+    public init(index: Int, editID: UUID, cause: NotebookSaveFailure) {
+        self.index = index
+        self.editID = editID
+        self.cause = cause
+    }
+}
+
+public struct NotebookSaveBatchOutcome: Sendable, Equatable {
+    public let committed: [NotebookCommittedEdit]
+    public let rejection: NotebookPendingFailure?
+
+    public init(committed: [NotebookCommittedEdit], rejection: NotebookPendingFailure? = nil) {
+        self.committed = committed
+        self.rejection = rejection
+    }
+}
+
 @MainActor
 public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: ObservableObject {
     public typealias Saver = @Sendable (
         Snapshot, NotebookEditStamp, UUID?
     ) async throws -> NotebookSaveReceipt
+
+    public typealias BatchSaver = @Sendable (
+        [NotebookPendingEdit<Snapshot>], UUID?
+    ) async throws -> NotebookSaveBatchOutcome
 
     @Published public private(set) var status: NotebookSaveStatus
     @Published public private(set) var pendingCount = 0
@@ -44,7 +70,8 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
     public private(set) var expectedRevisionID: UUID?
     public var pendingEdits: [NotebookPendingEdit<Snapshot>] { pending }
 
-    private let save: Saver
+    private let saveBatch: BatchSaver
+    private let batchLimit: Int
     private var latestSnapshot: Snapshot?
     private var pending: [NotebookPendingEdit<Snapshot>] = []
     private var writer: Task<Void, Never>?
@@ -67,7 +94,45 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
     ) {
         precondition(capacity > 0)
         self.capacity = capacity
-        self.save = save
+        self.batchLimit = 1
+        self.saveBatch = { edits, revision in
+            var committed: [NotebookCommittedEdit] = []
+            var cursor = revision
+            for (index, edit) in edits.enumerated() {
+                do {
+                    let receipt = try await save(edit.snapshot, edit.stamp, cursor)
+                    committed.append(NotebookCommittedEdit(
+                        editID: edit.id, revisionID: receipt.revisionID,
+                        sequence: index + 1, savedAt: receipt.savedAt
+                    ))
+                    cursor = receipt.revisionID
+                } catch {
+                    return NotebookSaveBatchOutcome(
+                        committed: committed,
+                        rejection: NotebookPendingFailure(
+                            index: index, editID: edit.id, cause: NotebookSaveFailure.classify(error)
+                        )
+                    )
+                }
+            }
+            return NotebookSaveBatchOutcome(committed: committed)
+        }
+        self.latestSnapshot = initialSnapshot
+        self.expectedRevisionID = expectedRevisionID
+        status = savedAt.map(NotebookSaveStatus.saved) ?? .idle
+    }
+
+    public init(
+        initialSnapshot: Snapshot? = nil,
+        expectedRevisionID: UUID? = nil,
+        savedAt: Date? = nil,
+        capacity: Int = 8,
+        saveBatch: @escaping BatchSaver
+    ) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        self.batchLimit = 8
+        self.saveBatch = saveBatch
         self.latestSnapshot = initialSnapshot
         self.expectedRevisionID = expectedRevisionID
         status = savedAt.map(NotebookSaveStatus.saved) ?? .idle
@@ -76,12 +141,17 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
     /// Admission pauses at capacity; callbacks from already completed input remain ordered.
     public func enqueue(snapshot: Snapshot, stamp: NotebookEditStamp) {
         guard snapshot != latestSnapshot else { return }
-        latestSnapshot = snapshot
-        pending.append(NotebookPendingEdit(snapshot: snapshot, stamp: stamp))
+        enqueue(edit: NotebookPendingEdit(snapshot: snapshot, stamp: stamp))
+    }
+
+    /// Observed generations are retained even when their drawing states compare equal.
+    public func enqueue(edit: NotebookPendingEdit<Snapshot>) {
+        latestSnapshot = edit.snapshot
+        pending.append(edit)
         generation += 1
         pendingCount = pending.count
         if failure == nil {
-            status = .saving
+            if status != .saving { status = .saving }
             startWriter()
         }
     }
@@ -110,18 +180,55 @@ public final class NotebookSaveCoordinator<Snapshot: Sendable & Equatable>: Obse
     }
 
     private func drain() async {
-        while let edit = pending.first {
+        while !pending.isEmpty {
+            let submitted = Array(pending.prefix(min(capacity, batchLimit)))
             do {
-                let receipt = try await save(edit.snapshot, edit.stamp, expectedRevisionID)
-                expectedRevisionID = receipt.revisionID
-                pending.removeFirst()
-                generation += 1
-                pendingCount = pending.count
-                status = pending.isEmpty ? .saved(receipt.savedAt) : .saving
+                let result = try await saveBatch(submitted, expectedRevisionID)
+                guard validates(result, submitted: submitted),
+                      pending.starts(with: submitted) else {
+                    status = .failed(.corruptData)
+                    return
+                }
+                if let last = result.committed.last {
+                    expectedRevisionID = last.revisionID
+                    pending.removeFirst(result.committed.count)
+                    generation += 1
+                    pendingCount = pending.count
+                    if let rejection = result.rejection {
+                        status = .failed(rejection.cause)
+                        return
+                    }
+                    let next: NotebookSaveStatus = pending.isEmpty ? .saved(last.savedAt) : .saving
+                    if status != next { status = next }
+                } else if let rejection = result.rejection {
+                    status = .failed(rejection.cause)
+                    return
+                }
             } catch {
                 status = .failed(NotebookSaveFailure.classify(error))
                 return
             }
         }
+    }
+
+    private func validates(
+        _ result: NotebookSaveBatchOutcome,
+        submitted: [NotebookPendingEdit<Snapshot>]
+    ) -> Bool {
+        guard result.committed.count <= submitted.count,
+              result.committed.map(\.editID) == submitted.prefix(result.committed.count).map(\.id),
+              Set(result.committed.map(\.revisionID)).count == result.committed.count,
+              result.committed.allSatisfy({
+                  $0.sequence > 0 && $0.savedAt.timeIntervalSinceReferenceDate.isFinite
+              }) else { return false }
+        for pair in zip(result.committed, result.committed.dropFirst()) {
+            guard pair.0.sequence < Int.max, pair.1.sequence == pair.0.sequence + 1 else { return false }
+        }
+        if let rejection = result.rejection {
+            return rejection.index == result.committed.count
+                && rejection.index < submitted.count
+                && rejection.editID == submitted[rejection.index].id
+        }
+        return !result.committed.isEmpty
     }
 }

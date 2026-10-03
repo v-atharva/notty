@@ -1,6 +1,8 @@
 import Foundation
 import NottyCore
 import PencilKit
+import SwiftUI
+import UIKit
 import XCTest
 @testable import Notty
 
@@ -224,6 +226,155 @@ final class NotebookSessionTests: XCTestCase {
         XCTAssertEqual(saved?.content.editStamp, pending.last?.stamp)
         let calls = await probe.saveCalls
         XCTAssertEqual(calls, 8)
+    }
+
+    func testOwnerScopedGenerationsRetainEqualDrawingStatesAndOriginalObservationStamps() async throws {
+        let (session, probe, root) = try await setup()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = session.makeCanvasSeed()
+        let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
+        let first = NotebookCanvasObservation(
+            generation: 1, drawing: drawing, capturedAt: Date(timeIntervalSince1970: 123), uptime: 45
+        )
+        let second = NotebookCanvasObservation(
+            generation: 2, drawing: drawing, capturedAt: Date(timeIntervalSince1970: 124), uptime: 46
+        )
+        session.recordObservation(first, ownerID: seed.ownerID)
+        session.recordObservation(second, ownerID: seed.ownerID)
+        session.recordObservation(second, ownerID: seed.ownerID)
+        let original = session.pendingEdits
+        XCTAssertEqual(original.count, 2)
+        XCTAssertEqual(original.map(\.stamp.capturedAt), [first.capturedAt, second.capturedAt])
+        XCTAssertEqual(original.map(\.stamp.uptime), [45, 46])
+        XCTAssertEqual(Set(original.map(\.id)).count, 2)
+        let nextSeed = session.makeCanvasSeed()
+        XCTAssertFalse(session.recordObservation(
+            NotebookCanvasObservation(
+                generation: 3, drawing: PKDrawing(), capturedAt: Date(), uptime: 100
+            ), ownerID: seed.ownerID
+        ))
+        XCTAssertEqual(session.pendingEdits, original)
+        session.recordObservation(
+            NotebookCanvasObservation(
+                generation: 1, drawing: PKDrawing(), capturedAt: Date(timeIntervalSince1970: 125), uptime: 47
+            ), ownerID: nextSeed.ownerID
+        )
+        let all = session.pendingEdits
+        await session.waitUntilSettled()
+        await session.saveRecoveryCopy()
+        XCTAssertTrue(session.canReopenSaved)
+        let preserved = await probe.preservedBatch
+        let batch = try XCTUnwrap(preserved)
+        XCTAssertEqual(batch.edits.map(\.id), all.map(\.id))
+        XCTAssertEqual(batch.edits.map(\.stamp), all.map(\.stamp))
+        XCTAssertEqual(session.pendingEdits, all)
+    }
+
+    func testLaterCodecFailureStillPublishesEarlierValidEditAndRetainsExactTail() async throws {
+        let (session, probe, root) = try await setup()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await probe.setSaveFailure(nil)
+        let seed = session.makeCanvasSeed()
+        let template = NotebookTestFixtures.stroke()
+        let tooMany = (0...InkCodec.maximumStrokeCount).map { _ in
+            var stroke = template
+            stroke.id = UUID()
+            return stroke
+        }
+        let drawings = [
+            PKDrawing(strokes: [template]), PKDrawing(strokes: tooMany), PKDrawing()
+        ]
+        for (index, drawing) in drawings.enumerated() {
+            session.recordObservation(
+                NotebookCanvasObservation(
+                    generation: UInt64(index + 1), drawing: drawing,
+                    capturedAt: Date(timeIntervalSince1970: Double(index + 10)),
+                    uptime: Double(index + 20)
+                ), ownerID: seed.ownerID
+            )
+        }
+        let original = session.pendingEdits
+        await session.waitUntilSettled()
+        XCTAssertEqual(session.saveState, .failed(.contentLimit))
+        XCTAssertEqual(session.pendingEdits, Array(original.dropFirst()))
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 1)
+        await session.saveRecoveryCopy()
+        XCTAssertTrue(session.canReopenSaved)
+        let batch = await probe.preservedBatch
+        XCTAssertEqual(batch?.edits.map(\.id), Array(original.dropFirst()).map(\.id))
+        XCTAssertEqual(batch?.edits.map(\.stamp), Array(original.dropFirst()).map(\.stamp))
+    }
+
+    func testTwentyEditsWithUnchangedGateDoNotRebuildScreenOrUpdateRepresentable() async throws {
+        let (session, probe, root) = try await setup()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await probe.setSaveFailure(nil)
+        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let window: UIWindow
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            window = UIWindow(windowScene: scene)
+        } else {
+            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
+        }
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        hosting.view.layoutIfNeeded()
+        defer {
+            notebookController(in: hosting)?.tearDown()
+            window.isHidden = true
+        }
+        try await waitForUI {
+            session.renderDiagnostics.screenBodyCount > 0
+                && session.renderDiagnostics.canvasUpdateCount > 0
+                && self.notebookController(in: hosting) != nil
+        }
+        let controller = try XCTUnwrap(notebookController(in: hosting))
+        let controllerID = ObjectIdentifier(controller)
+        let screenBefore = session.renderDiagnostics.screenBodyCount
+        let canvasBefore = session.renderDiagnostics.canvasUpdateCount
+        let generation = session.canvasGeneration
+        let ownerID = try XCTUnwrap(session.canvasOwnerID)
+        for index in 1...20 {
+            session.recordObservation(
+                NotebookCanvasObservation(
+                    generation: UInt64(index),
+                    drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke(x: CGFloat(index))]),
+                    capturedAt: Date(timeIntervalSince1970: Double(index)), uptime: Double(index)
+                ), ownerID: ownerID
+            )
+            await session.waitUntilSettled()
+            XCTAssertEqual(session.inputGate, .open)
+        }
+        try await waitForUI { session.statusModel.state.status == session.saveState }
+        // Let two display frames drain queued SwiftUI updates before checking counters.
+        try await Task.sleep(for: .milliseconds(80))
+        hosting.view.layoutIfNeeded()
+        XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
+        XCTAssertEqual(session.renderDiagnostics.canvasUpdateCount, canvasBefore)
+        XCTAssertEqual(session.canvasGeneration, generation)
+        XCTAssertEqual(notebookController(in: hosting).map(ObjectIdentifier.init), controllerID)
+        let calls = await probe.saveCalls
+        XCTAssertEqual(calls, 20)
+        print("Notty UI generation work: edits=20 screenBodies=\(session.renderDiagnostics.screenBodyCount - screenBefore) canvasUpdates=\(session.renderDiagnostics.canvasUpdateCount - canvasBefore)")
+    }
+
+    private func notebookController(in controller: UIViewController) -> NotebookViewController? {
+        if let notebook = controller as? NotebookViewController { return notebook }
+        for child in controller.children {
+            if let notebook = notebookController(in: child) { return notebook }
+        }
+        return nil
+    }
+
+    private func waitForUI(_ ready: @escaping @MainActor () -> Bool) async throws {
+        for _ in 0..<100 {
+            if ready() { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Notebook UI did not become ready within two seconds.")
+        throw NotebookSaveFailure.unexpected
     }
 
 }

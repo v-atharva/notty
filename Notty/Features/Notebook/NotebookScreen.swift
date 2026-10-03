@@ -2,11 +2,16 @@ import SwiftUI
 
 @MainActor
 struct NotebookScreen: View {
-    @StateObject private var session = NotebookSession()
+    @StateObject private var session: NotebookSession
+
+    init(session: NotebookSession = NotebookSession()) {
+        _session = StateObject(wrappedValue: session)
+    }
     @State private var showsRecoveryCopies = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
+        let _ = session.renderDiagnostics.screenBodyCount += 1
         NavigationStack {
             Group {
                 switch session.loadState {
@@ -24,7 +29,9 @@ struct NotebookScreen: View {
                 case .ready:
                     NotebookCanvas(session: session)
                         .id(session.canvasGeneration)
-                        .safeAreaInset(edge: .bottom, spacing: 0) { saveStatus }
+                        .safeAreaInset(edge: .bottom, spacing: 0) {
+                            NotebookSaveStatusView(session: session, model: session.statusModel)
+                        }
                 }
             }
             .background(Color(red: 0.98, green: 0.96, blue: 0.91))
@@ -43,15 +50,7 @@ struct NotebookScreen: View {
                     } label: {
                         Label("Recovery copies", systemImage: "clock.arrow.circlepath")
                     }
-                    Button {
-                        session.extendPaper()
-                    } label: {
-                        Label("Extend paper", systemImage: "plus")
-                    }
-                    .disabled(
-                        !session.canEdit
-                        || session.pageCount >= NotebookViewController.maximumPageCount
-                    )
+                    NotebookExtendPaperButton(session: session, model: session.gateModel)
                 }
             }
         }
@@ -65,16 +64,38 @@ struct NotebookScreen: View {
         .onDisappear { session.flush() }
     }
 
-    @ViewBuilder
-    private var saveStatus: some View {
+}
+
+@MainActor
+private struct NotebookExtendPaperButton: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookCanvasGateModel
+
+    var body: some View {
+        Button(action: session.extendPaper) {
+            Label("Extend paper", systemImage: "plus")
+        }
+        .disabled(
+            !model.state.inputGate.allowsMutation
+            || model.state.pageCount >= NotebookViewController.maximumPageCount
+        )
+    }
+}
+
+@MainActor
+private struct NotebookSaveStatusView: View {
+    let session: NotebookSession
+    @ObservedObject var model: NotebookSavePresentationModel
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            switch session.saveState {
+            switch model.state.status {
             case .idle:
                 Text("Ready")
             case .saving:
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text(session.inputPaused ? "Catching up on saves…" : "Saving…")
+                    Text(model.state.inputPaused ? "Catching up on saves…" : "Saving…")
                 }
             case .saved(let date):
                 Label("Saved \(date.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
@@ -85,24 +106,24 @@ struct NotebookScreen: View {
                 HStack(spacing: 16) {
                     if cause.canRetry {
                         Button("Retry save", action: session.retrySave)
-                            .disabled(session.isPerformingRecovery)
+                            .disabled(model.state.performingRecovery)
                     }
                     Button("Preserve recovery copy") {
                         Task { await session.saveRecoveryCopy() }
                     }
-                    .disabled(!session.canPreserveRecovery)
-                    if session.canReopenSaved {
+                    .disabled(!model.state.canPreserveRecovery)
+                    if model.state.canReopenSaved {
                         Button("Reopen saved notebook") {
                             Task { await session.reopenSavedNotebook() }
                         }
                     }
                 }
             }
-            if session.isPerformingRecovery {
+            if model.state.performingRecovery {
                 ProgressView("Preserving or opening notebook")
             }
-            if let message = session.recoveryMessage { Text(message) }
-            if let failure = session.recoveryFailure { Text(failure.title).fontWeight(.semibold) }
+            if let message = model.state.recoveryMessage { Text(message) }
+            if let failure = model.state.recoveryFailure { Text(failure.title).fontWeight(.semibold) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .font(.footnote)
