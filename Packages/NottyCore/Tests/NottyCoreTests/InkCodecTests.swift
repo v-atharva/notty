@@ -323,7 +323,8 @@ final class InkCodecTests: XCTestCase {
     }
 
 
-    func testInPlaceMaskMutationNeverReusesStaleArchive() async throws {
+
+    func testMutatingRetrievedMaskKeepsStrokeIsolatedUntilReassignment() async throws {
         let codec = InkCodec()
         var native = stroke()
         #if canImport(UIKit)
@@ -332,22 +333,31 @@ final class InkCodecTests: XCTestCase {
         native.mask = NSBezierPath(rect: CGRect(x: 10, y: 20, width: 30, height: 40))
         #endif
         let first = try await codec.encode(PKDrawing(strokes: [native]))
-        let liveMask = try XCTUnwrap(native.mask)
-        let originalBounds = liveMask.bounds
+        let editedMask = try XCTUnwrap(native.mask)
+        let originalBounds = editedMask.bounds
         #if canImport(UIKit)
-        liveMask.apply(CGAffineTransform(translationX: 25, y: 0))
+        editedMask.apply(CGAffineTransform(translationX: 25, y: 0))
         #else
-        liveMask.transform(using: AffineTransform(translationByX: 25, byY: 0))
+        editedMask.transform(using: AffineTransform(translationByX: 25, byY: 0))
         #endif
-        let expected = try XCTUnwrap(native.mask?.bounds)
-        XCTAssertNotEqual(expected, originalBounds)
-        let changed = try await codec.encode(PKDrawing(strokes: [native]))
-        let reopened = try await InkCodec().decode(changed)
+        let shiftedBounds = originalBounds.offsetBy(dx: 25, dy: 0)
+        XCTAssertEqual(editedMask.bounds, shiftedBounds)
+        XCTAssertEqual(native.mask?.bounds, originalBounds)
+        let isolated = try await codec.encode(PKDrawing(strokes: [native]))
+        let reusedCount = await codec.serializedStrokeCount
+        XCTAssertEqual(reusedCount, 1)
+        XCTAssertEqual(isolated[0].data, first[0].data)
+        let unchanged = try await InkCodec().decode(isolated)
+        XCTAssertEqual(unchanged.strokes[0].mask?.bounds, originalBounds)
 
+        native.mask = editedMask
+        XCTAssertEqual(native.mask?.bounds, shiftedBounds)
+        let changed = try await codec.encode(PKDrawing(strokes: [native]))
         let serialized = await codec.serializedStrokeCount
         XCTAssertEqual(serialized, 2)
         XCTAssertNotEqual(changed[0].data, first[0].data)
-        XCTAssertEqual(reopened.strokes[0].mask?.bounds, expected)
+        let reopened = try await InkCodec().decode(changed)
+        XCTAssertEqual(reopened.strokes[0].mask?.bounds, shiftedBounds)
         XCTAssertEqual(reopened.strokes[0].id, native.id)
     }
 
