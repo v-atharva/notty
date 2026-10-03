@@ -1,7 +1,7 @@
 import Foundation
 
 enum NotebookRevisionFormat {
-    struct Head: Codable, Equatable {
+    struct Head: Codable, Sendable, Equatable {
         let schemaVersion: Int
         let notebookID: UUID
         let revisionID: UUID

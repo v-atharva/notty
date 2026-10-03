@@ -12,9 +12,10 @@ struct NotebookHistory {
     struct AuditResult {
         let report: NotebookHistoryAudit
         let summaries: [NotebookRevisionSummary]
+        let links: [Link]
     }
 
-    struct HeadSnapshot {
+    struct HeadSnapshot: Sendable, Equatable {
         let head: Format.Head
         let digest: String
     }
@@ -24,14 +25,20 @@ struct NotebookHistory {
     let notebookID: UUID
     let assetVerificationObserver: (@Sendable (String) -> Void)?
     private let assetDirectory: URL
+    private let auditCancellation: NotebookHistoryAuditCancellation?
+    private let auditProgress: (@Sendable (NotebookHistoryAuditProgress) -> Void)?
 
     init(
         directory: URL, notebookID: UUID,
         assetVerificationObserver: (@Sendable (String) -> Void)?,
         assetDirectory: URL? = nil,
-        metrics: NotebookStorageMetricsRecorder? = nil
+        metrics: NotebookStorageMetricsRecorder? = nil,
+        auditCancellation: NotebookHistoryAuditCancellation? = nil,
+        auditProgress: (@Sendable (NotebookHistoryAuditProgress) -> Void)? = nil
     ) {
         self.metrics = metrics
+        self.auditCancellation = auditCancellation
+        self.auditProgress = auditProgress
         self.directory = directory
         self.notebookID = notebookID
         self.assetVerificationObserver = assetVerificationObserver
@@ -80,6 +87,7 @@ struct NotebookHistory {
         var expectedSequence: Int?
         let generation = head.schemaVersion == 2 ? try generationDirectory(head) : nil
         while true {
+            try auditCancellation?.check()
             guard visited.insert(id).inserted else {
                 throw NotebookRepositoryError.corruptData("The committed history contains a cycle.")
             }
@@ -132,6 +140,18 @@ struct NotebookHistory {
         let revision: Format.LegacyRevision = try Format.decode(data)
         try validateLegacy(revision, id: link.revisionID)
         return revision
+    }
+
+    func selectedSequence(_ head: Format.Head) throws -> Int {
+        if head.schemaVersion == 1 {
+            return try readLegacy(Link(
+                revisionID: head.revisionID, digest: head.revisionDigest, sequence: 0
+            )).sequence
+        }
+        return try readEvent(
+            id: head.revisionID, digest: head.revisionDigest,
+            generation: generationDirectory(head)
+        ).0.sequence
     }
 
     func current(_ head: Format.Head) throws -> Format.Materialized {
@@ -189,9 +209,10 @@ struct NotebookHistory {
     func audit(
         _ head: Format.Head,
         beforeRevisionID: UUID? = nil,
-        summaryLimit: Int = 0
+        summaryLimit: Int = 0,
+        links collectedLinks: [Link]? = nil
     ) throws -> AuditResult {
-        let links = try selectedLinks(head)
+        let links = try collectedLinks ?? selectedLinks(head)
         let upperBound: Int
         if let beforeRevisionID {
             guard let index = links.firstIndex(where: { $0.revisionID == beforeRevisionID }) else {
@@ -210,6 +231,7 @@ struct NotebookHistory {
         var credit = 0
         let generation = head.schemaVersion == 2 ? try generationDirectory(head) : nil
         for (index, link) in links.enumerated() {
+            try auditCancellation?.check()
             let stamp: NotebookEditStamp?
             let savedAt: Date
             if let generation {
@@ -218,13 +240,11 @@ struct NotebookHistory {
                 try replay.apply(event.delta)
                 credit = try addingCredit(credit, bytes)
                 if let checkpoint = event.checkpointDigest {
-                    let checkpointState = try readCheckpoint(checkpoint, event: event, generation: generation)
-                    guard checkpointState == replay.state else {
+                    let checkpointSnapshot = try readCheckpointSnapshot(checkpoint, event: event, generation: generation)
+                    guard checkpointSnapshot.state == replay.state else {
                         throw NotebookRepositoryError.corruptData("A history checkpoint does not match its event replay.")
                     }
-                    let checkpointBytes = try readMetadata(
-                        generation.appendingPathComponent("checkpoints/\(checkpoint).json")
-                    ).count
+                    let checkpointBytes = checkpointSnapshot.encodedBytes
                     guard event.sequence == 1 || credit >= checkpointBytes else {
                         throw NotebookRepositoryError.corruptData("A checkpoint exceeds its accumulated byte credit.")
                     }
@@ -254,7 +274,7 @@ struct NotebookHistory {
                 notebookID: notebookID, headRevisionID: head.revisionID,
                 revisionCount: links.count, verifiedAssetCount: sizes.count
             ),
-            summaries: summaries.reversed()
+            summaries: summaries.reversed(), links: links
         )
     }
 
@@ -275,11 +295,17 @@ struct NotebookHistory {
         try validateAssetsDirectory(state)
         var total = 0
         var result: [NotebookStroke] = []
+        var dataByDigest: [String: Data] = [:]
         for reference in state.strokes {
-            let data = try readAsset(reference)
+            let data: Data
+            if let cached = dataByDigest[reference.digest] { data = cached }
+            else {
+                data = try readAsset(reference)
+                dataByDigest[reference.digest] = data
+            }
             total += data.count
             guard total <= NotebookRepository.maximumNotebookBytes else {
-                throw NotebookRepositoryError.sizeLimitExceeded("The notebook exceeds 64 MiB.")
+                throw NotebookRepositoryError.corruptData("The notebook exceeds 64 MiB.")
             }
             result.append(NotebookStroke(id: reference.id, data: data, validatedDigest: reference.digest))
         }
@@ -322,6 +348,9 @@ struct NotebookHistory {
     }
 
     func readAsset(_ reference: Format.Reference) throws -> Data {
+        try auditCancellation?.check()
+        auditProgress?(.willReadAsset(reference.digest))
+        try auditCancellation?.check()
         let assets = assetDirectory
         try requireDirectory(assets)
         let data = try readMetadataAsset(assets.appendingPathComponent("\(reference.digest).stroke"))
@@ -335,6 +364,9 @@ struct NotebookHistory {
     func readEvent(
         id: UUID, digest: String, generation: URL
     ) throws -> (Format.Event, Int) {
+        try auditCancellation?.check()
+        auditProgress?(.willReadEvent(id))
+        try auditCancellation?.check()
         let data = try readMetadata(
             generation.appendingPathComponent("events/\(id.uuidString.lowercased()).json")
         )
@@ -361,6 +393,15 @@ struct NotebookHistory {
     func readCheckpoint(
         _ digest: String, event: Format.Event, generation: URL
     ) throws -> Format.State {
+        try readCheckpointSnapshot(digest, event: event, generation: generation).state
+    }
+
+    func readCheckpointSnapshot(
+        _ digest: String, event: Format.Event, generation: URL
+    ) throws -> (state: Format.State, encodedBytes: Int) {
+        try auditCancellation?.check()
+        auditProgress?(.willReadCheckpoint(digest))
+        try auditCancellation?.check()
         let data = try readMetadata(generation.appendingPathComponent("checkpoints/\(digest).json"))
         guard Format.digest(data, metrics: metrics) == digest else {
             throw NotebookRepositoryError.corruptData("A history checkpoint failed integrity validation.")
@@ -374,10 +415,11 @@ struct NotebookHistory {
             throw NotebookRepositoryError.corruptData("A history checkpoint has inconsistent identities.")
         }
         try Format.validateState(checkpoint.state)
-        return checkpoint.state
+        return (checkpoint.state, data.count)
     }
 
     func readMetadata(_ url: URL) throws -> Data {
+        try auditCancellation?.check()
         guard try NotebookFileSystem.kind(url) != nil else {
             throw NotebookRepositoryError.corruptData("A committed history file is missing.")
         }
@@ -385,6 +427,7 @@ struct NotebookHistory {
             metrics?.record(\.metadataReadCalls)
             let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumMetadataBytes)
             metrics?.record(\.metadataReadBytes, data.count)
+            try auditCancellation?.check()
             return data
         } catch let error as NotebookRepositoryError {
             if case .sizeLimitExceeded = error {
@@ -395,6 +438,7 @@ struct NotebookHistory {
     }
 
     func requireDirectory(_ url: URL) throws {
+        try auditCancellation?.check()
         guard try NotebookFileSystem.existingDirectory(url) else {
             throw NotebookRepositoryError.corruptData("A committed storage directory is missing.")
         }
@@ -408,6 +452,7 @@ struct NotebookHistory {
             metrics?.record(\.assetReadCalls)
             let data = try NotebookFileSystem.read(url, maximumBytes: NotebookRepository.maximumAssetBytes)
             metrics?.record(\.assetReadBytes, data.count)
+            try auditCancellation?.check()
             return data
         } catch let error as NotebookRepositoryError {
             if case .sizeLimitExceeded = error {
