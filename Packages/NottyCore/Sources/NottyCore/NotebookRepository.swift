@@ -16,11 +16,17 @@ public actor NotebookRepository {
     private let rootURL: URL
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
     private let assetVerificationObserver: (@Sendable (String) -> Void)?
+    private let maintenanceObserver: NotebookFileSystem.MaintenanceObserver?
+    private let maintenanceFaultInjector: (@Sendable () throws -> Void)?
+    private var maintainedNotebookIDs = Set<UUID>()
+    private var privateMaintenanceRequired = false
 
     public init(rootURL: URL) throws {
         self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = nil
         self.assetVerificationObserver = nil
+        self.maintenanceObserver = nil
+        self.maintenanceFaultInjector = nil
     }
 
     /// Creates a repository with deterministic publication faults for recovery tests.
@@ -31,6 +37,8 @@ public actor NotebookRepository {
         self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = faultInjector
         self.assetVerificationObserver = nil
+        self.maintenanceObserver = nil
+        self.maintenanceFaultInjector = nil
     }
 
     init(
@@ -40,13 +48,33 @@ public actor NotebookRepository {
         self.rootURL = try Self.prepareRoot(rootURL)
         self.faultInjector = nil
         self.assetVerificationObserver = assetVerificationObserver
+        self.maintenanceObserver = nil
+        self.maintenanceFaultInjector = nil
     }
 
-    private static func prepareRoot(_ rootURL: URL) throws -> URL {
+    init(
+        rootURL: URL,
+        faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)? = nil,
+        maintenanceObserver: @escaping NotebookFileSystem.MaintenanceObserver,
+        maintenanceFaultInjector: (@Sendable () throws -> Void)? = nil
+    ) throws {
+        self.rootURL = try Self.prepareRoot(rootURL, observer: maintenanceObserver)
+        self.faultInjector = faultInjector
+        self.assetVerificationObserver = nil
+        self.maintenanceObserver = maintenanceObserver
+        self.maintenanceFaultInjector = maintenanceFaultInjector
+    }
+
+    private static func prepareRoot(
+        _ rootURL: URL,
+        observer: NotebookFileSystem.MaintenanceObserver? = nil
+    ) throws -> URL {
         let root = try NotebookFileSystem.prepareRoot(rootURL)
         let lock = try NotebookFileSystem.acquireWriterLock(root)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
-        try NotebookFileSystem.sweepPrivateTransactions(in: root, prefix: ".creation-")
+        try NotebookFileSystem.sweepPrivateTransactions(
+            in: root, prefix: ".creation-", observer: observer
+        )
         return root
     }
 
@@ -63,8 +91,9 @@ public actor NotebookRepository {
         }
         let revision = try readRevision(head: head, directory: directory)
         let strokes = try readAssets(revision: revision, directory: directory)
-        try NotebookFileSystem.sweepNotebookStages(in: directory)
-        return storedNotebook(revision: revision, strokes: strokes)
+        let notebook = storedNotebook(revision: revision, strokes: strokes)
+        maintainNotebook(id: id, directory: directory)
+        return notebook
     }
 
     public func save(
@@ -72,12 +101,24 @@ public actor NotebookRepository {
         content: NotebookContent,
         expectedRevisionID: UUID?
     ) throws -> StoredNotebook {
+        var published = false
+        defer {
+            if !published {
+                maintainedNotebookIDs.remove(id)
+                privateMaintenanceRequired = true
+            }
+        }
         try validateContent(content)
         let prepared = try prepareAssets(content.strokes)
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
 
-        try NotebookFileSystem.sweepPrivateTransactions(in: rootURL, prefix: ".creation-")
+        if privateMaintenanceRequired {
+            try NotebookFileSystem.sweepPrivateTransactions(
+                in: rootURL, prefix: ".creation-", observer: maintenanceObserver
+            )
+            privateMaintenanceRequired = false
+        }
         let destination = notebookDirectory(id: id)
         let isCreating = try NotebookFileSystem.kind(destination) == nil
         let directory: URL
@@ -103,7 +144,13 @@ public actor NotebookRepository {
         }
         defer {
             if isCreating {
-                try? NotebookFileSystem.removePrivateTransaction(directory, prefix: ".creation-")
+                do {
+                    try NotebookFileSystem.removePrivateTransaction(
+                        directory, prefix: ".creation-", observer: maintenanceObserver
+                    )
+                } catch {
+                    maintenanceObserver?(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
+                }
             }
         }
         let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
@@ -126,7 +173,7 @@ public actor NotebookRepository {
                 throw NotebookRepositoryError.corruptData("The notebook revision sequence is exhausted.")
             }
             sequence = current.sequence + 1
-            try NotebookFileSystem.sweepNotebookStages(in: directory)
+            maintainNotebook(id: id, directory: directory)
         }
 
         for reference in prepared.references {
@@ -195,7 +242,23 @@ public actor NotebookRepository {
             try NotebookFileSystem.publishImmutable(directory, to: destination)
         }
 
+        if isCreating { maintainedNotebookIDs.insert(id) }
+        published = true
         return storedNotebook(revision: revision, strokes: content.strokes)
+    }
+
+    // Maintenance admission is per notebook; failed passes remain eligible for retry.
+    private func maintainNotebook(id: UUID, directory: URL) {
+        guard !maintainedNotebookIDs.contains(id) else { return }
+        do {
+            try maintenanceFaultInjector?()
+            try NotebookFileSystem.sweepNotebookStages(
+                in: directory, observer: maintenanceObserver
+            )
+            maintainedNotebookIDs.insert(id)
+        } catch {
+            maintenanceObserver?(.failed(NotebookFileSystem.maintenanceFailure(for: error)))
+        }
     }
 
     private func notebookDirectory(id: UUID) -> URL {

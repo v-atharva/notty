@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Darwin
 import XCTest
 @testable import NottyCore
 
@@ -772,19 +773,22 @@ final class NotebookRepositoryTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let id = UUID()
         let repository = try NotebookRepository(rootURL: root)
-        _ = try await repository.save(id: id, content: content(), expectedRevisionID: nil)
+        let saved = try await repository.save(id: id, content: content(), expectedRevisionID: nil)
         let outside = root.appendingPathComponent("outside")
         try Data("untouched".utf8).write(to: outside)
         let stage = noteURL(root: root, id: id).appendingPathComponent(".head-\(UUID().uuidString).tmp")
         try FileManager.default.createSymbolicLink(at: stage, withDestinationURL: outside)
-        do {
-            _ = try await repository.load(id: id)
-            XCTFail("A staged symbolic link was followed.")
-        } catch {
-            guard case .unsafePath? = error as? NotebookRepositoryError else {
-                return XCTFail("Unexpected stage error: \(error)")
-            }
-        }
+        let counter = NotebookMaintenanceCounter()
+        let reader = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        counter.reset()
+        let loaded = try await requiredNotebook(reader, id: id)
+        XCTAssertEqual(loaded.revisionID, saved.revisionID)
+        XCTAssertEqual(loaded.content, saved.content)
+        XCTAssertEqual(counter.count(.skippedNonRegularStage), 1)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: stage.path), outside.path)
+        XCTAssertEqual(try Data(contentsOf: outside), Data("untouched".utf8))
         try FileManager.default.removeItem(at: stage)
         let transaction = root.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())")
         try FileManager.default.createSymbolicLink(at: transaction, withDestinationURL: outside)
@@ -794,6 +798,310 @@ final class NotebookRepositoryTests: XCTestCase {
             }
         }
         XCTAssertEqual(try Data(contentsOf: outside), Data("untouched".utf8))
+    }
+
+    func testStrayStageDirectoryDoesNotBlockVerifiedNotebookLoad() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let first = NotebookStroke(id: UUID(), data: Data("original ink".utf8))
+        let second = NotebookStroke(id: UUID(), data: Data("later ink".utf8))
+        let writer = try NotebookRepository(rootURL: root)
+        let initial = try await writer.save(
+            id: id, content: content(strokes: [first]), expectedRevisionID: nil
+        )
+        let expected = NotebookContent(
+            title: "Healthy notebook", pageCount: 5, strokes: [second, first],
+            editStamp: NotebookEditStamp(
+                capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                uptime: 123, sessionID: UUID()
+            )
+        )
+        let saved = try await writer.save(
+            id: id, content: expected, expectedRevisionID: initial.revisionID
+        )
+        let directory = noteURL(root: root, id: id)
+        let stray = directory.appendingPathComponent("assets/.\(UUID().uuidString).tmp", isDirectory: true)
+        try FileManager.default.createDirectory(at: stray, withIntermediateDirectories: false)
+        let child = stray.appendingPathComponent("retained")
+        try Data("directory contents".utf8).write(to: child)
+        let before = try fileSnapshot(root: directory)
+        let counter = NotebookMaintenanceCounter()
+        let reader = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        counter.reset()
+
+        let loaded = try await requiredNotebook(reader, id: id)
+
+        XCTAssertEqual(loaded.id, id)
+        XCTAssertEqual(loaded.revisionID, saved.revisionID)
+        XCTAssertEqual(loaded.sequence, saved.sequence)
+        XCTAssertEqual(loaded.savedAt, saved.savedAt)
+        XCTAssertEqual(loaded.content, expected)
+        XCTAssertEqual(try fileSnapshot(root: directory), before)
+        XCTAssertEqual(try NotebookFileSystem.kind(stray), .directory)
+        XCTAssertEqual(try Data(contentsOf: child), Data("directory contents".utf8))
+        XCTAssertEqual(counter.count(.skippedNonRegularStage), 1)
+    }
+
+    func testSecondConsecutiveCleanSavePerformsNoMaintenanceEnumeration() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("kept".utf8))
+        let baseline = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+        )
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        XCTAssertEqual(counter.count(.directoryEnumeration(.library)), 1)
+        counter.reset()
+        let first = try await repository.save(
+            id: id, content: content(title: "First", strokes: [stroke]),
+            expectedRevisionID: baseline.revisionID
+        )
+        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.library)), 0)
+        counter.reset()
+
+        let second = try await repository.save(
+            id: id, content: content(title: "Second", strokes: [stroke]),
+            expectedRevisionID: first.revisionID
+        )
+
+        XCTAssertEqual(counter.enumerationCount, 0)
+        XCTAssertTrue(counter.snapshot().isEmpty)
+        let reopened = try await requiredNotebook(NotebookRepository(rootURL: root), id: id)
+        XCTAssertEqual(reopened.revisionID, second.revisionID)
+        XCTAssertEqual(reopened.content, second.content)
+    }
+
+    func testMaintenanceAdmissionIsIndependentForEachNotebook() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let idA = UUID()
+        let idB = UUID()
+        let writer = try NotebookRepository(rootURL: root)
+        let savedA = try await writer.save(
+            id: idA, content: content(title: "A"), expectedRevisionID: nil
+        )
+        let savedB = try await writer.save(
+            id: idB, content: content(title: "B"), expectedRevisionID: nil
+        )
+        let stageA = noteURL(root: root, id: idA).appendingPathComponent("assets/.\(UUID().uuidString).tmp")
+        let stageB = noteURL(root: root, id: idB).appendingPathComponent("revisions/.\(UUID().uuidString).tmp")
+        try Data("left A".utf8).write(to: stageA)
+        try Data("left B".utf8).write(to: stageB)
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        counter.reset()
+        let loadedA = try await requiredNotebook(repository, id: idA)
+        XCTAssertEqual(loadedA.content, savedA.content)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stageA.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stageB.path))
+        XCTAssertEqual(counter.enumerationCount, 3)
+        counter.reset()
+
+        let updatedB = try await repository.save(
+            id: idB, content: content(title: "Updated B"), expectedRevisionID: savedB.revisionID
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stageB.path))
+        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.count(.removedStage), 1)
+        counter.reset()
+        _ = try await repository.save(
+            id: idB, content: content(title: "Clean B"), expectedRevisionID: updatedB.revisionID
+        )
+        XCTAssertEqual(counter.enumerationCount, 0)
+        let unchangedA = try await requiredNotebook(repository, id: idA)
+        XCTAssertEqual(unchangedA.revisionID, savedA.revisionID)
+        XCTAssertEqual(unchangedA.content, savedA.content)
+    }
+
+    func testFailedSaveRearmsNoteAndPrivateCreationMaintenance() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("committed ink".utf8))
+        let baseline = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+        )
+        let fault = NotebookMaintenanceFaultBudget(failures: 1)
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(
+            rootURL: root,
+            faultInjector: { stage in
+                if stage == .beforeHeadPublication { try fault.failIfNeeded() }
+            },
+            maintenanceObserver: { counter.record($0) }
+        )
+        _ = try await requiredNotebook(repository, id: id)
+        counter.reset()
+        do {
+            _ = try await repository.save(
+                id: id, content: content(title: "Waiting", strokes: [stroke]),
+                expectedRevisionID: baseline.revisionID
+            )
+            XCTFail("The publication fault did not fail the save.")
+        } catch {
+            XCTAssertEqual(error as? NotebookRepositoryError, .ioFailure(EIO))
+        }
+        XCTAssertEqual(counter.enumerationCount, 0)
+        let directory = noteURL(root: root, id: id)
+        let stage = directory.appendingPathComponent("assets/.\(UUID().uuidString).tmp")
+        try Data("process stage".utf8).write(to: stage)
+        let transaction = root.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())")
+        try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+        try Data("unpublished creation".utf8).write(to: transaction.appendingPathComponent("private"))
+        let committedBytes = try Data(contentsOf: revisionURL(root: root, id: id, revision: baseline.revisionID))
+        counter.reset()
+
+        let retry = try await repository.save(
+            id: id, content: content(title: "Waiting", strokes: [stroke]),
+            expectedRevisionID: baseline.revisionID
+        )
+
+        XCTAssertEqual(counter.count(.directoryEnumeration(.library)), 1)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.privateTransaction)), 1)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.notebook)), 1)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.assets)), 1)
+        XCTAssertEqual(counter.count(.directoryEnumeration(.revisions)), 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: transaction.path))
+        XCTAssertEqual(
+            try Data(contentsOf: revisionURL(root: root, id: id, revision: baseline.revisionID)),
+            committedBytes
+        )
+        XCTAssertEqual(retry.content.strokes, [stroke])
+        counter.reset()
+        _ = try await repository.save(
+            id: id, content: content(title: "Clean", strokes: [stroke]),
+            expectedRevisionID: retry.revisionID
+        )
+        XCTAssertEqual(counter.enumerationCount, 0)
+    }
+
+    func testMaintenanceErrorsDoNotRejectValidatedLoadOrSaveAndRemainScheduled() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("retained".utf8))
+        let baseline = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+        )
+        let stage = noteURL(root: root, id: id).appendingPathComponent("revisions/.\(UUID().uuidString).tmp")
+        try Data("retry cleanup".utf8).write(to: stage)
+        let counter = NotebookMaintenanceCounter()
+        let fault = NotebookMaintenanceFaultBudget(failures: 2)
+        let repository = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) },
+            maintenanceFaultInjector: { try fault.failIfNeeded() }
+        )
+        counter.reset()
+
+        let loaded = try await requiredNotebook(repository, id: id)
+        XCTAssertEqual(loaded.revisionID, baseline.revisionID)
+        XCTAssertEqual(loaded.content, baseline.content)
+        XCTAssertEqual(counter.count(.failed(.io)), 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+        let first = try await repository.save(
+            id: id, content: content(title: "Accepted", strokes: [stroke]),
+            expectedRevisionID: baseline.revisionID
+        )
+        XCTAssertEqual(counter.count(.failed(.io)), 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+        counter.reset()
+        let second = try await repository.save(
+            id: id, content: content(title: "Cleanup recovered", strokes: [stroke]),
+            expectedRevisionID: first.revisionID
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
+        XCTAssertEqual(counter.enumerationCount, 3)
+        XCTAssertEqual(counter.count(.removedStage), 1)
+        counter.reset()
+        let third = try await repository.save(
+            id: id, content: content(title: "Clean again", strokes: [stroke]),
+            expectedRevisionID: second.revisionID
+        )
+        XCTAssertEqual(counter.enumerationCount, 0)
+        let reopened = try await requiredNotebook(NotebookRepository(rootURL: root), id: id)
+        XCTAssertEqual(reopened.revisionID, third.revisionID)
+        XCTAssertEqual(reopened.content, third.content)
+    }
+
+    func testCommittedCorruptionFailsBeforeOpportunisticMaintenance() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let stroke = NotebookStroke(id: UUID(), data: Data("original".utf8))
+        let saved = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(strokes: [stroke]), expectedRevisionID: nil
+        )
+        let directory = noteURL(root: root, id: id)
+        let stage = directory.appendingPathComponent(".head-\(UUID().uuidString).tmp")
+        try Data("keep until validated".utf8).write(to: stage)
+        let asset = directory.appendingPathComponent("assets/\(digest(stroke.data)).stroke")
+        try Data("damaged".utf8).write(to: asset)
+        let before = try fileSnapshot(root: directory)
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        counter.reset()
+        do {
+            _ = try await repository.load(id: id)
+            XCTFail("Committed corruption was hidden by cleanup.")
+        } catch {
+            guard case .corruptData? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected committed corruption error: \(error)")
+            }
+        }
+        do {
+            _ = try await repository.save(
+                id: id, content: content(strokes: [stroke]), expectedRevisionID: saved.revisionID
+            )
+            XCTFail("A corrupt committed asset was replaced.")
+        } catch {
+            guard case .corruptData? = error as? NotebookRepositoryError else {
+                return XCTFail("Unexpected corrupt save error: \(error)")
+            }
+        }
+        XCTAssertEqual(counter.enumerationCount, 0)
+        XCTAssertEqual(try fileSnapshot(root: directory), before)
+    }
+
+    func testStageMaintenanceRemovalBudgetIsObservableAndPreservesHistory() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let saved = try await NotebookRepository(rootURL: root).save(
+            id: id, content: content(), expectedRevisionID: nil
+        )
+        let directory = noteURL(root: root, id: id)
+        let stages = (0..<65).map { _ in directory.appendingPathComponent(".\(UUID().uuidString).tmp") }
+        for stage in stages { try Data("residue".utf8).write(to: stage) }
+        let revision = revisionURL(root: root, id: id, revision: saved.revisionID)
+        let historyBytes = try Data(contentsOf: revision)
+        let counter = NotebookMaintenanceCounter()
+        let repository = try NotebookRepository(
+            rootURL: root, maintenanceObserver: { counter.record($0) }
+        )
+        counter.reset()
+
+        let loaded = try await requiredNotebook(repository, id: id)
+
+        XCTAssertEqual(loaded.content, saved.content)
+        XCTAssertEqual(counter.count(.removedStage), 64)
+        XCTAssertEqual(counter.count(.limitReached), 1)
+        XCTAssertEqual(stages.filter { FileManager.default.fileExists(atPath: $0.path) }.count, 1)
+        XCTAssertEqual(try Data(contentsOf: revision), historyBytes)
     }
 
     private func digest(_ data: Data) -> String {
@@ -931,3 +1239,54 @@ private final class NotebookAssetVerificationCounter: @unchecked Sendable {
     }
 }
 
+
+private final class NotebookMaintenanceCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [NotebookFileSystem.MaintenanceEvent] = []
+
+    var enumerationCount: Int {
+        snapshot().filter {
+            if case .directoryEnumeration = $0 { return true }
+            return false
+        }.count
+    }
+
+    func record(_ event: NotebookFileSystem.MaintenanceEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        events.append(event)
+    }
+
+    func count(_ event: NotebookFileSystem.MaintenanceEvent) -> Int {
+        snapshot().filter { $0 == event }.count
+    }
+
+    func snapshot() -> [NotebookFileSystem.MaintenanceEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        events.removeAll()
+    }
+}
+
+private final class NotebookMaintenanceFaultBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: Int
+
+    init(failures: Int) {
+        remaining = failures
+    }
+
+    func failIfNeeded() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard remaining > 0 else { return }
+        remaining -= 1
+        throw NotebookRepositoryError.ioFailure(EIO)
+    }
+}

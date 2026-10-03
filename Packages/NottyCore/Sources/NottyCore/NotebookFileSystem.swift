@@ -2,6 +2,31 @@ import Darwin
 import Foundation
 
 enum NotebookFileSystem {
+    enum MaintenanceLocation: Sendable, Equatable {
+        case library
+        case notebook
+        case assets
+        case revisions
+        case privateTransaction
+    }
+
+    enum MaintenanceFailure: Sendable, Equatable {
+        case unsafePath
+        case sizeLimit
+        case io
+        case unexpected
+    }
+
+    enum MaintenanceEvent: Sendable, Equatable {
+        case directoryEnumeration(MaintenanceLocation)
+        case skippedNonRegularStage
+        case removedStage
+        case limitReached
+        case failed(MaintenanceFailure)
+    }
+
+    typealias MaintenanceObserver = @Sendable (MaintenanceEvent) -> Void
+
     enum ItemKind: Equatable {
         case directory
         case regularFile
@@ -132,20 +157,31 @@ enum NotebookFileSystem {
         return try publish(stage)
     }
 
-    static func sweepPrivateTransactions(in root: URL, prefix: String) throws {
+    static func sweepPrivateTransactions(
+        in root: URL,
+        prefix: String,
+        observer: MaintenanceObserver? = nil
+    ) throws {
         guard prefix == ".creation-" || prefix == ".recovery-" else {
             throw NotebookRepositoryError.unsafePath("Unknown storage transaction namespace.")
         }
         var removed = 0
-        try visitChildren(in: root, limit: 2_048) { entry in
+        try visitChildren(
+            in: root, limit: 2_048, location: .library, observer: observer
+        ) { entry in
             guard isTransactionName(entry.lastPathComponent, prefix: prefix) else { return true }
-            try removePrivateTransaction(entry, prefix: prefix)
+            try removePrivateTransaction(entry, prefix: prefix, observer: observer)
             removed += 1
+            if removed == 16 { observer?(.limitReached) }
             return removed < 16
         }
     }
 
-    static func removePrivateTransaction(_ url: URL, prefix: String) throws {
+    static func removePrivateTransaction(
+        _ url: URL,
+        prefix: String,
+        observer: MaintenanceObserver? = nil
+    ) throws {
         guard isTransactionName(url.lastPathComponent, prefix: prefix) else {
             throw NotebookRepositoryError.unsafePath("The storage transaction has an invalid name.")
         }
@@ -157,7 +193,9 @@ enum NotebookFileSystem {
         var visited = 0
         var bytes: Int64 = 0
         while let directory = directories.popLast() {
-            try visitChildren(in: directory, limit: 50_001) { child in
+            try visitChildren(
+                in: directory, limit: 50_001, location: .privateTransaction, observer: observer
+            ) { child in
                 visited += 1
                 guard visited <= 50_000 else {
                     throw NotebookRepositoryError.sizeLimitExceeded("The abandoned transaction exceeds cleanup bounds.")
@@ -181,33 +219,71 @@ enum NotebookFileSystem {
         try FileManager.default.removeItem(at: url)
     }
 
-    static func sweepNotebookStages(in directory: URL) throws {
-        let locations = [
-            directory,
-            directory.appendingPathComponent("assets", isDirectory: true),
-            directory.appendingPathComponent("revisions", isDirectory: true)
+    static func sweepNotebookStages(
+        in directory: URL,
+        observer: MaintenanceObserver? = nil
+    ) throws {
+        let locations: [(URL, MaintenanceLocation)] = [
+            (directory, .notebook),
+            (directory.appendingPathComponent("assets", isDirectory: true), .assets),
+            (directory.appendingPathComponent("revisions", isDirectory: true), .revisions)
         ]
         var removed = 0
-        for location in locations {
+        for (location, role) in locations {
             guard try existingDirectory(location) else { continue }
-            try visitChildren(in: location, limit: 20_000) { entry in
+            try visitChildren(
+                in: location, limit: 20_000, location: role, observer: observer
+            ) { entry in
                 guard isStageName(entry.lastPathComponent) else { return true }
-                guard try kind(entry) == .regularFile else {
-                    throw NotebookRepositoryError.unsafePath("A staged notebook file has an unsafe file type.")
+                guard let type = try kind(entry) else { return true }
+                guard type == .regularFile else {
+                    observer?(.skippedNonRegularStage)
+                    return true
                 }
-                try FileManager.default.removeItem(at: entry)
+                // unlink cannot recursively remove a directory or follow a link target.
+                try unlinkStage(entry)
+                observer?(.removedStage)
                 removed += 1
                 return removed < 64
             }
-            if removed == 64 { return }
+            if removed == 64 {
+                observer?(.limitReached)
+                return
+            }
         }
+    }
+
+    static func maintenanceFailure(for error: Error) -> MaintenanceFailure {
+        guard let error = error as? NotebookRepositoryError else {
+            let domain = (error as NSError).domain
+            return domain == NSCocoaErrorDomain || domain == NSPOSIXErrorDomain ? .io : .unexpected
+        }
+        switch error {
+        case .unsafePath: return .unsafePath
+        case .sizeLimitExceeded: return .sizeLimit
+        case .ioFailure: return .io
+        default: return .unexpected
+        }
+    }
+
+    private static func unlinkStage(_ url: URL) throws {
+        let result = try url.withUnsafeFileSystemRepresentation { path in
+            guard let path else {
+                throw NotebookRepositoryError.unsafePath("A notebook stage cannot be represented.")
+            }
+            return Darwin.unlink(path)
+        }
+        guard result == 0 else { throw NotebookRepositoryError.ioFailure(errno) }
     }
 
     private static func visitChildren(
         in directory: URL,
         limit: Int,
+        location: MaintenanceLocation,
+        observer: MaintenanceObserver? = nil,
         _ visit: (URL) throws -> Bool
     ) throws {
+        observer?(.directoryEnumeration(location))
         let failure = EnumerationFailure()
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
@@ -222,7 +298,10 @@ enum NotebookFileSystem {
         }
         var visited = 0
         for case let entry as URL in enumerator {
-            if visited == limit { break }
+            if visited == limit {
+                observer?(.limitReached)
+                break
+            }
             visited += 1
             if try !visit(entry) { break }
         }
