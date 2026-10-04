@@ -552,7 +552,7 @@ final class NotebookHistoryTests: XCTestCase {
         ])
         let repository = try NotebookRepository(rootURL: root)
         let last = try XCTUnwrap(fixture.states.last)
-        let receipt = try await repository.migrate(
+        let receipt = try await repository.migrateHistory(
             id: fixture.notebookID, expectedRevisionID: last.revisionID
         )
         XCTAssertEqual(receipt.revisionID, last.revisionID)
