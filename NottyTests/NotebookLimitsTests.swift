@@ -13,7 +13,9 @@ final class NotebookLimitsTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let stored = try await NotebookTestFixtures.stored(id: id)
         let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
-        let storage = await probe.storage(notebookID: id)
+        let base = await probe.storage(notebookID: id)
+        let trace = LimitsSaveTrace(base: base)
+        let storage = await trace.storage()
         let session = NotebookSession(notebookID: id, openStorage: { storage })
         await session.load()
         let scene = try XCTUnwrap(
@@ -30,11 +32,10 @@ final class NotebookLimitsTests: XCTestCase {
             window.rootViewController = nil
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while session.canvasOwnerID == nil {
+        while session.canvasOwnerID == nil || notebookController(in: hosting)?.isCanvasVisible != true {
             guard ContinuousClock.now < deadline else { throw FixtureFailure.readiness }
             try await Task.sleep(for: .milliseconds(5))
         }
-        try await Task.sleep(for: .milliseconds(100))
         hosting.view.layoutIfNeeded()
         let owner = try XCTUnwrap(session.canvasOwnerID)
         let controller = try XCTUnwrap(notebookController(in: hosting))
@@ -42,6 +43,7 @@ final class NotebookLimitsTests: XCTestCase {
         controller.canvasView.delegate = nil
         let firstGeneration = (controller.captureBarrier()?.generation ?? 0) + 1
         await session.waitUntilSettled()
+        await trace.reset()
         let generation = session.canvasGeneration
         let screenBefore = session.renderDiagnostics.screenBodyCount
         let canvasBefore = session.renderDiagnostics.canvasUpdateCount
@@ -76,6 +78,16 @@ final class NotebookLimitsTests: XCTestCase {
         let saved = try await storage.load()
         XCTAssertEqual(saved?.content.strokes.map(\.id), strokes.map(\.id))
         XCTAssertEqual(saved?.content.editStamp, pending.last?.stamp)
+        let savedEdits = await trace.edits
+        let receipts = await trace.receipts
+        XCTAssertEqual(savedEdits.map(\.id), pending.map(\.id))
+        XCTAssertEqual(receipts.map(\.editID), pending.map(\.id))
+        XCTAssertEqual(savedEdits.map { $0.content.editStamp }, pending.map(\.stamp))
+        XCTAssertEqual(savedEdits.map { $0.content.editStamp?.capturedAt },
+                       [Date(timeIntervalSince1970: 1), Date(timeIntervalSince1970: 2)])
+        XCTAssertEqual(savedEdits.map { $0.content.editStamp?.uptime }, [1, 2])
+        XCTAssertEqual(savedEdits.map { $0.content.strokes.map(\.id) },
+                       [Array(strokes.prefix(8_999)).map(\.id), strokes.map(\.id)])
     }
 
     func testEncodedByteWarningHasTheExactNinetyPercentBoundary() {
@@ -142,4 +154,32 @@ final class NotebookLimitsTests: XCTestCase {
     }
 
     private enum FixtureFailure: Error { case readiness }
+}
+
+private actor LimitsSaveTrace {
+    let base: NotebookStorage
+    private(set) var edits: [NotebookSaveEdit] = []
+    private(set) var receipts: [NotebookCommittedEdit] = []
+
+    init(base: NotebookStorage) { self.base = base }
+
+    func reset() {
+        edits.removeAll()
+        receipts.removeAll()
+    }
+
+    func storage() -> NotebookStorage {
+        NotebookStorage(
+            load: base.load, save: base.save, preserve: base.preserve,
+            listRecovery: base.listRecovery, loadRecovery: base.loadRecovery,
+            saveBatch: { try await self.save($0, revision: $1) }
+        )
+    }
+
+    private func save(_ offered: [NotebookSaveEdit], revision: UUID?) async throws -> NotebookBatchSaveResult {
+        let result = try await base.saveBatch(offered, revision)
+        edits.append(contentsOf: offered.prefix(result.committed.count))
+        receipts.append(contentsOf: result.committed)
+        return result
+    }
 }
