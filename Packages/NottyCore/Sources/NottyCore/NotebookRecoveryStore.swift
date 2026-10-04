@@ -176,7 +176,7 @@ public actor NotebookRecoveryStore {
         )
     }
 
-    /// Authenticates receipt and manifest metadata without checking edit files or archives.
+    /// Verifies receipt and manifest metadata without checking edit files or archives.
     public func inspect(id: UUID) throws -> NotebookRecoveryCopyMetadata {
         let lock = try NotebookFileSystem.acquireWriterLock(rootURL)
         defer { NotebookFileSystem.releaseWriterLock(lock) }
@@ -201,6 +201,7 @@ public actor NotebookRecoveryStore {
         let record = try stateFormat.readReceipt(id)
         guard record.schemaVersion == 3 else { return try loadLegacy(id: id) }
         let states = try stateFormat.load(record)
+        var totalBytes = 0
         let edits = try states.edits.map { edit in
             try autoreleasepool {
                 let strokes = try edit.strokes.map { asset in
@@ -208,9 +209,16 @@ public actor NotebookRecoveryStore {
                     native.id = asset.id
                     return native
                 }
-                let data = PKDrawing(strokes: strokes).dataRepresentation()
+                let encoded = PKDrawing(strokes: strokes).dataRepresentation()
                 metrics.record(\.nativeArchiveSerializations)
-                metrics.record(\.nativeSerializedBytes, data.count)
+                metrics.record(\.nativeSerializedBytes, encoded.count)
+                let data = encoded.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: $0.count) }
+                metrics.record(\.assetCopiedBytes, data.count)
+                guard data.count <= Self.maximumArchiveBytes,
+                      data.count <= Self.maximumBatchBytes - totalBytes else {
+                    throw NotebookRepositoryError.sizeLimitExceeded("The recovery state cannot fit the legacy whole-drawing representation.")
+                }
+                totalBytes += data.count
                 return NotebookRecoveryEdit(
                     id: edit.id, drawingData: data, strokeIDs: edit.strokes.map(\.id),
                     title: edit.title, pageCount: edit.pageCount, stamp: edit.stamp,
@@ -218,7 +226,9 @@ public actor NotebookRecoveryStore {
                 )
             }
         }
-        return NotebookRecoveryBatch(notebookID: states.notebookID, baseRevisionID: states.baseRevisionID, edits: edits)
+        let batch = NotebookRecoveryBatch(notebookID: states.notebookID, baseRevisionID: states.baseRevisionID, edits: edits)
+        try validateBatch(batch)
+        return batch
     }
 
     private func loadLegacy(id: UUID) throws -> NotebookRecoveryBatch {
@@ -355,9 +365,11 @@ public actor NotebookRecoveryStore {
                 var stateBytes = 0
                 var result: [NotebookStroke] = []
                 for (source, id) in zip(drawing.strokes, edit.strokeIDs) {
-                    let data = PKDrawing(strokes: [source]).dataRepresentation()
+                    let encoded = PKDrawing(strokes: [source]).dataRepresentation()
                     metrics.record(\.nativeArchiveSerializations)
-                    metrics.record(\.nativeSerializedBytes, data.count)
+                    metrics.record(\.nativeSerializedBytes, encoded.count)
+                    let data = encoded.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: $0.count) }
+                    metrics.record(\.assetCopiedBytes, data.count)
                     guard !data.isEmpty, data.count <= Self.maximumArchiveBytes - stateBytes else {
                         throw NotebookRepositoryError.sizeLimitExceeded("The converted legacy recovery state exceeds 128 MiB.")
                     }

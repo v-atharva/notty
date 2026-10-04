@@ -235,7 +235,20 @@ final class NotebookRecoveryStoreTests: XCTestCase {
                     return $0.savedAt > $1.savedAt
                 }
                 XCTAssertEqual(result.copies, expected)
-                XCTAssertEqual(result.unavailableCopyIDs, [damagedReceipt.id])
+                let issue = NotebookRecoveryScanIssue(copyID: damagedReceipt.id, kind: .damagedData)
+                if damaged == "receipt" {
+                    XCTAssertEqual(result.unavailableCopyIDs, [])
+                    XCTAssertEqual(result.matchingIssues, [])
+                    XCTAssertEqual(result.unattributedIssues, [issue])
+                } else if belongsToAnotherNotebook {
+                    XCTAssertEqual(result.unavailableCopyIDs, [])
+                    XCTAssertEqual(result.matchingIssues, [])
+                    XCTAssertEqual(result.unattributedIssues, [])
+                } else {
+                    XCTAssertEqual(result.unavailableCopyIDs, [damagedReceipt.id])
+                    XCTAssertEqual(result.matchingIssues, [issue])
+                    XCTAssertEqual(result.unattributedIssues, [])
+                }
                 let loadedFirst = try await store.load(id: first.id)
                 let loadedSecond = try await store.load(id: second.id)
                 XCTAssertEqual(loadedFirst, firstBatch)
@@ -561,6 +574,94 @@ final class NotebookRecoveryStoreTests: XCTestCase {
                 edit(drawing: PKDrawing(), uptime: 3)
             ]
         )
+    }
+
+
+    func testLegacyUnsupportedExtentRemainsReadableWithoutClaimingStateConversionCoverage() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let batch = NotebookRecoveryBatch(
+            notebookID: UUID(), baseRevisionID: UUID(),
+            edits: [edit(drawing: PKDrawing(strokes: [stroke()]), pages: 14)]
+        )
+        let store = try NotebookRecoveryStore(rootURL: root)
+        let receipt = try await store.preserve(batch)
+        let before = try snapshot(root: root)
+        let metadata = try await store.inspect(id: receipt.id)
+        XCTAssertEqual(metadata.edits.map(\.pageCount), [14])
+        for operation in ["states", "edit"] {
+            do {
+                if operation == "states" { _ = try await store.loadStates(id: receipt.id) }
+                else { _ = try await store.loadEdit(id: receipt.id, editID: batch.edits[0].id) }
+                XCTFail("Unsupported extent must not yield a full state-coverage representation.")
+            } catch {
+                guard case .sizeLimitExceeded? = error as? NotebookRepositoryError else {
+                    return XCTFail("Valid legacy content is unsupported for conversion, not damaged: \(error)")
+                }
+            }
+        }
+        let original = try await store.load(id: receipt.id)
+        XCTAssertEqual(original, batch)
+        let scan = try await store.scan(notebookID: batch.notebookID)
+        XCTAssertEqual(scan, NotebookRecoveryScan(copies: [receipt], unavailableCopyIDs: []))
+        XCTAssertEqual(try snapshot(root: root), before)
+    }
+
+    func testLegacyStateConversionPreservesOrderedIdentitiesMetadataAndNonrecursiveProvenance() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notebookID = UUID()
+        let oldStamp = NotebookEditStamp(
+            capturedAt: Date(timeIntervalSince1970: 1_700_000_000), uptime: 10, sessionID: UUID()
+        )
+        let source = NotebookRecoveryProvenance(
+            notebookID: notebookID, copyID: UUID(), editID: UUID(), originalStamp: oldStamp, baseRevisionID: UUID()
+        )
+        let first = edit(drawing: PKDrawing(strokes: [stroke(), stroke()]), ids: [UUID(), UUID()])
+        let recovered = NotebookRecoveryEdit(
+            id: first.id, drawingData: first.drawingData, strokeIDs: first.strokeIDs,
+            title: first.title, pageCount: first.pageCount, stamp: first.stamp, recoverySource: source
+        )
+        let batch = NotebookRecoveryBatch(
+            notebookID: notebookID, baseRevisionID: UUID(),
+            edits: [recovered, edit(drawing: PKDrawing(), uptime: 20)]
+        )
+        let store = try NotebookRecoveryStore(rootURL: root)
+        let receipt = try await store.preserve(batch)
+        let before = try snapshot(root: root)
+        let metadataBefore = await store.workMetrics()
+        let metadata = try await store.inspect(id: receipt.id)
+        let metadataAfter = await store.workMetrics()
+        XCTAssertEqual(metadataAfter.assetReadCalls - metadataBefore.assetReadCalls, 0)
+        XCTAssertEqual(metadataAfter.assetHashBytes - metadataBefore.assetHashBytes, 0)
+        XCTAssertEqual(metadata.edits.first?.recoverySource, source)
+        let statesBefore = await store.workMetrics()
+        let states = try await store.loadStates(id: receipt.id)
+        let statesAfter = await store.workMetrics()
+        XCTAssertEqual(states.notebookID, batch.notebookID)
+        XCTAssertEqual(states.baseRevisionID, batch.baseRevisionID)
+        XCTAssertEqual(states.edits.map(\.id), batch.edits.map(\.id))
+        XCTAssertEqual(states.edits.map(\.stamp), batch.edits.map(\.stamp))
+        XCTAssertEqual(states.edits.map { $0.strokes.map(\.id) }, batch.edits.map(\.strokeIDs))
+        XCTAssertEqual(states.edits.map(\.recoverySource), batch.edits.map(\.recoverySource))
+        XCTAssertEqual(statesAfter.nativeArchiveSerializations - statesBefore.nativeArchiveSerializations, 2)
+        XCTAssertGreaterThan(statesAfter.nativeSerializedBytes - statesBefore.nativeSerializedBytes, 0)
+        XCTAssertEqual(
+            statesAfter.assetCopiedBytes - statesBefore.assetCopiedBytes,
+            statesAfter.nativeSerializedBytes - statesBefore.nativeSerializedBytes
+        )
+        XCTAssertEqual(statesAfter.nativeStateValidations - statesBefore.nativeStateValidations, 4)
+        let targeted = try await store.loadEdit(id: receipt.id, editID: recovered.id)
+        XCTAssertEqual(targeted.state.strokes.map(\.id), recovered.strokeIDs)
+        XCTAssertEqual(targeted.state.recoverySource, source)
+        XCTAssertEqual(targeted.source, NotebookRecoveryProvenance(
+            notebookID: notebookID, copyID: receipt.id, editID: recovered.id,
+            originalStamp: recovered.stamp, baseRevisionID: batch.baseRevisionID
+        ))
+        XCTAssertNotEqual(targeted.source.originalStamp, oldStamp)
+        let legacy = try await store.load(id: receipt.id)
+        XCTAssertEqual(legacy, batch)
+        XCTAssertEqual(try snapshot(root: root), before)
     }
 
     private func edit(

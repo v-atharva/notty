@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PencilKit
 import Darwin
 import XCTest
 @testable import NottyCore
@@ -1358,6 +1359,272 @@ final class NotebookRepositoryTests: XCTestCase {
         XCTAssertTrue(counter.snapshot().isEmpty)
     }
 
+
+    func testSelectionBootstrapPublishesOnlyTheOpenedFreshNotebook() async throws {
+        let notes = try makeRoot()
+        let recovery = try makeRoot()
+        defer {
+            try? FileManager.default.removeItem(at: notes)
+            try? FileManager.default.removeItem(at: recovery)
+        }
+        let repository = try NotebookRepository(rootURL: notes)
+        let legacyID = UUID()
+        guard case .empty(let token) = try await repository.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("Empty paired roots must provide a bootstrap token.") }
+        let targetID = UUID()
+        let saved = try await repository.save(
+            id: targetID, content: content(strokes: []), expectedRevisionID: nil
+        )
+        let opened = try await repository.open(id: targetID)
+        let pin = try XCTUnwrap(opened?.historyPin)
+        guard case .selected(let selected, _) = try await repository.selectNotebook(
+            pin: pin, expectedSelection: token
+        ) else { return XCTFail("Publication must return the exact selected ID.") }
+        XCTAssertEqual(selected, targetID)
+        let reader = try NotebookRepository(rootURL: notes)
+        guard case .selected(let reopened, _) = try await reader.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("A published pointer must survive reopening.") }
+        XCTAssertEqual(reopened, targetID)
+        let loaded = try await requiredNotebook(reader, id: targetID)
+        XCTAssertEqual(loaded.revisionID, saved.revisionID)
+        XCTAssertEqual(loaded.content, saved.content)
+    }
+
+    func testSelectionEmptyTokenRejectsForeignNoteOrCopyArrivingBeforePublication() async throws {
+        for arrival in ["note", "copy"] {
+            let notes = try makeRoot()
+            let recovery = try makeRoot()
+            defer {
+                try? FileManager.default.removeItem(at: notes)
+                try? FileManager.default.removeItem(at: recovery)
+            }
+            let repository = try NotebookRepository(rootURL: notes)
+            let legacyID = UUID()
+            guard case .empty(let token) = try await repository.readSelection(
+                legacyNotebookID: legacyID, recoveryRootURL: recovery
+            ) else { return XCTFail("The fixture must begin empty.") }
+            let targetID = UUID()
+            _ = try await repository.save(id: targetID, content: content(strokes: []), expectedRevisionID: nil)
+            let opened = try await repository.open(id: targetID)
+            let pin = try XCTUnwrap(opened?.historyPin)
+            if arrival == "note" {
+                let foreign = try NotebookRepository(rootURL: notes)
+                _ = try await foreign.save(id: UUID(), content: content(strokes: []), expectedRevisionID: nil)
+            } else {
+                let store = try NotebookRecoveryStore(rootURL: recovery)
+                _ = try await store.preserve(NotebookRecoveryBatch(
+                    notebookID: UUID(), baseRevisionID: nil,
+                    edits: [NotebookRecoveryEdit(
+                        id: UUID(), drawingData: PKDrawing().dataRepresentation(), strokeIDs: [],
+                        title: "Retained", pageCount: 1,
+                        stamp: NotebookEditStamp(capturedAt: Date(timeIntervalSince1970: 100), uptime: 1, sessionID: UUID())
+                    )]
+                ))
+            }
+            let beforeNotes = try fileSnapshot(root: notes)
+            let beforeRecovery = try fileSnapshot(root: recovery)
+            do {
+                _ = try await repository.selectNotebook(pin: pin, expectedSelection: token)
+                XCTFail("A stale empty-library token must not select a blank notebook after foreign publication.")
+            } catch {
+                XCTAssertEqual(error as? NotebookRepositoryError, .revisionConflict)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: notes.appendingPathComponent("SELECTION.json").path))
+            XCTAssertEqual(try fileSnapshot(root: notes), beforeNotes)
+            XCTAssertEqual(try fileSnapshot(root: recovery), beforeRecovery)
+            guard case .recoveryRequired = try await repository.readSelection(
+                legacyNotebookID: legacyID, recoveryRootURL: recovery
+            ) else { return XCTFail("Retained unselected content must never be automatically promoted.") }
+            let retained = try await requiredNotebook(repository, id: targetID)
+            XCTAssertEqual(retained.revisionID, pin.revisionID)
+        }
+    }
+
+    func testSelectionFaultsRetainOldPointerAndBothNotebookHistories() async throws {
+        for targetStage in NotebookSelectionWriteStage.allCases {
+            let notes = try makeRoot()
+            let recovery = try makeRoot()
+            defer {
+                try? FileManager.default.removeItem(at: notes)
+                try? FileManager.default.removeItem(at: recovery)
+            }
+            let healthy = try NotebookRepository(rootURL: notes)
+            let oldID = UUID()
+            _ = try await healthy.save(id: oldID, content: content(strokes: []), expectedRevisionID: nil)
+            guard case .selected(_, let initialToken) = try await healthy.readSelection(
+                legacyNotebookID: oldID, recoveryRootURL: recovery
+            ) else { return XCTFail("The existing fixed legacy directory is the compatibility selection.") }
+            let oldOpen = try await healthy.open(id: oldID)
+            _ = try await healthy.selectNotebook(
+                pin: try XCTUnwrap(oldOpen?.historyPin), expectedSelection: initialToken
+            )
+            let outsideFile = recovery.appendingPathComponent("retained-outside")
+            let retainedLink = notes.appendingPathComponent("retained-link")
+            let outsideBytes = Data("retained outside target".utf8)
+            try outsideBytes.write(to: outsideFile)
+            try FileManager.default.createSymbolicLink(at: retainedLink, withDestinationURL: outsideFile)
+            let faulty = try NotebookRepository(rootURL: notes, selectionFaultInjector: { stage in
+                if stage == targetStage { throw InjectedFailure.stop }
+            })
+            guard case .selected(_, let token) = try await faulty.readSelection(
+                legacyNotebookID: oldID, recoveryRootURL: recovery
+            ) else { return XCTFail("The fixture must retain its selected pointer.") }
+            let newID = UUID()
+            _ = try await faulty.save(id: newID, content: content(strokes: []), expectedRevisionID: nil)
+            let opened = try await faulty.open(id: newID)
+            let before = try fileSnapshot(root: notes)
+            do {
+                _ = try await faulty.selectNotebook(pin: try XCTUnwrap(opened?.historyPin), expectedSelection: token)
+                XCTFail("The injected selection fault must propagate before publication.")
+            } catch { XCTAssertTrue(error is InjectedFailure) }
+            XCTAssertEqual(try fileSnapshot(root: notes), before)
+            XCTAssertTrue(try retainedLink.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true)
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: retainedLink.path), outsideFile.path)
+            XCTAssertEqual(try Data(contentsOf: outsideFile), outsideBytes)
+            let reader = try NotebookRepository(rootURL: notes)
+            guard case .selected(let id, _) = try await reader.readSelection(
+                legacyNotebookID: oldID, recoveryRootURL: recovery
+            ) else { return XCTFail("Failure must retain the old selection.") }
+            XCTAssertEqual(id, oldID)
+            let oldAudit = try await reader.auditHistory(id: oldID)
+            let newAudit = try await reader.auditHistory(id: newID)
+            XCTAssertEqual(oldAudit.revisionCount, 1)
+            XCTAssertEqual(newAudit.revisionCount, 1)
+        }
+    }
+
+    func testSelectionRejectsForeignPinStaleHeadAndFreshCurrentAssetDamage() async throws {
+        for invalid in ["foreign", "head", "asset"] {
+            let notes = try makeRoot()
+            let recovery = try makeRoot()
+            defer {
+                try? FileManager.default.removeItem(at: notes)
+                try? FileManager.default.removeItem(at: recovery)
+            }
+            let repository = try NotebookRepository(rootURL: notes)
+            let legacyID = UUID()
+            guard case .empty(let token) = try await repository.readSelection(
+                legacyNotebookID: legacyID, recoveryRootURL: recovery
+            ) else { return XCTFail("The fixture must begin empty.") }
+            let id = UUID()
+            let asset = NotebookStroke(id: UUID(), data: Data("validated archive".utf8))
+            let saved = try await repository.save(id: id, content: content(strokes: [asset]), expectedRevisionID: nil)
+            let opened = try await repository.open(id: id)
+            var pin = try XCTUnwrap(opened?.historyPin)
+            if invalid == "foreign" {
+                let foreign = try NotebookRepository(rootURL: notes)
+                let foreignOpen = try await foreign.open(id: id)
+                pin = try XCTUnwrap(foreignOpen?.historyPin)
+            } else if invalid == "head" {
+                let foreign = try NotebookRepository(rootURL: notes)
+                _ = try await foreign.save(
+                    id: id, content: NotebookContent(title: "Changed", pageCount: 3, strokes: [asset]),
+                    expectedRevisionID: saved.revisionID
+                )
+            } else {
+                let path = noteURL(root: notes, id: id).appendingPathComponent("assets/\(digest(asset.data)).stroke")
+                try Data("tampered".utf8).write(to: path)
+            }
+            let before = try fileSnapshot(root: notes)
+            do {
+                _ = try await repository.selectNotebook(pin: pin, expectedSelection: token)
+                XCTFail("Selection must validate repository ownership, exact HEAD and fresh current assets.")
+            } catch {
+                switch (invalid, error as? NotebookRepositoryError) {
+                case ("foreign", .invalidContent?), ("head", .revisionConflict?), ("asset", .corruptData?): break
+                default: XCTFail("Unexpected selection validation error: \(error)")
+                }
+            }
+            XCTAssertEqual(try fileSnapshot(root: notes), before)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: notes.appendingPathComponent("SELECTION.json").path))
+        }
+    }
+
+    func testSelectionRecoveryRequiredEscapeRetainsAmbiguousContentAndDamagedLegacySelection() async throws {
+        let notes = try makeRoot()
+        let recovery = try makeRoot()
+        defer {
+            try? FileManager.default.removeItem(at: notes)
+            try? FileManager.default.removeItem(at: recovery)
+        }
+        let repository = try NotebookRepository(rootURL: notes)
+        let legacyID = UUID()
+        let legacyDirectory = noteURL(root: notes, id: legacyID)
+        try FileManager.default.createDirectory(at: legacyDirectory, withIntermediateDirectories: false)
+        try Data("damaged".utf8).write(to: legacyDirectory.appendingPathComponent("HEAD.json"))
+        guard case .selected(let legacy, _) = try await repository.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("An existing legacy directory must remain selected even when its HEAD is damaged.") }
+        XCTAssertEqual(legacy, legacyID)
+        guard case .recoveryRequired(let token) = try await repository.readSelection(
+            legacyNotebookID: UUID(), recoveryRootURL: recovery
+        ) else { return XCTFail("A nondefault retained directory without a pointer requires explicit recovery.") }
+        let retainedBefore = try fileSnapshot(root: legacyDirectory)
+        let target = UUID()
+        _ = try await repository.save(id: target, content: content(strokes: []), expectedRevisionID: nil)
+        let opened = try await repository.open(id: target)
+        _ = try await repository.selectNotebook(pin: try XCTUnwrap(opened?.historyPin), expectedSelection: token)
+        XCTAssertEqual(try fileSnapshot(root: legacyDirectory), retainedBefore)
+        guard case .selected(let selected, _) = try await repository.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("Only the explicitly selected fresh note must be selected.") }
+        XCTAssertEqual(selected, target)
+    }
+
+    func testSelectionInvalidPointerAndUnsafePairedRootsNeverBecomeEmptyTokens() async throws {
+        for invalid in ["malformed", "version", "link", "directory", "overlap", "aliasOverlap", "recoveryLink"] {
+            let notes = try makeRoot()
+            let recovery = try makeRoot()
+            let outside = try makeRoot()
+            defer {
+                try? FileManager.default.removeItem(at: notes)
+                try? FileManager.default.removeItem(at: recovery)
+                try? FileManager.default.removeItem(at: outside)
+            }
+            let repository = try NotebookRepository(rootURL: notes)
+            let pointer = notes.appendingPathComponent("SELECTION.json")
+            var recoveryURL = recovery
+            switch invalid {
+            case "malformed": try Data("invalid".utf8).write(to: pointer)
+            case "version": try writeObject(["schemaVersion": 99], to: pointer)
+            case "link":
+                let target = outside.appendingPathComponent("pointer")
+                try Data("retained".utf8).write(to: target)
+                try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: target)
+            case "directory": try FileManager.default.createDirectory(at: pointer, withIntermediateDirectories: false)
+            case "overlap": recoveryURL = notes.appendingPathComponent("nested")
+            case "aliasOverlap":
+                let alias = outside.appendingPathComponent("notes-alias")
+                try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: notes)
+                recoveryURL = alias.appendingPathComponent("nested")
+            default:
+                recoveryURL = outside.appendingPathComponent("recovery-link")
+                try FileManager.default.createSymbolicLink(at: recoveryURL, withDestinationURL: recovery)
+            }
+            let before = try fileSnapshot(root: notes)
+            do {
+                _ = try await repository.readSelection(legacyNotebookID: UUID(), recoveryRootURL: recoveryURL)
+                XCTFail("Malformed pointer and unsafe roots must never mint an absence token.")
+            } catch {
+                switch (invalid, error as? NotebookRepositoryError) {
+                case ("malformed", .corruptData?), ("version", .unsupportedVersion(99)?): break
+                case ("link", .unsafePath?), ("directory", .unsafePath?),
+                     ("overlap", .unsafePath?), ("aliasOverlap", .unsafePath?),
+                     ("recoveryLink", .unsafePath?): break
+                default: XCTFail("Unexpected unsafe selection error: \(error)")
+                }
+            }
+            XCTAssertEqual(try fileSnapshot(root: notes), before)
+            if invalid == "link" {
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: pointer.path),
+                               outside.appendingPathComponent("pointer").path)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: notes.appendingPathComponent("nested").path))
+        }
+    }
+
     private func makeSparseFile(_ url: URL, size: Int) throws {
         if !FileManager.default.fileExists(atPath: url.path) {
             XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
@@ -1365,6 +1632,132 @@ final class NotebookRepositoryTests: XCTestCase {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
         try handle.truncate(atOffset: UInt64(size))
+    }
+
+
+    func testSelectionExistingPointerCompareAndSwapRetainsTheNewerSelectedNotebook() async throws {
+        let notes = try makeRoot()
+        let recovery = try makeRoot()
+        defer {
+            try? FileManager.default.removeItem(at: notes)
+            try? FileManager.default.removeItem(at: recovery)
+        }
+        let repository = try NotebookRepository(rootURL: notes)
+        let firstID = UUID()
+        _ = try await repository.save(id: firstID, content: content(strokes: []), expectedRevisionID: nil)
+        guard case .selected(_, let initial) = try await repository.readSelection(
+            legacyNotebookID: firstID, recoveryRootURL: recovery
+        ) else { return XCTFail("The legacy directory must be selected for compatibility.") }
+        let firstOpen = try await repository.open(id: firstID)
+        let firstPin = try XCTUnwrap(firstOpen?.historyPin)
+        guard case .selected(_, let stale) = try await repository.selectNotebook(
+            pin: firstPin, expectedSelection: initial
+        ) else { return XCTFail("The fixture must publish its first pointer.") }
+        let secondID = UUID()
+        _ = try await repository.save(id: secondID, content: content(strokes: []), expectedRevisionID: nil)
+        let secondOpen = try await repository.open(id: secondID)
+        _ = try await repository.selectNotebook(
+            pin: try XCTUnwrap(secondOpen?.historyPin), expectedSelection: stale
+        )
+        let before = try fileSnapshot(root: notes)
+        do {
+            _ = try await repository.selectNotebook(pin: firstPin, expectedSelection: stale)
+            XCTFail("An old existing-pointer token must not replace the newer selection.")
+        } catch { XCTAssertEqual(error as? NotebookRepositoryError, .revisionConflict) }
+        XCTAssertEqual(try fileSnapshot(root: notes), before)
+        guard case .selected(let selected, _) = try await repository.readSelection(
+            legacyNotebookID: firstID, recoveryRootURL: recovery
+        ) else { return XCTFail("The newer selected notebook must remain selected.") }
+        XCTAssertEqual(selected, secondID)
+    }
+
+    func testSelectionRechecksEmptyInventoryAfterThePublicationCallback() async throws {
+        let notes = try makeRoot()
+        let recovery = try makeRoot()
+        defer {
+            try? FileManager.default.removeItem(at: notes)
+            try? FileManager.default.removeItem(at: recovery)
+        }
+        let foreignID = UUID()
+        let foreignDirectory = noteURL(root: notes, id: foreignID)
+        let repository = try NotebookRepository(rootURL: notes, selectionFaultInjector: { stage in
+            if stage == .beforeSelectionPublication {
+                try FileManager.default.createDirectory(at: foreignDirectory, withIntermediateDirectories: false)
+            }
+        })
+        let legacyID = UUID()
+        guard case .empty(let token) = try await repository.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("The fixture must begin empty.") }
+        let targetID = UUID()
+        let saved = try await repository.save(id: targetID, content: content(strokes: []), expectedRevisionID: nil)
+        let opened = try await repository.open(id: targetID)
+        let targetBefore = try fileSnapshot(root: noteURL(root: notes, id: targetID))
+        do {
+            _ = try await repository.selectNotebook(pin: try XCTUnwrap(opened?.historyPin), expectedSelection: token)
+            XCTFail("A retained entry arriving at the publication callback must invalidate empty bootstrap.")
+        } catch { XCTAssertEqual(error as? NotebookRepositoryError, .revisionConflict) }
+        XCTAssertTrue(try NotebookFileSystem.existingDirectory(foreignDirectory))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: foreignDirectory.path), [])
+        XCTAssertEqual(try fileSnapshot(root: noteURL(root: notes, id: targetID)), targetBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: notes.appendingPathComponent("SELECTION.json").path))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: notes.path).contains { $0.hasSuffix(".tmp") })
+        guard case .recoveryRequired = try await repository.readSelection(
+            legacyNotebookID: legacyID, recoveryRootURL: recovery
+        ) else { return XCTFail("Neither retained directory may be automatically selected.") }
+        let loaded = try await requiredNotebook(repository, id: targetID)
+        XCTAssertEqual(loaded.revisionID, saved.revisionID)
+        XCTAssertEqual(loaded.content, saved.content)
+    }
+
+    func testSelectionAbsentPointerClassifiesRetainedCopyPrivateOrphanAndUnknownContentConservatively() async throws {
+        for retained in ["copy", "private", "orphan", "regular", "many"] {
+            let notes = try makeRoot()
+            let recovery = try makeRoot()
+            defer {
+                try? FileManager.default.removeItem(at: notes)
+                try? FileManager.default.removeItem(at: recovery)
+            }
+            let repository = try NotebookRepository(rootURL: notes)
+            let legacyID = UUID()
+            switch retained {
+            case "copy":
+                let store = try NotebookRecoveryStore(rootURL: recovery)
+                _ = try await store.preserve(NotebookRecoveryBatch(
+                    notebookID: UUID(), baseRevisionID: nil,
+                    edits: [NotebookRecoveryEdit(
+                        id: UUID(), drawingData: PKDrawing().dataRepresentation(), strokeIDs: [],
+                        title: "Retained", pageCount: 1,
+                        stamp: NotebookEditStamp(capturedAt: Date(timeIntervalSince1970: 100), uptime: 1, sessionID: UUID())
+                    )]
+                ))
+            case "private":
+                try FileManager.default.createDirectory(
+                    at: notes.appendingPathComponent(".creation-\(UUID().uuidString.lowercased())"),
+                    withIntermediateDirectories: false
+                )
+            case "orphan":
+                _ = try await repository.save(id: UUID(), content: content(strokes: []), expectedRevisionID: nil)
+            case "regular": try Data("retained".utf8).write(to: notes.appendingPathComponent("unknown"))
+            default:
+                for index in 0..<65 {
+                    try Data([UInt8(index)]).write(to: notes.appendingPathComponent("unknown-\(index)"))
+                }
+            }
+            let beforeNotes = try fileSnapshot(root: notes)
+            let beforeRecovery = try fileSnapshot(root: recovery)
+            guard case .recoveryRequired = try await repository.readSelection(
+                legacyNotebookID: legacyID, recoveryRootURL: recovery
+            ) else { return XCTFail("Retained \(retained) content cannot be classified as an empty library.") }
+            XCTAssertEqual(try fileSnapshot(root: notes), beforeNotes)
+            // Selection may initialize only the regular zero-byte recovery writer lock.
+            var afterRecovery = try fileSnapshot(root: recovery)
+            afterRecovery.removeValue(forKey: ".writer.lock")
+            var retainedRecovery = beforeRecovery
+            retainedRecovery.removeValue(forKey: ".writer.lock")
+            XCTAssertEqual(afterRecovery, retainedRecovery)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: notes.appendingPathComponent("SELECTION.json").path))
+        }
     }
 
     private func digest(_ data: Data) -> String {

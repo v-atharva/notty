@@ -428,4 +428,151 @@ final class NotebookHistoryTests: XCTestCase {
         } catch NotebookRepositoryError.corruptData(_) {}
     }
 
+    func testRecoveryProvenanceSurvivesEveryHistoryStateCheckpointAndOrdinaryReset() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notebookID = UUID()
+        let source = NotebookRecoveryProvenance(
+            notebookID: notebookID, copyID: UUID(), editID: UUID(),
+            originalStamp: Fixtures.stamp(1), baseRevisionID: UUID()
+        )
+        let repository = try NotebookRepository(rootURL: root)
+        var expected: [StoredNotebook] = []
+        for index in 1...20 {
+            let content = NotebookContent(
+                title: "State \(index)", pageCount: 1 + index % 3,
+                strokes: index.isMultiple(of: 3) ? [] : [Fixtures.asset(index: 1)],
+                editStamp: Fixtures.stamp(100 + index),
+                recoverySource: index.isMultiple(of: 2) ? source : nil
+            )
+            expected.append(try await repository.save(
+                id: notebookID, content: content, expectedRevisionID: expected.last?.revisionID
+            ))
+        }
+        let layout = try Fixtures.layout(root: root, id: notebookID)
+        XCTAssertGreaterThan(try Fixtures.regularFiles(in: layout.checkpointsDirectory).count, 1)
+        let reader = try NotebookRepository(rootURL: root)
+        let summaries = try await reader.history(id: notebookID, limit: 50)
+        XCTAssertEqual(summaries.count, expected.count)
+        for saved in expected {
+            let summary = try XCTUnwrap(summaries.first { $0.revisionID == saved.revisionID })
+            XCTAssertEqual(summary.recoverySource, saved.content.recoverySource)
+            XCTAssertEqual(summary.editStamp, saved.content.editStamp)
+            let historical = try await reader.loadRevision(id: notebookID, revisionID: saved.revisionID)
+            XCTAssertEqual(historical.content, saved.content)
+            XCTAssertEqual(historical.savedAt, saved.savedAt)
+        }
+        let current = try await reader.open(id: notebookID)
+        XCTAssertEqual(current?.notebook.content.recoverySource, source)
+        let next = try await reader.save(
+            id: notebookID,
+            content: NotebookContent(title: "Ordinary", pageCount: 2, strokes: [], editStamp: Fixtures.stamp(200)),
+            expectedRevisionID: expected.last?.revisionID
+        )
+        XCTAssertNil(next.content.recoverySource)
+        let fresh = try NotebookRepository(rootURL: root)
+        let loaded = try await fresh.load(id: notebookID)
+        XCTAssertEqual(loaded?.content, next.content)
+        let audit = try await fresh.auditHistory(id: notebookID)
+        XCTAssertEqual(audit.revisionCount, 21)
+        XCTAssertEqual(next.content.editStamp, Fixtures.stamp(200))
+        XCTAssertNotEqual(next.content.editStamp, source.originalStamp)
+    }
+
+    func testCheckpointCurrentHeaderRejectsAuthenticatedMalformedRecoveryProvenance() async throws {
+        for invalid in ["notebook", "stamp", "missingID"] {
+            let root = try Fixtures.root()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let notebookID = UUID()
+            let source = NotebookRecoveryProvenance(
+                notebookID: notebookID, copyID: UUID(), editID: UUID(), originalStamp: Fixtures.stamp(1)
+            )
+            let writer = try NotebookRepository(rootURL: root)
+            let saved = try await writer.save(
+                id: notebookID,
+                content: NotebookContent(title: "Recovered", pageCount: 1, strokes: [], recoverySource: source),
+                expectedRevisionID: nil
+            )
+            let layout = try Fixtures.layout(root: root, id: notebookID)
+            var event = try Fixtures.object(at: layout.eventURL(saved.revisionID))
+            XCTAssertNotNil(event["checkpointDigest"])
+            var metadata = try XCTUnwrap(event["recoverySource"] as? [String: Any])
+            if invalid == "notebook" { metadata["notebookID"] = UUID().uuidString }
+            else if invalid == "missingID" { metadata.removeValue(forKey: "copyID") }
+            else {
+                var stamp = try XCTUnwrap(metadata["originalStamp"] as? [String: Any])
+                stamp["uptime"] = -1
+                metadata["originalStamp"] = stamp
+            }
+            event["recoverySource"] = metadata
+            let data = try JSONSerialization.data(withJSONObject: event, options: [.sortedKeys])
+            try data.write(to: layout.eventURL(saved.revisionID))
+            let headURL = layout.notebookDirectory.appendingPathComponent("HEAD.json")
+            var head = try Fixtures.object(at: headURL)
+            head["revisionDigest"] = Fixtures.digest(data)
+            try Fixtures.writeObject(head, to: headURL)
+            let reader = try NotebookRepository(rootURL: root)
+            for operation in ["open", "history", "revision", "audit"] {
+                do {
+                    switch operation {
+                    case "open": _ = try await reader.open(id: notebookID)
+                    case "history": _ = try await reader.history(id: notebookID)
+                    case "revision": _ = try await reader.loadRevision(id: notebookID, revisionID: saved.revisionID)
+                    default: _ = try await reader.auditHistory(id: notebookID)
+                    }
+                    XCTFail("A checkpoint must not supersede malformed current-event provenance.")
+                } catch {
+                    guard case .corruptData? = error as? NotebookRepositoryError else {
+                        return XCTFail("Unexpected provenance classification: \(error)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testNilRecoverySourcePreservesThePreviousEventEncodingExactly() throws {
+        let bytes = Data(#"{"delta":{},"notebookID":"00000000-0000-0000-0000-000000000001","revisionID":"00000000-0000-0000-0000-000000000002","savedAt":0,"schemaVersion":2,"sequence":1}"#.utf8)
+        let event: NotebookRevisionFormat.Event = try NotebookRevisionFormat.decode(bytes)
+        XCTAssertNil(event.recoverySource)
+        XCTAssertEqual(try NotebookRevisionFormat.encode(event), bytes)
+        let explicit = NotebookRevisionFormat.Event(
+            schemaVersion: 2, notebookID: event.notebookID, revisionID: event.revisionID,
+            parentRevisionID: nil, parentDigest: nil, sequence: 1, delta: event.delta,
+            editStamp: nil, savedAt: event.savedAt, checkpointDigest: nil, recoverySource: nil
+        )
+        XCTAssertEqual(try NotebookRevisionFormat.encode(explicit), bytes)
+    }
+
+    func testLegacyMigrationAndRollbackKeepOriginalBytesAndAbsentRecoverySource() async throws {
+        let root = try Fixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try Fixtures.writeLegacy(root: root, contents: [
+            NotebookContent(title: "Before", pageCount: 2, strokes: [Fixtures.asset(index: 1)], editStamp: Fixtures.stamp(1)),
+            NotebookContent(title: "After", pageCount: 3, strokes: [], editStamp: Fixtures.stamp(2))
+        ])
+        let repository = try NotebookRepository(rootURL: root)
+        let last = try XCTUnwrap(fixture.states.last)
+        let receipt = try await repository.migrate(
+            id: fixture.notebookID, expectedRevisionID: last.revisionID
+        )
+        XCTAssertEqual(receipt.revisionID, last.revisionID)
+        try Fixtures.assertOriginalFiles(fixture, root: root, includeHead: false)
+        let summaries = try await repository.history(id: fixture.notebookID, limit: 10)
+        XCTAssertEqual(summaries.count, 2)
+        XCTAssertTrue(summaries.allSatisfy { $0.recoverySource == nil })
+        for original in fixture.states {
+            let restored = try await repository.loadRevision(
+                id: fixture.notebookID, revisionID: original.revisionID
+            )
+            XCTAssertNil(restored.content.recoverySource)
+            XCTAssertEqual(restored.content, original.content)
+        }
+        let rolledBack = try await repository.rollbackMigration(
+            id: fixture.notebookID, expectedRevisionID: last.revisionID
+        )
+        XCTAssertEqual(rolledBack.content, last.content)
+        XCTAssertNil(rolledBack.content.recoverySource)
+        try Fixtures.assertOriginalFiles(fixture, root: root, includeHead: true)
+    }
+
 }

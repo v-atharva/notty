@@ -7,7 +7,7 @@ struct NottyApp: App {
             if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
                 Color.clear
             } else {
-                NotebookScreen()
+                NotebookLibraryHost()
             }
         }
     }

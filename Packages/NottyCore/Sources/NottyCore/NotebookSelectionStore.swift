@@ -114,11 +114,41 @@ struct NotebookSelectionStore {
         guard !overlaps(notesRoot, recoveryURL.standardizedFileURL) else {
             throw NotebookRepositoryError.unsafePath("Notebook and recovery storage must have separate roots.")
         }
+        let prospective = try prospectiveRoot(recoveryURL)
+        guard !overlaps(notesRoot, prospective) else {
+            throw NotebookRepositoryError.unsafePath("Notebook and recovery storage must have separate roots.")
+        }
         let recoveryRoot = try NotebookFileSystem.prepareRoot(recoveryURL)
         guard !overlaps(notesRoot, recoveryRoot) else {
             throw NotebookRepositoryError.unsafePath("Notebook and recovery storage must have separate roots.")
         }
         return recoveryRoot
+    }
+
+    private func prospectiveRoot(_ url: URL) throws -> URL {
+        var existing = url.standardizedFileURL
+        var missing: [String] = []
+        while try NotebookFileSystem.kind(existing) == nil {
+            let parent = existing.deletingLastPathComponent()
+            guard parent.path != existing.path else {
+                throw NotebookRepositoryError.unsafePath("The recovery storage ancestor is missing.")
+            }
+            missing.append(existing.lastPathComponent)
+            existing = parent
+        }
+        if missing.isEmpty {
+            guard try NotebookFileSystem.kind(existing) == .directory else {
+                throw NotebookRepositoryError.unsafePath("Recovery storage must use a directory without a symbolic link.")
+            }
+        }
+        var candidate = existing.resolvingSymlinksInPath()
+        guard try NotebookFileSystem.kind(candidate) == .directory else {
+            throw NotebookRepositoryError.unsafePath("The recovery storage ancestor is not a directory.")
+        }
+        for component in missing.reversed() {
+            candidate.appendPathComponent(component, isDirectory: true)
+        }
+        return candidate
     }
 
     private func isEmpty(
