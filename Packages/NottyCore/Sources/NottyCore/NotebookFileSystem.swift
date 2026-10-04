@@ -390,6 +390,45 @@ enum NotebookFileSystem {
         try renameFile(stage, destination: destination)
     }
 
+    static func withWriterLocks<T>(_ roots: [URL], _ operation: () throws -> T) throws -> T {
+        let sorted = Array(Set(roots)).sorted { $0.path < $1.path }
+        var descriptors: [Int32] = []
+        defer { for descriptor in descriptors.reversed() { releaseWriterLock(descriptor) } }
+        for root in sorted { descriptors.append(try acquireWriterLock(root)) }
+        return try operation()
+    }
+
+    static func hasRetainedEntries(
+        in directory: URL, excluding: [String: ItemKind] = [:]
+    ) throws -> Bool {
+        guard try existingDirectory(directory) else {
+            throw NotebookRepositoryError.unsafePath("A storage root is missing.")
+        }
+        let failure = EnumerationFailure()
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsSubdirectoryDescendants],
+            errorHandler: { _, error in failure.record(error); return false }
+        ) else {
+            throw NotebookRepositoryError.unsafePath("A storage root cannot be enumerated.")
+        }
+        var count = 0
+        var retained = false
+        for case let entry as URL in enumerator {
+            guard count < 64 else { retained = true; break }
+            count += 1
+            let expected: ItemKind?
+            if entry.lastPathComponent == ".writer.lock" { expected = .regularFile }
+            else { expected = excluding[entry.lastPathComponent] }
+            if let expected {
+                guard try kind(entry) == expected else {
+                    throw NotebookRepositoryError.unsafePath("A storage inventory entry has an unsafe file type.")
+                }
+            } else { retained = true; break }
+        }
+        if let error = failure.value() { throw error }
+        return retained
+    }
+
     static func acquireWriterLock(_ root: URL) throws -> Int32 {
         guard try existingDirectory(root) else {
             throw NotebookRepositoryError.unsafePath("The notebook storage directory is missing.")

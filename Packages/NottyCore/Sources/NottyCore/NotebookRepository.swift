@@ -39,6 +39,7 @@ public actor NotebookRepository {
     private var validatedGenerations: [UUID: ValidatedGeneration] = [:]
     private var metadataGenerations: [UUID: MetadataGeneration] = [:]
     private let rootURL: URL
+    private var selectionFaultInjector: (@Sendable (NotebookSelectionWriteStage) throws -> Void)?
     private let migrationFaultInjector: (@Sendable (NotebookMigrationStage) throws -> Void)?
     private let faultInjector: (@Sendable (NotebookWriteStage) throws -> Void)?
     private let assetVerificationObserver: (@Sendable (String) -> Void)?
@@ -124,6 +125,48 @@ public actor NotebookRepository {
         self.assetVerificationObserver = nil
         self.maintenanceObserver = observer
         self.maintenanceFaultInjector = nil
+    }
+
+    public init(
+        rootURL: URL,
+        selectionFaultInjector: @escaping @Sendable (NotebookSelectionWriteStage) throws -> Void
+    ) throws {
+        let diagnostics = NotebookFileSystem.MaintenanceDiagnostics()
+        let observer = Self.makeMaintenanceObserver(diagnostics: diagnostics)
+        self.rootURL = try Self.prepareRoot(rootURL, observer: observer)
+        self.maintenanceDiagnostics = diagnostics
+        self.faultInjector = nil
+        self.migrationFaultInjector = nil
+        self.assetVerificationObserver = nil
+        self.maintenanceObserver = observer
+        self.maintenanceFaultInjector = nil
+        self.selectionFaultInjector = selectionFaultInjector
+    }
+
+    public func readSelection(
+        legacyNotebookID: UUID, recoveryRootURL: URL
+    ) throws -> NotebookSelectionState {
+        try selectionStore.read(legacyNotebookID: legacyNotebookID, recoveryRootURL: recoveryRootURL)
+    }
+
+    public func selectNotebook(
+        pin: NotebookHistoryPin, expectedSelection: NotebookSelectionToken
+    ) throws -> NotebookSelectionState {
+        defer { invalidateValidation(pin.notebookID) }
+        return try selectionStore.select(pin: pin, expected: expectedSelection) {
+            let (history, snapshot) = try self.selectedHistorySnapshot(id: pin.notebookID)
+            guard snapshot == pin.snapshot else { throw NotebookRepositoryError.revisionConflict }
+            let current = try history.current(snapshot.head)
+            guard current.sequence == pin.sequence else { throw NotebookRepositoryError.revisionConflict }
+            try self.migrationStore(history).validateReceiptRecord(snapshot.head, selectedSequence: current.sequence)
+            _ = try history.readAssets(current.state)
+        }
+    }
+
+    private var selectionStore: NotebookSelectionStore {
+        NotebookSelectionStore(
+            notesRoot: rootURL, repositoryID: repositoryID, metrics: metrics, fault: selectionFaultInjector
+        )
     }
 
     public func storageMetrics() -> NotebookStorageMetrics { metrics.snapshot() }
