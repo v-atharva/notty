@@ -23,9 +23,14 @@ final class NotebookSession: ObservableObject {
         let baseRevisionID: UUID?
     }
 
+    private enum RecoveryVerification {
+        case legacy(NotebookRecoveryFingerprint)
+        case states(NotebookRecoveryStateFingerprint)
+    }
+
     private struct PreservedState {
         let receipt: NotebookRecoveryReceipt
-        let fingerprint: NotebookRecoveryFingerprint
+        let verification: RecoveryVerification
         let coverage: RecoveryCoverage
     }
 
@@ -41,6 +46,8 @@ final class NotebookSession: ObservableObject {
     private(set) var recoveryFailure: NotebookSaveFailure?
     @Published private(set) var recoveryCopies: [NotebookRecoveryReceipt] = []
     @Published private(set) var unavailableRecoveryCopyIDs: [UUID] = []
+    @Published private(set) var recoveryIssues: [NotebookRecoveryScanIssue] = []
+    @Published private(set) var unattributedRecoveryIssues: [NotebookRecoveryScanIssue] = []
     @Published private(set) var isLoadingRecoveryCopies = false
     @Published private(set) var recoveryListFailure: NotebookSaveFailure?
 
@@ -90,6 +97,15 @@ final class NotebookSession: ObservableObject {
     private var preservedState: PreservedState?
     private var preservationTask: Task<Void, Never>?
     private var preservationID: UUID?
+    private var restoreID: UUID?
+    private struct RestoreContext {
+        let installation: UUID
+        let coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>
+        let ownerID: UUID?
+        let nativeGeneration: UInt64
+        let editGeneration: UInt64
+        let revisionID: UUID
+    }
     private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
     private struct BackgroundFlush {
         let id: UUID
@@ -514,24 +530,41 @@ final class NotebookSession: ObservableObject {
             }
         }
         do {
-            let batch = try await recoveryCodec.encode(
-                notebookID: notebookID, baseRevisionID: coverage.baseRevisionID, edits: edits
-            )
-            guard self.coordinator === coordinator, preservationID == id else { return }
-            captureWorkingInk()
-            let unchangedAfterEncoding = matches(coverage)
-            let fingerprint = await recoveryCodec.fingerprint(batch)
-            guard self.coordinator === coordinator, preservationID == id else { return }
-            captureWorkingInk()
-            let unchangedAfterFingerprint = matches(coverage)
-            let receipt = try await storage.preserve(batch)
+            let verification: RecoveryVerification
+            let receipt: NotebookRecoveryReceipt
+            let unchangedAfterEncoding: Bool
+            let unchangedAfterFingerprint: Bool
+            if let states = storage.recoveryStates {
+                let encoded = try await recoveryCodec.encodeStates(
+                    notebookID: notebookID, baseRevisionID: coverage.baseRevisionID, edits: edits
+                )
+                guard self.coordinator === coordinator, preservationID == id else { return }
+                captureWorkingInk()
+                unchangedAfterEncoding = matches(coverage)
+                unchangedAfterFingerprint = unchangedAfterEncoding
+                receipt = try await states.preserveStates(encoded.strokeBatch)
+                verification = .states(encoded.fingerprint)
+            } else {
+                let batch = try await recoveryCodec.encode(
+                    notebookID: notebookID, baseRevisionID: coverage.baseRevisionID, edits: edits
+                )
+                guard self.coordinator === coordinator, preservationID == id else { return }
+                captureWorkingInk()
+                unchangedAfterEncoding = matches(coverage)
+                let fingerprint = await recoveryCodec.fingerprint(batch)
+                guard self.coordinator === coordinator, preservationID == id else { return }
+                captureWorkingInk()
+                unchangedAfterFingerprint = matches(coverage)
+                receipt = try await storage.preserve(batch)
+                verification = .legacy(fingerprint)
+            }
             guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             guard receipt.notebookID == notebookID, receipt.editCount == edits.count else {
                 throw NotebookSaveFailure.corruptData
             }
             preservedState = PreservedState(
-                receipt: receipt, fingerprint: fingerprint, coverage: coverage
+                receipt: receipt, verification: verification, coverage: coverage
             )
             if unchangedAfterEncoding && unchangedAfterFingerprint && matches(coverage) {
                 setRecoveryFeedback("All waiting edits are preserved. You can reopen the saved notebook.")
@@ -542,7 +575,7 @@ final class NotebookSession: ObservableObject {
             guard self.coordinator === coordinator, preservationID == id else { return }
             captureWorkingInk()
             setRecoveryFeedback(
-                "The recovery copy could not be saved. Your waiting edits remain here.",
+                "The recovery copy could not be saved. Your waiting edits remain here; quitting before they are saved or preserved will discard them.",
                 failure: NotebookSaveFailure.classify(error)
             )
         }
@@ -559,14 +592,26 @@ final class NotebookSession: ObservableObject {
         defer { finishRecoveryOperation() }
         var recoveryVerified = false
         do {
-            let batch = try await storage.loadRecovery(preservedState.receipt.id)
-            captureWorkingInk()
-            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
-            let fingerprint = await recoveryCodec.fingerprint(batch)
-            captureWorkingInk()
-            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
-            guard fingerprint == preservedState.fingerprint else {
-                throw NotebookSaveFailure.corruptData
+            switch preservedState.verification {
+            case .legacy(let expected):
+                let batch = try await storage.loadRecovery(preservedState.receipt.id)
+                captureWorkingInk()
+                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                let fingerprint = await recoveryCodec.fingerprint(batch)
+                captureWorkingInk()
+                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard fingerprint == expected else { throw NotebookSaveFailure.corruptData }
+            case .states(let expected):
+                guard let states = storage.recoveryStates else { throw NotebookSaveFailure.storageUnavailable }
+                let batch = try await states.loadStates(preservedState.receipt.id)
+                captureWorkingInk()
+                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                let fingerprint = try await Task.detached(priority: .utility) {
+                    try NotebookRecoveryStateFingerprint(validating: batch)
+                }.value
+                captureWorkingInk()
+                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard fingerprint == expected else { throw NotebookSaveFailure.corruptData }
             }
             recoveryVerified = true
             let opening = try await readOpening(storage)
@@ -600,11 +645,13 @@ final class NotebookSession: ObservableObject {
             recoveryListFailure = .storageUnavailable
             return
         }
+        let installedID = installationID
         isLoadingRecoveryCopies = true
         recoveryListFailure = nil
         defer { isLoadingRecoveryCopies = false }
         do {
             let scan = try await storage.listRecovery()
+            guard installationID == installedID, !Task.isCancelled else { return }
             guard scan.copies.allSatisfy({ $0.notebookID == notebookID }),
                   Set(scan.copies.map(\.id)).count == scan.copies.count,
                   Set(scan.unavailableCopyIDs).count == scan.unavailableCopyIDs.count,
@@ -613,7 +660,10 @@ final class NotebookSession: ObservableObject {
             }
             recoveryCopies = scan.copies
             unavailableRecoveryCopyIDs = scan.unavailableCopyIDs
+            recoveryIssues = scan.matchingIssues
+            unattributedRecoveryIssues = scan.unattributedIssues
         } catch {
+            guard installationID == installedID else { return }
             recoveryListFailure = NotebookSaveFailure.classify(error)
         }
     }
@@ -623,6 +673,229 @@ final class NotebookSession: ObservableObject {
         let batch = try await storage.loadRecovery(id)
         guard batch.notebookID == notebookID else { throw NotebookSaveFailure.corruptData }
         return batch
+    }
+
+
+    struct RecoveryEditMetadata: Identifiable, Sendable {
+        let id: UUID
+        let title: String
+        let pageCount: Int
+        let strokeCount: Int
+        let stamp: NotebookEditStamp
+    }
+
+    func inspectRecoveryCopy(id: UUID) async throws -> [RecoveryEditMetadata] {
+        guard let storage else { throw NotebookSaveFailure.storageUnavailable }
+        let installedID = installationID
+        let summaries: [RecoveryEditMetadata]
+        if let inspect = storage.inspectRecovery {
+            let metadata = try await inspect(id)
+            guard metadata.receipt.id == id, metadata.receipt.notebookID == notebookID,
+                  metadata.receipt.editCount == metadata.edits.count else {
+                throw NotebookSaveFailure.corruptData
+            }
+            summaries = metadata.edits.map {
+                RecoveryEditMetadata(id: $0.id, title: $0.title, pageCount: $0.pageCount,
+                                     strokeCount: $0.strokeCount, stamp: $0.stamp)
+            }
+        } else {
+            let batch = try await openRecoveryCopy(id: id)
+            summaries = batch.edits.map {
+                RecoveryEditMetadata(id: $0.id, title: $0.title, pageCount: $0.pageCount,
+                                     strokeCount: $0.strokeCount, stamp: $0.stamp)
+            }
+        }
+        try Task.checkCancellation()
+        guard installationID == installedID, !summaries.isEmpty,
+              Set(summaries.map(\.id)).count == summaries.count else {
+            throw NotebookSaveFailure.corruptData
+        }
+        return summaries
+    }
+
+    func openRecoveryDrawing(copyID: UUID, editID: UUID) async throws -> PKDrawing {
+        guard let storage else { throw NotebookSaveFailure.storageUnavailable }
+        let installedID = installationID
+        let drawing: PKDrawing
+        if let load = storage.loadRecoveryEdit {
+            let edit = try await load(copyID, editID)
+            try Task.checkCancellation()
+            guard installationID == installedID, edit.source.notebookID == notebookID,
+                  edit.source.copyID == copyID, edit.source.editID == editID,
+                  edit.state.id == editID, edit.source.originalStamp == edit.state.stamp else {
+                throw NotebookSaveFailure.corruptData
+            }
+            drawing = try await recoveryCodec.decodeSelected(edit)
+        } else {
+            let batch = try await openRecoveryCopy(id: copyID)
+            guard let edit = batch.edits.first(where: { $0.id == editID }) else {
+                throw NotebookSaveFailure.corruptData
+            }
+            drawing = try await recoveryCodec.decode(edit)
+        }
+        try Task.checkCancellation()
+        guard installationID == installedID else { throw CancellationError() }
+        return drawing
+    }
+
+    var canRestoreRecovery: Bool {
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        return loadState == .ready && !isPerformingRecovery && !availability.isUsingTool
+            && coordinator?.failure == nil && integrityFailure == nil
+            && coordinator?.expectedRevisionID != nil && pendingEdits.isEmpty
+    }
+
+    @discardableResult
+    func restoreRecoveryEdit(copyID: UUID, editID: UUID) async -> Bool {
+        captureWorkingInk()
+        guard canRestoreRecovery, let storage, let coordinator,
+              let revision = coordinator.expectedRevisionID else { return false }
+        let context = RestoreContext(
+            installation: installationID, coordinator: coordinator, ownerID: activeCanvasOwner,
+            nativeGeneration: latestCanvasGeneration, editGeneration: coordinator.generation,
+            revisionID: revision
+        )
+        let commandID = UUID()
+        let stamp = NotebookEditStamp(
+            capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime, sessionID: editSessionID
+        )
+        let operation = UUID()
+        restoreID = operation
+        isPerformingRecovery = true
+        extentIntent = nil
+        clearRecoveryFeedback()
+        defer {
+            if restoreID == operation {
+                restoreID = nil
+                finishRecoveryOperation()
+                refreshPresentation()
+            }
+        }
+        do {
+            let drawing: PKDrawing
+            let restoredTitle: String
+            let restoredPageCount: Int
+            let source: NotebookRecoveryProvenance
+            if let load = storage.loadRecoveryEdit {
+                let selected = try await load(copyID, editID)
+                try requireRestoreContext(context, operation: operation)
+                guard selected.source.notebookID == notebookID,
+                      selected.source.copyID == copyID, selected.source.editID == editID,
+                      selected.state.id == editID, selected.source.originalStamp == selected.state.stamp else {
+                    throw NotebookSaveFailure.corruptData
+                }
+                try validateRestorableState(selected.state)
+                drawing = try await recoveryCodec.decodeSelected(selected)
+                try requireRestoreContext(context, operation: operation)
+                restoredTitle = selected.state.title
+                restoredPageCount = selected.state.pageCount
+                source = selected.source
+            } else {
+                let batch = try await storage.loadRecovery(copyID)
+                try requireRestoreContext(context, operation: operation)
+                guard batch.notebookID == notebookID,
+                      Set(batch.edits.map(\.id)).count == batch.edits.count,
+                      let selected = batch.edits.first(where: { $0.id == editID }) else {
+                    throw NotebookSaveFailure.corruptData
+                }
+                drawing = try await recoveryCodec.decode(selected)
+                try requireRestoreContext(context, operation: operation)
+                let strokes = try await codec.encode(drawing)
+                try requireRestoreContext(context, operation: operation)
+                try validateRestorableState(NotebookRecoveryStrokeEdit(
+                    id: selected.id, strokes: strokes, title: selected.title,
+                    pageCount: selected.pageCount, stamp: selected.stamp,
+                    recoverySource: selected.recoverySource
+                ))
+                restoredTitle = selected.title
+                restoredPageCount = selected.pageCount
+                source = NotebookRecoveryProvenance(
+                    notebookID: notebookID, copyID: copyID, editID: editID,
+                    originalStamp: selected.stamp, baseRevisionID: batch.baseRevisionID
+                )
+            }
+            captureWorkingInk()
+            try requireRestoreContext(context, operation: operation)
+            let retire = canvasControls?.retire
+            retire?()
+            captureWorkingInk()
+            do {
+                try requireRestoreContext(context, operation: operation, allowsDetachedOwner: true)
+            } catch {
+                recreateRetiredCanvas(ownerID: context.ownerID)
+                throw error
+            }
+            invalidateCanvasOwner()
+            workingDrawing = drawing
+            workingSignature = try? InkDrawingSignature(drawing)
+            latestCanvasGeneration = 0
+            title = restoredTitle
+            pageCount = restoredPageCount
+            enqueueCurrentDrawing(id: commandID, stamp: stamp, recoverySource: source)
+            canvasGeneration = UUID()
+            setRecoveryFeedback("Restored as a new edit. The recovery copy remains available.")
+            return true
+        } catch {
+            guard installationID == context.installation, self.coordinator === coordinator,
+                  restoreID == operation else { return false }
+            captureWorkingInk()
+            if error is CancellationError { return false }
+            let failure = NotebookSaveFailure.classify(error)
+            let message = failure == .contentLimit
+                ? "This preserved edit exceeds normal notebook limits and can only be inspected. The recovery copy is retained."
+                : "The edit could not be restored. Any waiting edits and the recovery copy remain here."
+            setRecoveryFeedback(message, failure: failure)
+            return false
+        }
+    }
+
+    private func requireRestoreContext(
+        _ context: RestoreContext, operation: UUID, allowsDetachedOwner: Bool = false
+    ) throws {
+        try Task.checkCancellation()
+        captureWorkingInk()
+        let ownerMatches = activeCanvasOwner == context.ownerID
+            || (allowsDetachedOwner && activeCanvasOwner == nil)
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard restoreID == operation, installationID == context.installation,
+              coordinator === context.coordinator, ownerMatches,
+              latestCanvasGeneration == context.nativeGeneration,
+              context.coordinator.generation == context.editGeneration,
+              context.coordinator.expectedRevisionID == context.revisionID,
+              context.coordinator.failure == nil, integrityFailure == nil,
+              pendingEdits.isEmpty, !availability.isUsingTool else {
+            throw NotebookSaveFailure.invalidContent
+        }
+    }
+
+    private func validateRestorableState(_ state: NotebookRecoveryStrokeEdit) throws {
+        guard state.title.utf8.count <= 4_096, state.strokes.count <= 10_000,
+              (1...NotebookViewController.maximumPageCount).contains(state.pageCount) else {
+            throw NotebookSaveFailure.contentLimit
+        }
+        var bytes = 0
+        for stroke in state.strokes {
+            guard stroke.data.count <= 10 * 1_024 * 1_024,
+                  stroke.data.count <= 64 * 1_024 * 1_024 - bytes else {
+                throw NotebookSaveFailure.contentLimit
+            }
+            bytes += stroke.data.count
+        }
+    }
+
+    private func invalidateCanvasOwner() {
+        activeCanvasOwner = nil
+        snapshotProvider = nil
+        observationProvider = nil
+        canvasGateSink = nil
+        lastPushedCanvasGate = nil
+        resetCanvasCommands()
+    }
+
+    private func recreateRetiredCanvas(ownerID: UUID?) {
+        guard activeCanvasOwner == nil || activeCanvasOwner == ownerID else { return }
+        invalidateCanvasOwner()
+        canvasGeneration = UUID()
     }
 
     private func currentCoverage() -> RecoveryCoverage {
@@ -658,16 +931,21 @@ final class NotebookSession: ObservableObject {
         enqueueCurrentDrawing()
     }
 
-    private func enqueueCurrentDrawing(stamp: NotebookEditStamp? = nil) {
+    private func enqueueCurrentDrawing(
+        id: UUID = UUID(), stamp: NotebookEditStamp? = nil,
+        recoverySource: NotebookRecoveryProvenance? = nil
+    ) {
         guard let coordinator else { return }
-        let snapshot = NotebookDrawingSnapshot(drawing: workingDrawing, pageCount: pageCount, title: title)
+        let snapshot = NotebookDrawingSnapshot(
+            drawing: workingDrawing, pageCount: pageCount, title: title, recoverySource: recoverySource
+        )
         workingSnapshotIdentity = snapshot.identity
         limitsModel.beginSnapshot(
             identity: snapshot.identity, installation: installationID,
             strokeCount: workingDrawing.strokes.count
         )
         coordinator.enqueue(edit: NotebookPendingEdit(
-            snapshot: snapshot,
+            id: id, snapshot: snapshot,
             stamp: stamp ?? NotebookEditStamp(
                 capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime, sessionID: editSessionID
             )
@@ -737,7 +1015,8 @@ final class NotebookSession: ObservableObject {
                             id: edit.id,
                             content: NotebookContent(
                                 title: edit.snapshot.title, pageCount: edit.snapshot.pageCount,
-                                strokes: strokes, editStamp: edit.stamp
+                                strokes: strokes, editStamp: edit.stamp,
+                                recoverySource: edit.snapshot.recoverySource
                             )
                         ))
                     } catch {

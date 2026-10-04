@@ -5,8 +5,14 @@ import SwiftUI
 struct NotebookScreen: View {
     @StateObject private var session: NotebookSession
 
-    init(session: NotebookSession = NotebookSession()) {
+    private let startNewNotebook: (@MainActor () async -> Void)?
+
+    init(
+        session: NotebookSession = NotebookSession(),
+        startNewNotebook: (@MainActor () async -> Void)? = nil
+    ) {
         _session = StateObject(wrappedValue: session)
+        self.startNewNotebook = startNewNotebook
     }
     @State private var showsRecoveryCopies = false
     @Environment(\.scenePhase) private var scenePhase
@@ -26,6 +32,11 @@ struct NotebookScreen: View {
                         Text(failure.message)
                     } actions: {
                         Button("Try opening again") { Task { await session.load() } }
+                        if let startNewNotebook {
+                            Button("Start new notebook and keep this one") {
+                                Task { await startNewNotebook() }
+                            }
+                        }
                     }
                 case .ready:
                     NotebookCanvas(session: session)

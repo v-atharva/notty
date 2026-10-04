@@ -44,7 +44,8 @@ struct NotebookCanvas: UIViewControllerRepresentable {
                 redo: { [weak controller] in controller?.performRedo() },
                 setPaletteSuppressed: { [weak controller] in controller?.setPaletteSuppressed($0) },
                 applyPageCount: { [weak controller] in controller?.setPageCount($0) },
-                currentAvailability: { [weak controller] in controller?.currentUndoAvailability ?? .unavailable }
+                currentAvailability: { [weak controller] in controller?.currentUndoAvailability ?? .unavailable },
+                retire: { [weak controller] in controller?.tearDown() }
             )
         )
         controller.onDetach = { [weak session] in

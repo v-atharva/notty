@@ -18,19 +18,22 @@ struct NotebookCanvasControls {
     let setPaletteSuppressed: (Bool) -> Void
     let applyPageCount: (Int) -> Void
     let currentAvailability: () -> NotebookUndoAvailability
+    let retire: (() -> Void)?
 
     init(
         undo: @escaping () -> Void,
         redo: @escaping () -> Void,
         setPaletteSuppressed: @escaping (Bool) -> Void,
         applyPageCount: @escaping (Int) -> Void,
-        currentAvailability: @escaping () -> NotebookUndoAvailability = { .unavailable }
+        currentAvailability: @escaping () -> NotebookUndoAvailability = { .unavailable },
+        retire: (() -> Void)? = nil
     ) {
         self.undo = undo
         self.redo = redo
         self.setPaletteSuppressed = setPaletteSuppressed
         self.applyPageCount = applyPageCount
         self.currentAvailability = currentAvailability
+        self.retire = retire
     }
 }
 
