@@ -19,6 +19,8 @@ public struct NotebookRecoveryWorkMetrics: Sendable, Equatable {
     public internal(set) var metadataEncodedBytes = 0
     public internal(set) var nativeArchiveValidations = 0
     public internal(set) var nativeStateValidations = 0
+    public internal(set) var nativeArchiveSerializations = 0
+    public internal(set) var nativeSerializedBytes = 0
     public internal(set) var publications = 0
 
     public var totalHashBytes: Int { assetHashBytes + metadataHashBytes }

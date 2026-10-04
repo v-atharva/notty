@@ -98,12 +98,14 @@ public struct NotebookRecoveryStateFingerprint: Sendable, Equatable {
         ))
         var assets: [String: Data] = [:]
         var edits: [NotebookRecoveryStrokeEdit] = []
+        var capturedBytes = 0
         for edit in batch.edits {
             try appendHeader(EditHeader(
                 id: edit.id, strokeCount: edit.strokes.count, title: edit.title,
                 pageCount: edit.pageCount, stamp: edit.stamp, recoverySource: edit.recoverySource
             ))
             var strokes: [NotebookStroke] = []
+            var stateBytes = 0
             strokes.reserveCapacity(edit.strokes.count)
             for stroke in edit.strokes {
                 metrics.record(\.inputReferenceVisits)
@@ -120,6 +122,10 @@ public struct NotebookRecoveryStateFingerprint: Sendable, Equatable {
                     metrics.record(\.assetCopiedBytes, data.count)
                     digest = metrics.assetDigest(data)
                 }
+                guard !data.isEmpty, data.count <= 128 * 1_024 * 1_024 - stateBytes else {
+                    throw NotebookRepositoryError.sizeLimitExceeded("The captured recovery state exceeds 128 MiB.")
+                }
+                stateBytes += data.count
                 if let existing = assets[digest] {
                     guard existing == data else {
                         throw NotebookRepositoryError.invalidContent("Recovery archive references conflict.")
@@ -130,6 +136,10 @@ public struct NotebookRecoveryStateFingerprint: Sendable, Equatable {
                 append(Data(digest.utf8))
                 strokes.append(NotebookStroke(id: stroke.id, data: assets[digest]!, validatedDigest: digest))
             }
+            guard stateBytes <= 512 * 1_024 * 1_024 - capturedBytes else {
+                throw NotebookRepositoryError.sizeLimitExceeded("The captured recovery copy exceeds 512 MiB.")
+            }
+            capturedBytes += stateBytes
             edits.append(NotebookRecoveryStrokeEdit(
                 id: edit.id, strokes: strokes, title: edit.title, pageCount: edit.pageCount,
                 stamp: edit.stamp, recoverySource: edit.recoverySource

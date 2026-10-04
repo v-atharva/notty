@@ -209,6 +209,8 @@ public actor NotebookRecoveryStore {
                     return native
                 }
                 let data = PKDrawing(strokes: strokes).dataRepresentation()
+                metrics.record(\.nativeArchiveSerializations)
+                metrics.record(\.nativeSerializedBytes, data.count)
                 return NotebookRecoveryEdit(
                     id: edit.id, drawingData: data, strokeIDs: edit.strokes.map(\.id),
                     title: edit.title, pageCount: edit.pageCount, stamp: edit.stamp,
@@ -340,20 +342,41 @@ public actor NotebookRecoveryStore {
     }
 
     private func convertLegacy(_ batch: NotebookRecoveryBatch) throws -> NotebookRecoveryStrokeBatch {
-        let edits = try batch.edits.map { edit in
-            try autoreleasepool {
-                let drawing = try PKDrawing(data: edit.drawingData)
-                let strokes = zip(drawing.strokes, edit.strokeIDs).map { native, id in
-                    let data = PKDrawing(strokes: [native]).dataRepresentation()
-                    metrics.record(\.assetCopiedBytes, data.count)
-                    let digest = metrics.assetDigest(data)
-                    return NotebookStroke(id: id, data: data, validatedDigest: digest)
-                }
-                return NotebookRecoveryStrokeEdit(
-                    id: edit.id, strokes: strokes, title: edit.title, pageCount: edit.pageCount,
-                    stamp: edit.stamp, recoverySource: edit.recoverySource
-                )
+        var totalBytes = 0
+        var native: [String: PKStroke] = [:]
+        var edits: [NotebookRecoveryStrokeEdit] = []
+        for edit in batch.edits {
+            guard (1...12).contains(edit.pageCount) else {
+                throw NotebookRepositoryError.sizeLimitExceeded("The legacy recovery extent cannot fit the supported state representation.")
             }
+            metrics.record(\.nativeArchiveValidations)
+            let strokes: [NotebookStroke] = try autoreleasepool {
+                let drawing = try PKDrawing(data: edit.drawingData)
+                var stateBytes = 0
+                var result: [NotebookStroke] = []
+                for (source, id) in zip(drawing.strokes, edit.strokeIDs) {
+                    let data = PKDrawing(strokes: [source]).dataRepresentation()
+                    metrics.record(\.nativeArchiveSerializations)
+                    metrics.record(\.nativeSerializedBytes, data.count)
+                    guard !data.isEmpty, data.count <= Self.maximumArchiveBytes - stateBytes else {
+                        throw NotebookRepositoryError.sizeLimitExceeded("The converted legacy recovery state exceeds 128 MiB.")
+                    }
+                    stateBytes += data.count
+                    let digest = metrics.assetDigest(data)
+                    if native[digest] == nil { native[digest] = try stateFormat.decodeStroke(data, stored: true) }
+                    result.append(NotebookStroke(id: id, data: data, validatedDigest: digest))
+                }
+                guard stateBytes <= Self.maximumBatchBytes - totalBytes else {
+                    throw NotebookRepositoryError.sizeLimitExceeded("The converted legacy recovery copy exceeds 512 MiB.")
+                }
+                totalBytes += stateBytes
+                return result
+            }
+            try stateFormat.validateNativeState(strokes, native: native, stored: true)
+            edits.append(NotebookRecoveryStrokeEdit(
+                id: edit.id, strokes: strokes, title: edit.title, pageCount: edit.pageCount,
+                stamp: edit.stamp, recoverySource: edit.recoverySource
+            ))
         }
         return NotebookRecoveryStrokeBatch(
             notebookID: batch.notebookID, baseRevisionID: batch.baseRevisionID, edits: edits
@@ -589,7 +612,7 @@ public actor NotebookRecoveryStore {
         guard title.utf8.count <= Self.maximumTitleBytes else {
             throw NotebookRepositoryError.sizeLimitExceeded("A recovery title exceeds 4 KiB.")
         }
-        guard (1...12).contains(pageCount),
+        guard pageCount > 0,
               stamp.capturedAt.timeIntervalSinceReferenceDate.isFinite,
               stamp.uptime.isFinite, stamp.uptime >= 0 else {
             throw NotebookRepositoryError.invalidContent("Recovery edit metadata is invalid.")
@@ -646,10 +669,6 @@ public actor NotebookRecoveryStore {
 
     private func validateVersion(_ version: Int) throws {
         guard version == 1 || version == 2 else { throw NotebookRepositoryError.unsupportedVersion(version) }
-    }
-
-    private static func digest(_ data: Data) -> String {
-        NotebookDigest.sha256(data)
     }
 
     private static func isDigest(_ value: String) -> Bool {
