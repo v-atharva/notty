@@ -26,7 +26,15 @@ struct NotebookRecoveryView: View {
                 if !session.recoveryIssues.isEmpty {
                     Section("Copies needing attention") {
                         ForEach(session.recoveryIssues, id: \.copyID) { issue in
-                            recoveryIssue(issue)
+                            if issue.kind == .damagedData {
+                                NavigationLink {
+                                    NotebookRecoveryInspector(
+                                        session: session, copyID: issue.copyID, close: { dismiss() }
+                                    )
+                                } label: { recoveryIssue(issue) }
+                            } else {
+                                recoveryIssue(issue)
+                            }
                         }
                     }
                 } else if !session.unavailableRecoveryCopyIDs.isEmpty {
@@ -47,7 +55,7 @@ struct NotebookRecoveryView: View {
                 }
                 ForEach(session.recoveryCopies, id: \.id) { receipt in
                     NavigationLink {
-                        NotebookRecoveryInspector(session: session, receipt: receipt, close: { dismiss() })
+                        NotebookRecoveryInspector(session: session, copyID: receipt.id, expectedReceipt: receipt, close: { dismiss() })
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(receipt.savedAt.formatted(date: .abbreviated, time: .shortened))
@@ -85,7 +93,8 @@ struct NotebookRecoveryView: View {
 @MainActor
 private struct NotebookRecoveryInspector: View {
     @ObservedObject var session: NotebookSession
-    let receipt: NotebookRecoveryReceipt
+    let copyID: UUID
+    var expectedReceipt: NotebookRecoveryReceipt? = nil
     let close: () -> Void
     @State private var edits: [NotebookSession.RecoveryEditMetadata] = []
     @State private var drawing: PKDrawing?
@@ -124,9 +133,13 @@ private struct NotebookRecoveryInspector: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             do {
-                let summaries = try await session.inspectRecoveryCopy(id: receipt.id)
-                guard summaries.count == receipt.editCount else { throw NotebookSaveFailure.corruptData }
-                edits = summaries
+                let metadata = try await session.inspectRecoveryCopy(id: copyID)
+                guard metadata.receipt.id == copyID,
+                      expectedReceipt == nil || expectedReceipt == metadata.receipt,
+                      metadata.edits.count == metadata.receipt.editCount else {
+                    throw NotebookSaveFailure.corruptData
+                }
+                edits = metadata.edits
                 await select(0)
             } catch {
                 if error is CancellationError { return }
@@ -155,7 +168,7 @@ private struct NotebookRecoveryInspector: View {
             }
             NotebookRecoveryRestoreButton(
                 session: session, model: session.commandModel, status: session.statusModel,
-                copyID: receipt.id, editID: edits[index].id, isOpening: isOpening || failure != nil, close: close
+                copyID: copyID, editID: edits[index].id, isOpening: isOpening || failure != nil, close: close
             )
         }
         .font(.footnote).padding().background(.regularMaterial)
@@ -170,7 +183,7 @@ private struct NotebookRecoveryInspector: View {
         failure = nil
         isOpening = true
         do {
-            let restored = try await session.openRecoveryDrawing(copyID: receipt.id, editID: edits[requested].id)
+            let restored = try await session.openRecoveryDrawing(copyID: copyID, editID: edits[requested].id)
             guard requestID == request, !Task.isCancelled else { return }
             drawing = restored
         } catch {

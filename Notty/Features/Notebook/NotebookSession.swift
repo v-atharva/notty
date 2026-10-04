@@ -681,7 +681,11 @@ final class NotebookSession: ObservableObject {
             guard scan.copies.allSatisfy({ $0.notebookID == notebookID }),
                   Set(scan.copies.map(\.id)).count == scan.copies.count,
                   Set(scan.unavailableCopyIDs).count == scan.unavailableCopyIDs.count,
-                  Set(scan.copies.map(\.id)).isDisjoint(with: scan.unavailableCopyIDs) else {
+                  Set(scan.copies.map(\.id)).isDisjoint(with: scan.unavailableCopyIDs),
+                  Set(scan.matchingIssues.map(\.copyID)).count == scan.matchingIssues.count,
+                  Set(scan.unattributedIssues.map(\.copyID)).count == scan.unattributedIssues.count,
+                  Set(scan.matchingIssues.map(\.copyID)).isDisjoint(with: scan.unattributedIssues.map(\.copyID)),
+                  Set(scan.copies.map(\.id)).isDisjoint(with: scan.matchingIssues.map(\.copyID)) else {
                 throw NotebookSaveFailure.corruptData
             }
             recoveryCopies = scan.copies
@@ -710,25 +714,39 @@ final class NotebookSession: ObservableObject {
         let stamp: NotebookEditStamp
     }
 
-    func inspectRecoveryCopy(id: UUID) async throws -> [RecoveryEditMetadata] {
+    struct RecoveryCopyMetadata: Sendable {
+        let receipt: NotebookRecoveryReceipt
+        let edits: [RecoveryEditMetadata]
+    }
+
+    func inspectRecoveryCopy(id: UUID) async throws -> RecoveryCopyMetadata {
         guard let storage else { throw NotebookSaveFailure.storageUnavailable }
         let installedID = installationID
         let summaries: [RecoveryEditMetadata]
+        let receipt: NotebookRecoveryReceipt
         if let inspect = storage.inspectRecovery {
             let metadata = try await inspect(id)
             guard metadata.receipt.id == id, metadata.receipt.notebookID == notebookID,
                   metadata.receipt.editCount == metadata.edits.count else {
                 throw NotebookSaveFailure.corruptData
             }
+            receipt = metadata.receipt
             summaries = metadata.edits.map {
                 RecoveryEditMetadata(id: $0.id, title: $0.title, pageCount: $0.pageCount,
                                      strokeCount: $0.strokeCount, stamp: $0.stamp)
             }
         } else {
             let batch = try await openRecoveryCopy(id: id)
+            let scan = try await storage.listRecovery()
+            guard let verifiedReceipt = scan.copies.first(where: { $0.id == id }),
+                  verifiedReceipt.notebookID == notebookID,
+                  verifiedReceipt.editCount == batch.edits.count else {
+                throw NotebookSaveFailure.corruptData
+            }
+            receipt = verifiedReceipt
             summaries = batch.edits.map {
                 RecoveryEditMetadata(id: $0.id, title: $0.title, pageCount: $0.pageCount,
-                                     strokeCount: $0.strokeCount, stamp: $0.stamp)
+                                     strokeCount: $0.strokeIDs.count, stamp: $0.stamp)
             }
         }
         try Task.checkCancellation()
@@ -736,7 +754,7 @@ final class NotebookSession: ObservableObject {
               Set(summaries.map(\.id)).count == summaries.count else {
             throw NotebookSaveFailure.corruptData
         }
-        return summaries
+        return RecoveryCopyMetadata(receipt: receipt, edits: summaries)
     }
 
     func openRecoveryDrawing(copyID: UUID, editID: UUID) async throws -> PKDrawing {
