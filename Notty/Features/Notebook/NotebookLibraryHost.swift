@@ -18,6 +18,7 @@ final class NotebookLibraryModel: ObservableObject {
     private let openLibrary: @Sendable () async throws -> NotebookLibraryAccess
     private let makeNotebookID: @Sendable () -> UUID
     private let legacyNotebookID: UUID
+    private let beforeSelection: (@Sendable () async throws -> Void)?
     private var library: NotebookLibraryAccess?
     private var selection: NotebookSelectionToken?
     private var operationID = UUID()
@@ -28,11 +29,13 @@ final class NotebookLibraryModel: ObservableObject {
         openLibrary: @escaping @Sendable () async throws -> NotebookLibraryAccess = {
             try await NotebookLibraryAccess.shared()
         },
-        makeNotebookID: @escaping @Sendable () -> UUID = { UUID() }
+        makeNotebookID: @escaping @Sendable () -> UUID = { UUID() },
+        beforeSelection: (@Sendable () async throws -> Void)? = nil
     ) {
         self.legacyNotebookID = legacyNotebookID
         self.openLibrary = openLibrary
         self.makeNotebookID = makeNotebookID
+        self.beforeSelection = beforeSelection
     }
 
     func load() async {
@@ -76,9 +79,15 @@ final class NotebookLibraryModel: ObservableObject {
 
     func startNewNotebook() async {
         guard !isCreating, let library, let selection else { return }
+        let previousSession: NotebookSession?
+        let transitionID: UUID?
         if case .notebook(let session) = state {
-            guard case .failed = session.loadState, session.pendingEdits.isEmpty else { return }
+            guard let transition = session.beginNewNotebookTransition() else { return }
+            previousSession = session
+            transitionID = transition
         } else if case .recoveryRequired = state {
+            previousSession = nil
+            transitionID = nil
         } else {
             return
         }
@@ -91,11 +100,21 @@ final class NotebookLibraryModel: ObservableObject {
             capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime, sessionID: UUID()
         )
         defer {
+            if let previousSession, let transitionID {
+                previousSession.endNewNotebookTransition(transitionID)
+            }
             if operationID == operation { isCreating = false }
         }
+        let beforeSelection = self.beforeSelection
         do {
             let selected = try await library.createAndSelectNotebook(
-                id: id, expectedSelection: selection, stamp: stamp
+                id: id, expectedSelection: selection, stamp: stamp,
+                beforeSelection: {
+                    try await beforeSelection?()
+                    if let previousSession, let transitionID {
+                        try await previousSession.prepareNewNotebookSelection(transitionID: transitionID)
+                    }
+                }
             )
             // Selection is already durable; reflect that outcome even if this task was cancelled.
             guard operationID == operation else { return }
@@ -113,7 +132,7 @@ final class NotebookLibraryModel: ObservableObject {
 
     private func installSession(id: UUID, library: NotebookLibraryAccess) {
         let session = NotebookSession(
-            notebookID: id, openStorage: { await library.storage(notebookID: id) }
+            notebookID: id, openStorage: { await library.storage(notebookID: id, requiresExistingCommit: true) }
         )
         state = .notebook(session)
     }
@@ -164,7 +183,7 @@ struct NotebookLibraryHost: View {
                     Label("Couldn't open library", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(failure.message)
-                    Text("No notebook has been selected or replaced.")
+                    Text("Your retained files have not been replaced.")
                 } actions: {
                     Button("Try again") { Task { await model.retry() } }
                 }
