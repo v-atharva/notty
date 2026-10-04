@@ -98,6 +98,16 @@ final class NotebookSession: ObservableObject {
     private var preservationTask: Task<Void, Never>?
     private var preservationID: UUID?
     private var restoreID: UUID?
+    private struct NewNotebookTransition {
+        let id: UUID
+        let installation: UUID
+        let ownerID: UUID?
+        let coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>?
+        let editGeneration: UInt64
+        let nativeGeneration: UInt64
+        let loadState: LoadState
+    }
+    private var newNotebookTransition: NewNotebookTransition?
     private struct RestoreContext {
         let installation: UUID
         let coordinator: NotebookSaveCoordinator<NotebookDrawingSnapshot>
@@ -135,12 +145,12 @@ final class NotebookSession: ObservableObject {
         activeCanvasOwner == ownerID ? inputGate : .readOnly
     }
     var canPreserveRecovery: Bool {
-        (coordinator?.failure != nil || integrityFailure != nil)
+        newNotebookTransition == nil && (coordinator?.failure != nil || integrityFailure != nil)
             && !pendingEdits.isEmpty && !isPerformingRecovery
     }
     var canReopenSaved: Bool {
         let availability = canvasControls?.currentAvailability() ?? undoAvailability
-        guard !isPerformingRecovery, !availability.isUsingTool, let preservedState else { return false }
+        guard newNotebookTransition == nil, !isPerformingRecovery, !availability.isUsingTool, let preservedState else { return false }
         return matches(preservedState.coverage)
     }
 
@@ -167,7 +177,7 @@ final class NotebookSession: ObservableObject {
     }
 
     func load() async {
-        guard !loadStarted else { return }
+        guard !loadStarted, newNotebookTransition == nil else { return }
         loadStarted = true
         loadState = .loading
         do {
@@ -585,6 +595,9 @@ final class NotebookSession: ObservableObject {
         captureWorkingInk()
         guard canReopenSaved, let preservedState, let storage else { return }
         let coverage = preservedState.coverage
+        let installedID = installationID
+        let previousOwner = activeCanvasOwner
+        let previousCoordinator = coordinator
         retireAudit()
         isPerformingRecovery = true
         clearRecoveryFeedback()
@@ -596,40 +609,53 @@ final class NotebookSession: ObservableObject {
             case .legacy(let expected):
                 let batch = try await storage.loadRecovery(preservedState.receipt.id)
                 captureWorkingInk()
-                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
                 let fingerprint = await recoveryCodec.fingerprint(batch)
                 captureWorkingInk()
-                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
                 guard fingerprint == expected else { throw NotebookSaveFailure.corruptData }
             case .states(let expected):
                 guard let states = storage.recoveryStates else { throw NotebookSaveFailure.storageUnavailable }
                 let batch = try await states.loadStates(preservedState.receipt.id)
                 captureWorkingInk()
-                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
                 let fingerprint = try await Task.detached(priority: .utility) {
                     try NotebookRecoveryStateFingerprint(validating: batch)
                 }.value
                 captureWorkingInk()
-                guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+                guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
                 guard fingerprint == expected else { throw NotebookSaveFailure.corruptData }
             }
             recoveryVerified = true
             let opening = try await readOpening(storage)
             let stored = opening.notebook
             captureWorkingInk()
-            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+            guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
             guard let stored else { throw NotebookSaveFailure.corruptData }
             try validateExtent(stored.content.pageCount)
             let drawing = try await codec.decode(stored.content.strokes)
             captureWorkingInk()
-            guard matches(coverage) else { throw NotebookSaveFailure.invalidContent }
-            // Invalidate the previous controller before publishing a new saved session.
-            activeCanvasOwner = nil
-            snapshotProvider = nil
+            guard installationID == installedID, coordinator === previousCoordinator,
+                      activeCanvasOwner == previousOwner, matches(coverage) else { throw NotebookSaveFailure.invalidContent }
+            canvasControls?.retire?()
+            captureWorkingInk()
+            guard installationID == installedID, coordinator === previousCoordinator,
+                  activeCanvasOwner == previousOwner || activeCanvasOwner == nil,
+                  matches(coverage) else {
+                recreateRetiredCanvas(ownerID: previousOwner)
+                throw NotebookSaveFailure.invalidContent
+            }
+            invalidateCanvasOwner()
             install(opening: opening, drawing: drawing)
             self.preservedState = nil
             setRecoveryFeedback("Saved notebook reopened. Your recovery copy remains available.")
         } catch {
+            guard installationID == installedID, coordinator === previousCoordinator else { return }
             captureWorkingInk()
             if !recoveryVerified { self.preservedState = nil }
             setRecoveryFeedback(
@@ -738,9 +764,56 @@ final class NotebookSession: ObservableObject {
         return drawing
     }
 
+    func beginNewNotebookTransition() -> UUID? {
+        captureWorkingInk()
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard newNotebookTransition == nil, case .failed = loadState,
+              pendingEdits.isEmpty, !availability.isUsingTool, !isPerformingRecovery else { return nil }
+        let id = UUID()
+        newNotebookTransition = NewNotebookTransition(
+            id: id, installation: installationID, ownerID: activeCanvasOwner,
+            coordinator: coordinator, editGeneration: coordinator?.generation ?? 0,
+            nativeGeneration: latestCanvasGeneration, loadState: loadState
+        )
+        return id
+    }
+
+    func prepareNewNotebookSelection(transitionID: UUID) throws {
+        try requireNewNotebookTransition(transitionID, allowsDetachedOwner: false)
+        let owner = activeCanvasOwner
+        canvasControls?.retire?()
+        do {
+            try requireNewNotebookTransition(transitionID, allowsDetachedOwner: true)
+        } catch {
+            recreateRetiredCanvas(ownerID: owner)
+            throw error
+        }
+    }
+
+    func endNewNotebookTransition(_ id: UUID) {
+        guard newNotebookTransition?.id == id else { return }
+        newNotebookTransition = nil
+        refreshPresentation()
+    }
+
+    private func requireNewNotebookTransition(_ id: UUID, allowsDetachedOwner: Bool) throws {
+        try Task.checkCancellation()
+        captureWorkingInk()
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        guard let transition = newNotebookTransition, transition.id == id,
+              transition.installation == installationID, transition.loadState == loadState,
+              transition.coordinator === coordinator,
+              transition.editGeneration == (coordinator?.generation ?? 0),
+              transition.nativeGeneration == latestCanvasGeneration,
+              activeCanvasOwner == transition.ownerID || (allowsDetachedOwner && activeCanvasOwner == nil),
+              pendingEdits.isEmpty, !availability.isUsingTool, !isPerformingRecovery else {
+            throw NotebookSaveFailure.revisionConflict
+        }
+    }
+
     var canRestoreRecovery: Bool {
         let availability = canvasControls?.currentAvailability() ?? undoAvailability
-        return loadState == .ready && !isPerformingRecovery && !availability.isUsingTool
+        return newNotebookTransition == nil && loadState == .ready && !isPerformingRecovery && !availability.isUsingTool
             && coordinator?.failure == nil && integrityFailure == nil
             && coordinator?.expectedRevisionID != nil && pendingEdits.isEmpty
     }

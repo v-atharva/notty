@@ -287,17 +287,27 @@ actor NotebookLibraryAccess {
         )
     }
 
-    func storage(notebookID: UUID) -> NotebookStorage {
+    func storage(notebookID: UUID, requiresExistingCommit: Bool = false) -> NotebookStorage {
         let repository = self.repository
         let recovery = self.recovery
         return NotebookStorage(
-            load: { try await repository.load(notebookID: notebookID) },
+            load: {
+                let notebook = try await repository.load(notebookID: notebookID)
+                guard notebook != nil || !requiresExistingCommit else { throw NotebookRepositoryError.recoveryRequired }
+                return notebook
+            },
             save: { try await repository.save(notebookID: notebookID, content: $0, expectedRevisionID: $1) },
             preserve: { try await recovery.preserve($0) },
             listRecovery: { try await recovery.scan(notebookID: notebookID) },
             loadRecovery: { try await recovery.load(id: $0) },
             storageMetrics: { try await repository.currentMetrics() },
-            openForEditing: { try await repository.openForEditing(notebookID: notebookID) },
+            openForEditing: {
+                let opening = try await repository.openForEditing(notebookID: notebookID)
+                guard opening.notebook != nil || !requiresExistingCommit else {
+                    throw NotebookRepositoryError.recoveryRequired
+                }
+                return opening
+            },
             captureHistoryPin: {
                 try await repository.captureHistoryPin(notebookID: notebookID, expectedRevisionID: $0)
             },
@@ -319,7 +329,8 @@ actor NotebookLibraryAccess {
     }
 
     func createAndSelectNotebook(
-        id: UUID, expectedSelection: NotebookSelectionToken, stamp: NotebookEditStamp
+        id: UUID, expectedSelection: NotebookSelectionToken, stamp: NotebookEditStamp,
+        beforeSelection: (@Sendable () async throws -> Void)? = nil
     ) async throws -> NotebookSelectionState {
         let saved = try await repository.save(
             notebookID: id,
@@ -332,6 +343,7 @@ actor NotebookLibraryAccess {
               current.content == saved.content else {
             throw NotebookSaveFailure.revisionConflict
         }
+        try await beforeSelection?()
         return try await repository.selectNotebook(pin: pin, expectedSelection: expectedSelection)
     }
 }
