@@ -1574,7 +1574,7 @@ final class NotebookRepositoryTests: XCTestCase {
     }
 
     func testSelectionInvalidPointerAndUnsafePairedRootsNeverBecomeEmptyTokens() async throws {
-        for invalid in ["malformed", "version", "link", "directory", "overlap", "recoveryLink"] {
+        for invalid in ["malformed", "version", "link", "directory", "overlap", "aliasOverlap", "recoveryLink"] {
             let notes = try makeRoot()
             let recovery = try makeRoot()
             let outside = try makeRoot()
@@ -1595,6 +1595,10 @@ final class NotebookRepositoryTests: XCTestCase {
                 try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: target)
             case "directory": try FileManager.default.createDirectory(at: pointer, withIntermediateDirectories: false)
             case "overlap": recoveryURL = notes.appendingPathComponent("nested")
+            case "aliasOverlap":
+                let alias = outside.appendingPathComponent("notes-alias")
+                try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: notes)
+                recoveryURL = alias.appendingPathComponent("nested")
             default:
                 recoveryURL = outside.appendingPathComponent("recovery-link")
                 try FileManager.default.createSymbolicLink(at: recoveryURL, withDestinationURL: recovery)
@@ -1607,7 +1611,8 @@ final class NotebookRepositoryTests: XCTestCase {
                 switch (invalid, error as? NotebookRepositoryError) {
                 case ("malformed", .corruptData?), ("version", .unsupportedVersion(99)?): break
                 case ("link", .unsafePath?), ("directory", .unsafePath?),
-                     ("overlap", .unsafePath?), ("recoveryLink", .unsafePath?): break
+                     ("overlap", .unsafePath?), ("aliasOverlap", .unsafePath?),
+                     ("recoveryLink", .unsafePath?): break
                 default: XCTFail("Unexpected unsafe selection error: \(error)")
                 }
             }
