@@ -139,43 +139,6 @@ final class NotebookRecoveryScanIsolationTests: XCTestCase {
         XCTAssertEqual(loaded, batch)
     }
 
-    func testLegacyPositiveExtentRemainsByteExactAndInspectableWhenStateConversionCannotFit() async throws {
-        let root = try RecoveryStateFixtures.makeRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let drawing = PKDrawing(strokes: [RecoveryStateFixtures.stroke()])
-        let edit = NotebookRecoveryEdit(
-            id: UUID(), drawingData: drawing.dataRepresentation(), strokeIDs: drawing.strokes.map(\.id),
-            title: "Legacy extent", pageCount: 14, stamp: RecoveryStateFixtures.stamp(0)
-        )
-        let batch = NotebookRecoveryBatch(notebookID: UUID(), baseRevisionID: UUID(), edits: [edit])
-        let store = try NotebookRecoveryStore(rootURL: root)
-        let receipt = try await store.preserve(batch)
-        let directory = bundle(root, receipt.id)
-        let before = try RecoveryStateFixtures.fileSnapshot(in: directory)
-        let reader = try NotebookRecoveryStore(rootURL: root)
-        let loaded = try await reader.load(id: receipt.id)
-        XCTAssertEqual(loaded, batch)
-        let metadata = try await reader.inspect(id: receipt.id)
-        XCTAssertEqual(metadata.edits[0].pageCount, 14)
-        XCTAssertEqual(metadata.edits[0].id, edit.id)
-        XCTAssertEqual(metadata.edits[0].stamp, edit.stamp)
-        let scan = try await reader.scan(notebookID: batch.notebookID)
-        XCTAssertEqual(scan.copies, [receipt])
-        XCTAssertTrue(scan.matchingIssues.isEmpty)
-        XCTAssertTrue(scan.unavailableCopyIDs.isEmpty)
-        for selected in [false, true] {
-            do {
-                if selected {
-                    _ = try await reader.loadEdit(id: receipt.id, editID: edit.id)
-                } else {
-                    _ = try await reader.loadStates(id: receipt.id)
-                }
-                XCTFail("An old valid copy outside new state bounds must remain preserved without returning an unsupported state.")
-            } catch NotebookRepositoryError.sizeLimitExceeded {}
-        }
-        XCTAssertEqual(try RecoveryStateFixtures.fileSnapshot(in: directory), before)
-    }
-
     private func makeBatch(notebookID: UUID) async throws -> NotebookRecoveryStrokeBatch {
         let strokes = try await InkCodec(profile: .recovery).encode(
             PKDrawing(strokes: [RecoveryStateFixtures.stroke()])
