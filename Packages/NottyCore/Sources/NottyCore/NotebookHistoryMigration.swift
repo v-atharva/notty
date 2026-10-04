@@ -181,7 +181,7 @@ struct NotebookHistoryMigration {
             id: history.notebookID, revisionID: current.revisionID, sequence: current.sequence,
             content: NotebookContent(
                 title: current.state.title, pageCount: current.state.pageCount,
-                strokes: strokes, editStamp: current.editStamp
+                strokes: strokes, editStamp: current.editStamp, recoverySource: current.recoverySource
             ),
             savedAt: current.savedAt
         )

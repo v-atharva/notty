@@ -21,14 +21,15 @@ struct NotebookHistoryWriter {
     func prepare(
         state: Format.State, previous: Format.State, parent: Format.Head?,
         revisionID: UUID, sequence: Int, stamp: NotebookEditStamp?, savedAt: Date, credit: Int,
-        checkpointSize: Format.CheckpointSize
+        checkpointSize: Format.CheckpointSize, recoverySource: NotebookRecoveryProvenance? = nil
     ) throws -> Prepared {
         let delta = try Format.delta(from: previous, to: state, metrics: metrics)
         func event(_ digest: String?) -> Format.Event {
             Format.Event(
                 schemaVersion: 2, notebookID: notebookID, revisionID: revisionID,
                 parentRevisionID: parent?.revisionID, parentDigest: parent?.revisionDigest,
-                sequence: sequence, delta: delta, editStamp: stamp, savedAt: savedAt, checkpointDigest: digest
+                sequence: sequence, delta: delta, editStamp: stamp, savedAt: savedAt,
+                checkpointDigest: digest, recoverySource: recoverySource
             )
         }
         let plain = try Format.encode(event(nil), metrics: metrics)
@@ -111,12 +112,14 @@ struct NotebookHistoryWriter {
 
     func append(
         state: Format.State, previous: Format.State, parent: Format.Head?,
-        revisionID: UUID, sequence: Int, stamp: NotebookEditStamp?, savedAt: Date, credit: Int
+        revisionID: UUID, sequence: Int, stamp: NotebookEditStamp?, savedAt: Date, credit: Int,
+        recoverySource: NotebookRecoveryProvenance? = nil
     ) throws -> (head: Format.Head, credit: Int) {
         let prepared = try prepare(
             state: state, previous: previous, parent: parent, revisionID: revisionID,
             sequence: sequence, stamp: stamp, savedAt: savedAt, credit: credit,
-            checkpointSize: Format.CheckpointSize(title: state.title, metrics: metrics)
+            checkpointSize: Format.CheckpointSize(title: state.title, metrics: metrics),
+            recoverySource: recoverySource
         )
         try publish(prepared)
         return (prepared.head, prepared.credit)
