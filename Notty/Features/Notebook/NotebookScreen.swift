@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 @MainActor
@@ -47,6 +48,7 @@ struct NotebookScreen: View {
                         showsRecoveryCopies = true
                     }
                     NotebookSaveStatusView(session: session, model: session.statusModel)
+                    NotebookLimitsIndicator(model: session.limitsModel)
                     NotebookIntegrityIndicator(session: session, model: session.integrityModel)
                     NotebookExtendPaperButton(session: session, model: session.gateModel)
                 }
@@ -278,5 +280,38 @@ private struct NotebookIntegrityDetails: View {
         .padding(20)
         .frame(idealWidth: 320, alignment: .leading)
         .accessibilityElement(children: .contain)
+    }
+}
+
+
+@MainActor
+private struct NotebookLimitsIndicator: View {
+    @ObservedObject var model: NotebookLimitsPresentationModel
+    @State private var showsDetails = false
+
+    var body: some View {
+        Button {
+            showsDetails = true
+        } label: {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+                .opacity(model.state.isNearLimit ? 1 : 0)
+                .frame(width: 28, height: 28)
+        }
+        .disabled(!model.state.isNearLimit)
+        .accessibilityHidden(!model.state.isNearLimit)
+        .accessibilityLabel("Notebook nearing save limit")
+        .popover(isPresented: $showsDetails) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Notebook nearing save limit").font(.headline)
+                Text("This drawing contains \(model.state.strokeCount) of 10,000 supported strokes.")
+                if let bytes = model.state.encodedBytes {
+                    Text("Its most recent encoding uses \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)) of 64 MiB.")
+                }
+                Text("If an edit exceeds the save limit, preserve a recovery copy before reopening. Larger preserved states remain available for inspection.")
+            }
+            .padding()
+            .frame(maxWidth: 320)
+        }
     }
 }

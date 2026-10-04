@@ -59,9 +59,11 @@ final class NotebookSession: ObservableObject {
     private var canvasGateSink: ((NotebookInputGate) -> Void)?
     private var lastPushedCanvasGate: NotebookInputGate?
     private var latestCanvasGeneration: UInt64 = 0
+    private var workingSnapshotIdentity = UUID()
     private var workingSignature: InkDrawingSignature?
     let gateModel = NotebookCanvasGateModel()
     let statusModel: NotebookSavePresentationModel
+    let limitsModel = NotebookLimitsPresentationModel()
     let commandModel = NotebookCanvasCommandModel()
     private var canvasControls: NotebookCanvasControls?
     private var undoAvailability = NotebookUndoAvailability.unavailable
@@ -658,13 +660,24 @@ final class NotebookSession: ObservableObject {
 
     private func enqueueCurrentDrawing(stamp: NotebookEditStamp? = nil) {
         guard let coordinator else { return }
+        let snapshot = NotebookDrawingSnapshot(drawing: workingDrawing, pageCount: pageCount, title: title)
+        workingSnapshotIdentity = snapshot.identity
+        limitsModel.beginSnapshot(
+            identity: snapshot.identity, installation: installationID,
+            strokeCount: workingDrawing.strokes.count
+        )
         coordinator.enqueue(edit: NotebookPendingEdit(
-            snapshot: NotebookDrawingSnapshot(drawing: workingDrawing, pageCount: pageCount, title: title),
+            snapshot: snapshot,
             stamp: stamp ?? NotebookEditStamp(
                 capturedAt: Date(), uptime: ProcessInfo.processInfo.systemUptime, sessionID: editSessionID
             )
         ))
         refreshPresentation()
+    }
+
+    private func recordEncodedBytes(_ count: Int, identity: UUID, installation: UUID) {
+        guard installationID == installation, workingSnapshotIdentity == identity else { return }
+        limitsModel.recordEncodedBytes(count, identity: identity, installation: installation)
     }
 
     private func validateExtent(_ count: Int) throws {
@@ -696,6 +709,16 @@ final class NotebookSession: ObservableObject {
         pageCount = stored?.content.pageCount ?? 3
         title = stored?.content.title ?? "Personal notebook"
         let initial = NotebookDrawingSnapshot(drawing: drawing, pageCount: pageCount, title: title)
+        workingSnapshotIdentity = initial.identity
+        limitsModel.beginSnapshot(
+            identity: initial.identity, installation: installedID, strokeCount: drawing.strokes.count
+        )
+        if let stored {
+            limitsModel.recordEncodedBytes(
+                stored.content.strokes.reduce(0) { $0 + $1.data.count },
+                identity: initial.identity, installation: installedID
+            )
+        }
         let codec = self.codec
         let coordinator = NotebookSaveCoordinator(
             initialSnapshot: stored == nil ? nil : initial,
@@ -706,6 +729,10 @@ final class NotebookSession: ObservableObject {
                 for (index, edit) in edits.enumerated() {
                     do {
                         let strokes = try await codec.encode(edit.snapshot.drawing)
+                        await self?.recordEncodedBytes(
+                            strokes.reduce(0) { $0 + $1.data.count },
+                            identity: edit.snapshot.identity, installation: installedID
+                        )
                         encoded.append(NotebookSaveEdit(
                             id: edit.id,
                             content: NotebookContent(
@@ -1117,5 +1144,38 @@ final class NotebookIntegrityPresentationModel: ObservableObject {
 
     func update(_ next: NotebookIntegrityState?) {
         if next != state { state = next }
+    }
+}
+
+
+@MainActor
+final class NotebookLimitsPresentationModel: ObservableObject {
+    struct State: Equatable {
+        let strokeCount: Int
+        let encodedBytes: Int?
+
+        var isNearLimit: Bool {
+            strokeCount >= 9_000 || (encodedBytes.map { $0 >= 60_397_978 } ?? false)
+        }
+    }
+
+    @Published private(set) var state = State(strokeCount: 0, encodedBytes: nil)
+    private var identity: UUID?
+    private var installation: UUID?
+
+    func beginSnapshot(identity: UUID, installation: UUID, strokeCount: Int) {
+        self.identity = identity
+        self.installation = installation
+        update(State(strokeCount: strokeCount, encodedBytes: nil))
+    }
+
+    func recordEncodedBytes(_ count: Int, identity: UUID, installation: UUID) {
+        guard count >= 0, self.identity == identity, self.installation == installation else { return }
+        update(State(strokeCount: state.strokeCount, encodedBytes: count))
+    }
+
+    private func update(_ next: State) {
+        guard next != state else { return }
+        state = next
     }
 }
