@@ -58,18 +58,9 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(controller.currentDrawing.strokes[0].path.creationDate, drawing.strokes[0].path.creationDate)
         controller.tearDown()
     }
-    func testCapacityPauseKeepsFirstResponderAndInsets() {
+    func testCapacityPauseKeepsFirstResponderAndInsets() async throws {
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
-        window.rootViewController = controller
-        window.makeKeyAndVisible()
-        controller.view.layoutIfNeeded()
+        let window = try await present(controller)
         controller.setInputGate(.open)
         let canvas = controller.canvasView
         XCTAssertTrue(canvas.becomeFirstResponder())
@@ -86,10 +77,10 @@ final class NotebookControllerTests: XCTestCase {
         window.isHidden = true
     }
 
-    func testTwentyCapacityCyclesKeepResponderPaletteViewportAndInsets() throws {
+    func testTwentyCapacityCyclesKeepResponderPaletteViewportAndInsets() async throws {
         let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
         let controller = NotebookViewController(pageCount: 3, initialDrawing: drawing)
-        let window = present(controller)
+        let window = try await present(controller)
         defer {
             controller.tearDown()
             window.isHidden = true
@@ -137,7 +128,7 @@ final class NotebookControllerTests: XCTestCase {
     func testNativeToolChoicesDuringCapacityCannotReenableMutation() async throws {
         let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
         let controller = NotebookViewController(pageCount: 3, initialDrawing: drawing)
-        let window = present(controller)
+        let window = try await present(controller)
         defer {
             controller.tearDown()
             window.isHidden = true
@@ -191,7 +182,7 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(canvas.isDrawingEnabled)
     }
 
-    func testNativeCustomItemDrawingRequestSurvivesCapacityResume() async {
+    func testNativeCustomItemDrawingRequestSurvivesCapacityResume() async throws {
         let pen = PKToolPickerInkingItem(type: .pen, color: .black, width: 3, identifier: "test.pen")
         var configuration = PKToolPickerCustomItem.Configuration(identifier: "test.inspect", name: "Inspect")
         configuration.imageProvider = { _ in UIImage(systemName: "hand.draw")! }
@@ -200,7 +191,7 @@ final class NotebookControllerTests: XCTestCase {
         let controller = NotebookViewController(
             pageCount: 3, initialDrawing: PKDrawing(), toolPicker: picker
         )
-        let window = present(controller)
+        let window = try await present(controller)
         let canvas = controller.canvasView
         defer {
             controller.tearDown()
@@ -244,9 +235,9 @@ final class NotebookControllerTests: XCTestCase {
         controller.tearDown()
     }
 
-    func testFailureRecoveryAndReadOnlyHidePaletteAndResignResponder() {
+    func testFailureRecoveryAndReadOnlyHidePaletteAndResignResponder() async throws {
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
-        let window = present(controller)
+        let window = try await present(controller)
         defer {
             controller.tearDown()
             window.isHidden = true
@@ -265,11 +256,18 @@ final class NotebookControllerTests: XCTestCase {
             XCTAssertTrue(controller.canvasView.panGestureRecognizer.isEnabled)
             XCTAssertTrue(controller.canvasView.pinchGestureRecognizer?.isEnabled == true)
         }
+        controller.setInputGate(.failed)
+        XCTAssertTrue(controller.canvasView.becomeFirstResponder())
+        XCTAssertTrue(controller.canvasView.isFirstResponder)
+        controller.setInputGate(.recovering)
+        XCTAssertFalse(controller.canvasView.isFirstResponder)
+        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertFalse(controller.canvasView.isDrawingEnabled)
     }
 
-    func testObservedStatesDuringToolUseKeepGenerationsAndDeferCapacityDisableUntilEnd() {
+    func testObservedStatesDuringToolUseKeepGenerationsAndDeferCapacityDisableUntilEnd() async throws {
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
-        let window = present(controller)
+        let window = try await present(controller)
         defer { window.isHidden = true }
         var observations: [NotebookCanvasObservation] = []
         controller.onObservation = {
@@ -351,20 +349,33 @@ final class NotebookControllerTests: XCTestCase {
         if let metrics { print("NOTTY_BARRIER_METRIC \(String(decoding: metrics, as: UTF8.self))") }
     }
 
-    private func present(_ controller: NotebookViewController) -> UIWindow {
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
+    private func present(_ controller: NotebookViewController) async throws -> UIWindow {
+        let scene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        )
+        let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
-        controller.drawingToolPicker?.setVisible(true, forFirstResponder: controller.canvasView)
-        XCTAssertTrue(controller.canvasView.becomeFirstResponder())
+        do {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !controller.isCanvasVisible || controller.view.window !== window
+                || controller.drawingToolPicker?.isVisible != true || !controller.canvasView.isFirstResponder {
+                guard ContinuousClock.now < deadline else {
+                    XCTFail("The scene-backed canvas did not become visible and ready.")
+                    throw FixtureFailure.readiness
+                }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        } catch {
+            controller.tearDown()
+            window.isHidden = true
+            window.rootViewController = nil
+            throw error
+        }
         return window
     }
 
+    private enum FixtureFailure: Error { case readiness }
 }
