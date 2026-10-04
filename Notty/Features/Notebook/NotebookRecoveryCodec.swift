@@ -50,6 +50,8 @@ struct NotebookEncodedRecoveryStates: Sendable {
 
 actor NotebookRecoveryCodec {
     private let stateCodec = InkCodec(profile: .recovery)
+    private(set) var legacySerializedDrawingCount = 0
+    private(set) var legacyHashedArchiveBytes = 0
 
     static let maximumEditCount = 32
     static let maximumStrokeCount = 20_000
@@ -61,23 +63,14 @@ actor NotebookRecoveryCodec {
         baseRevisionID: UUID?,
         edits: [NotebookPendingEdit<NotebookDrawingSnapshot>]
     ) throws -> NotebookRecoveryBatch {
-        guard !edits.isEmpty, edits.count <= Self.maximumEditCount else {
-            throw NotebookSaveFailure.contentLimit
-        }
+        try validateMetadata(edits, notebookID: notebookID)
         var archived: [NotebookRecoveryEdit] = []
         var totalBytes = 0
         for edit in edits {
             let snapshot = edit.snapshot
-            guard snapshot.drawing.strokes.count <= Self.maximumStrokeCount else {
-                throw NotebookSaveFailure.contentLimit
-            }
             let identities = snapshot.drawing.strokes.map(\.id)
-            guard Set(identities).count == identities.count,
-                  snapshot.pageCount > 0,
-                  snapshot.title.utf8.count <= 4 * 1_024 else {
-                throw NotebookSaveFailure.contentLimit
-            }
             let data = snapshot.drawing.dataRepresentation()
+            legacySerializedDrawingCount += 1
             guard data.count <= Self.maximumArchiveBytes,
                   data.count <= Self.maximumBatchBytes - totalBytes else {
                 throw NotebookSaveFailure.contentLimit
@@ -95,7 +88,8 @@ actor NotebookRecoveryCodec {
     }
 
     func fingerprint(_ batch: NotebookRecoveryBatch) -> NotebookRecoveryFingerprint {
-        NotebookRecoveryFingerprint(
+        legacyHashedArchiveBytes += batch.edits.reduce(0) { $0 + $1.drawingData.count }
+        return NotebookRecoveryFingerprint(
             notebookID: batch.notebookID,
             baseRevisionID: batch.baseRevisionID,
             edits: batch.edits.map { edit in
@@ -115,18 +109,7 @@ actor NotebookRecoveryCodec {
         baseRevisionID: UUID?,
         edits: [NotebookPendingEdit<NotebookDrawingSnapshot>]
     ) async throws -> NotebookEncodedRecoveryStates {
-        guard !edits.isEmpty, edits.count <= Self.maximumEditCount,
-              Set(edits.map(\.id)).count == edits.count else {
-            throw NotebookSaveFailure.contentLimit
-        }
-        for edit in edits {
-            let snapshot = edit.snapshot
-            guard snapshot.drawing.strokes.count <= Self.maximumStrokeCount,
-                  (1...12).contains(snapshot.pageCount),
-                  snapshot.title.utf8.count <= 4 * 1_024 else {
-                throw NotebookSaveFailure.contentLimit
-            }
-        }
+        try validateMetadata(edits, notebookID: notebookID)
         var states: [NotebookRecoveryStrokeEdit] = []
         states.reserveCapacity(edits.count)
         var totalBytes = 0
@@ -151,6 +134,39 @@ actor NotebookRecoveryCodec {
             strokeBatch: batch,
             fingerprint: try NotebookRecoveryStateFingerprint(validating: batch)
         )
+    }
+
+    private func validateMetadata(
+        _ edits: [NotebookPendingEdit<NotebookDrawingSnapshot>], notebookID: UUID
+    ) throws {
+        guard !edits.isEmpty, Set(edits.map(\.id)).count == edits.count else {
+            throw NotebookSaveFailure.invalidContent
+        }
+        guard edits.count <= Self.maximumEditCount else {
+            throw NotebookSaveFailure.contentLimit
+        }
+        for edit in edits {
+            let snapshot = edit.snapshot
+            guard snapshot.drawing.strokes.count <= Self.maximumStrokeCount,
+                  snapshot.title.utf8.count <= 4 * 1_024 else {
+                throw NotebookSaveFailure.contentLimit
+            }
+            guard (1...12).contains(snapshot.pageCount),
+                  Set(snapshot.drawing.strokes.map(\.id)).count == snapshot.drawing.strokes.count,
+                  validStamp(edit.stamp) else {
+                throw NotebookSaveFailure.invalidContent
+            }
+            if let source = snapshot.recoverySource {
+                guard source.notebookID == notebookID, validStamp(source.originalStamp) else {
+                    throw NotebookSaveFailure.invalidContent
+                }
+            }
+        }
+    }
+
+    private func validStamp(_ stamp: NotebookEditStamp) -> Bool {
+        stamp.capturedAt.timeIntervalSinceReferenceDate.isFinite
+            && stamp.uptime.isFinite && stamp.uptime >= 0
     }
 
     func decodeSelected(_ recovered: NotebookRecoveredEdit) async throws -> PKDrawing {
