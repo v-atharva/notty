@@ -139,6 +139,7 @@ public struct NotebookRevisionSummary: Sendable, Equatable {
         self.pageCount = pageCount
         self.strokeCount = strokeCount
         self.editStamp = editStamp
+        self.recoverySource = recoverySource
         self.savedAt = savedAt
     }
 }
