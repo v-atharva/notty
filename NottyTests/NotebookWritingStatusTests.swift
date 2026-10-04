@@ -787,6 +787,12 @@ final class NotebookWritingStatusTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await waitForUI {
+            controller.isCanvasVisible
+                && controller.view.window?.windowScene != nil
+                && controller.drawingToolPicker != nil
+                && controller.canvasView.isFirstResponder
+        }
         // This fixture controls session states and exercises the real native command stack.
         controller.canvasView.delegate = nil
         controller.onUndoAvailabilityChange = { [weak session] in

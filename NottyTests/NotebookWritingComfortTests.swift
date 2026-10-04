@@ -6,8 +6,8 @@ import XCTest
 
 @MainActor
 final class NotebookWritingComfortTests: XCTestCase {
-    func testSimulatorAcceptsNativeDrawingInput() throws {
-        let fixture = try presentController()
+    func testSimulatorAcceptsNativeDrawingInput() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         #if targetEnvironment(simulator)
         XCTAssertEqual(fixture.controller.canvasView.drawingPolicy, .anyInput)
@@ -16,8 +16,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         #endif
     }
 
-    func testMinimumZoomCanShowAnEntireA4Section() throws {
-        let fixture = try presentController()
+    func testMinimumZoomCanShowAnEntireA4Section() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let canvas = fixture.controller.canvasView
         let page = PaperGeometry(pageWidth: 794)
@@ -28,8 +28,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertLessThanOrEqual(CGFloat(page.pageHeight) * canvas.zoomScale, canvas.bounds.height + 0.5)
     }
 
-    func testCapacityKeepsTheRealUndoManagerAvailable() throws {
-        let fixture = try presentController()
+    func testCapacityKeepsTheRealUndoManagerAvailable() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let manager = try XCTUnwrap(fixture.controller.canvasView.undoManager)
         fixture.controller.setInputGate(.capacity)
@@ -38,8 +38,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertFalse(fixture.controller.canvasView.drawingGestureRecognizer.isEnabled)
     }
 
-    func testTeardownEndsActiveToolBeforeApplyingClosedAdmission() throws {
-        let fixture = try presentController()
+    func testTeardownEndsActiveToolBeforeApplyingClosedAdmission() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
         controller.canvasViewDidBeginUsingTool(controller.canvasView)
@@ -50,9 +50,9 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertFalse(controller.canvasView.isDrawingEnabled)
     }
 
-    func testTeardownClearsTheActualUndoAndRedoStacks() throws {
+    func testTeardownClearsTheActualUndoAndRedoStacks() async throws {
         for startsWithRedo in [false, true] {
-            let fixture = try presentController()
+            let fixture = try await presentController()
             defer { fixture.close() }
             let manager = try XCTUnwrap(fixture.controller.canvasView.undoManager)
             manager.removeAllActions()
@@ -72,9 +72,9 @@ final class NotebookWritingComfortTests: XCTestCase {
         }
     }
 
-    func testCapacityReservesOnlyOneOwnedUndoOrRedoBeforeMutation() throws {
+    func testCapacityReservesOnlyOneOwnedUndoOrRedoBeforeMutation() async throws {
         for startsWithRedo in [false, true] {
-            let fixture = try presentController()
+            let fixture = try await presentController()
             defer { fixture.close() }
             let controller = fixture.controller
             let canvas = controller.canvasView
@@ -119,8 +119,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         }
     }
 
-    func testHistoryCommandsRespectActiveToolAndAuthorizationAtInvocation() throws {
-        let fixture = try presentController()
+    func testHistoryCommandsRespectActiveToolAndAuthorizationAtInvocation() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
         let manager = try XCTUnwrap(controller.canvasView.undoManager)
@@ -146,8 +146,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertNil(controller.canvasView.undoManager)
     }
 
-    func testPaletteSuppressionSurvivesClosedGatesAndActiveTool() throws {
-        let fixture = try presentController()
+    func testPaletteSuppressionSurvivesClosedGatesAndActiveTool() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
         let picker = try XCTUnwrap(controller.drawingToolPicker)
@@ -156,6 +156,11 @@ final class NotebookWritingComfortTests: XCTestCase {
         controller.setPaletteSuppressed(true)
         XCTAssertTrue(picker.isVisible)
         controller.canvasViewDidEndUsingTool(controller.canvasView)
+        XCTAssertFalse(picker.isVisible)
+        XCTAssertTrue(controller.canvasView.becomeFirstResponder())
+        XCTAssertTrue(controller.canvasView.isFirstResponder)
+        controller.setPaletteSuppressed(true)
+        XCTAssertFalse(controller.canvasView.isFirstResponder)
         XCTAssertFalse(picker.isVisible)
         controller.setInputGate(.failed)
         controller.setPaletteSuppressed(false)
@@ -171,14 +176,14 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertTrue(picker.isVisible)
     }
 
-    func testReadOnlyViewerAndUnmountedCanvasDoNotAllocatePicker() throws {
+    func testReadOnlyViewerAndUnmountedCanvasDoNotAllocatePicker() async throws {
         let before = NotebookSceneToolPicker.creationCount
         let unmounted = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
         unmounted.loadViewIfNeeded()
         XCTAssertNil(unmounted.drawingToolPicker)
         XCTAssertEqual(NotebookSceneToolPicker.creationCount, before)
         unmounted.tearDown()
-        let fixture = try presentController(injectPicker: false, allowsEditing: false)
+        let fixture = try await presentController(injectPicker: false, allowsEditing: false)
         defer { fixture.close() }
         XCTAssertNil(fixture.controller.drawingToolPicker)
         XCTAssertEqual(NotebookSceneToolPicker.creationCount, before)
@@ -188,8 +193,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertFalse(fixture.controller.canvasView.isDrawingEnabled)
     }
 
-    func testSceneOwnedPickerHandoffRetainsSelectionAndRetiresOldOwner() throws {
-        let first = try presentController(injectPicker: false)
+    func testSceneOwnedPickerHandoffRetainsSelectionAndRetiresOldOwner() async throws {
+        let first = try await presentController(injectPicker: false)
         defer { first.close() }
         let picker = try XCTUnwrap(first.controller.drawingToolPicker)
         let scene = try XCTUnwrap(first.window.windowScene)
@@ -203,7 +208,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         target.register()
         var detachCount = 0
         first.controller.onDetach = { detachCount += 1 }
-        let second = try presentController(injectPicker: false)
+        let second = try await presentController(injectPicker: false)
         defer { second.close() }
         XCTAssertTrue(try XCTUnwrap(second.controller.drawingToolPicker) === picker)
         XCTAssertEqual(picker.selectedToolItemIdentifier, eraser.identifier)
@@ -217,8 +222,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertTrue(second.controller.canvasView.isFirstResponder)
     }
 
-    func testPaperLayersTrackLogicalGeometryAcrossZoomWithoutAnimations() throws {
-        let fixture = try presentController()
+    func testPaperLayersTrackLogicalGeometryAcrossZoomWithoutAnimations() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let paper = fixture.controller.paperView
         let height = CGFloat(NotebookPaperMetrics.geometry.pageHeight)
@@ -247,7 +252,7 @@ final class NotebookWritingComfortTests: XCTestCase {
 
     func testThousandPointScrollUsesTransformsWithoutCPUPaperRedraw() async throws {
         let paper = PaperDrawSpy(frame: .zero)
-        let fixture = try presentController(paperView: paper)
+        let fixture = try await presentController(paperView: paper)
         defer { fixture.close() }
         paper.setNeedsDisplay()
         try await waitForRenderedFrames()
@@ -276,8 +281,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         print("NOTTY_COMFORT_METRIC \(String(decoding: data, as: UTF8.self))")
     }
 
-    func testRotationKeepsLogicalCenterAndFullSectionMinimumZoom() throws {
-        let fixture = try presentController()
+    func testRotationKeepsLogicalCenterAndFullSectionMinimumZoom() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -299,10 +304,10 @@ final class NotebookWritingComfortTests: XCTestCase {
         )
     }
 
-    func testEqualObservedCallbacksAndRestoredToolStateDoNotRequestGrowth() throws {
+    func testEqualObservedCallbacksAndRestoredToolStateDoNotRequestGrowth() async throws {
         let stroke = nearEndStroke()
         let drawing = PKDrawing(strokes: [stroke])
-        let fixture = try presentController(drawing: drawing)
+        let fixture = try await presentController(drawing: drawing)
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -329,8 +334,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertTrue(completions.isEmpty)
     }
 
-    func testSemanticToolCompletionRetainsStampAndLaterObservationSeparately() throws {
-        let fixture = try presentController(drawing: PKDrawing())
+    func testSemanticToolCompletionRetainsStampAndLaterObservationSeparately() async throws {
+        let fixture = try await presentController(drawing: PKDrawing())
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -372,8 +377,8 @@ final class NotebookWritingComfortTests: XCTestCase {
         XCTAssertFalse(NotebookPaperMetrics.isNearPaperEnd(end, pageCount: 0))
     }
 
-    func testDisappearanceCancelsGrowthBeforeSyntheticInactivityAndTeardownDoesNotPublishIt() throws {
-        let fixture = try presentController()
+    func testDisappearanceCancelsGrowthBeforeSyntheticInactivityAndTeardownDoesNotPublishIt() async throws {
+        let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -402,7 +407,7 @@ final class NotebookWritingComfortTests: XCTestCase {
     }
 
     func testDisplayScaleTraitChangeRefreshesOnlyDividerThickness() async throws {
-        let fixture = try presentController()
+        let fixture = try await presentController()
         defer { fixture.close() }
         let paper = fixture.controller.paperView
         let geometryBefore = paper.geometryUpdates
@@ -421,7 +426,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         )
     }
 
-    func testClosedFirstAppearanceDefersPickerUntilGenuineOpenAdmission() throws {
+    func testClosedFirstAppearanceDefersPickerUntilGenuineOpenAdmission() async throws {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
@@ -437,6 +442,7 @@ final class NotebookWritingComfortTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await waitForAppearance(controller, window: window, expectsPalette: false)
         XCTAssertNil(controller.drawingToolPicker)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
         controller.setInputGate(.open)
@@ -447,7 +453,7 @@ final class NotebookWritingComfortTests: XCTestCase {
 
     func testActualSDKRestorationCallbacksRemainObservedWithoutAutomaticGrowth() async throws {
         let original = PKDrawing(strokes: [nearEndStroke()])
-        let fixture = try presentController(drawing: original)
+        let fixture = try await presentController(drawing: original)
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -479,7 +485,7 @@ final class NotebookWritingComfortTests: XCTestCase {
 
     func testAcceptedOwnedUndoRetainsEveryActualSDKObservation() async throws {
         let initial = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
-        let fixture = try presentController(drawing: initial)
+        let fixture = try await presentController(drawing: initial)
         defer { fixture.close() }
         let controller = fixture.controller
         let canvas = controller.canvasView
@@ -528,7 +534,7 @@ final class NotebookWritingComfortTests: XCTestCase {
     private func presentController(
         injectPicker: Bool = true, allowsEditing: Bool = true,
         drawing: PKDrawing = PKDrawing(), paperView: NotebookPaperView? = nil
-    ) throws -> Fixture {
+    ) async throws -> Fixture {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
@@ -543,7 +549,29 @@ final class NotebookWritingComfortTests: XCTestCase {
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
-        return Fixture(controller: controller, window: window)
+        let fixture = Fixture(controller: controller, window: window)
+        do {
+            try await waitForAppearance(controller, window: window, expectsPalette: allowsEditing)
+            return fixture
+        } catch {
+            fixture.close()
+            throw error
+        }
+    }
+
+    private func waitForAppearance(
+        _ controller: NotebookViewController, window: UIWindow, expectsPalette: Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !controller.isCanvasVisible || controller.view.window !== window
+            || (expectsPalette && (controller.drawingToolPicker?.isVisible != true
+                || !controller.canvasView.isFirstResponder)) {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("The scene-backed canvas did not become visible and ready.")
+                throw FixtureFailure.readiness
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     @MainActor

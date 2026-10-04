@@ -30,6 +30,8 @@ final class NotebookViewController: UIViewController {
     private var capacityHistoryActionReserved = false
     private var paletteSuppressed = false
     private var isTornDown = false
+    private var isAppearing = false
+    private(set) var isCanvasVisible = false
     private var isPublishingUndoAvailability = false
     private var toolBeginSignature: InkDrawingSignature?
     private var toolBeginGeneration: UInt64?
@@ -135,6 +137,10 @@ final class NotebookViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        if isAppearing || isCanvasVisible {
+            acquireToolPicker()
+            applyPaletteGate()
+        }
         let newSize = view.bounds.size
         guard newSize.width > 0, newSize.height > 0 else { return }
 
@@ -183,22 +189,39 @@ final class NotebookViewController: UIViewController {
         paperView.finishZoom()
     }
 
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        guard !isTornDown else { return }
+        isAppearing = true
+    }
+
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        guard !isTornDown else { return }
+        acquireToolPicker()
+        applyPaletteGate(force: true)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         guard !isTornDown else { return }
+        isAppearing = false
+        isCanvasVisible = true
         acquireToolPicker()
-        refreshUndoManager()
         applyPaletteGate(force: true)
         updatePaperViewport()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        isAppearing = false
+        isCanvasVisible = false
         _ = captureBarrier()
         onInteractionInterrupted?()
         resetActiveTool()
         if ownsToolPicker { toolPicker?.setVisible(false, forFirstResponder: canvas) }
         canvas.resignFirstResponder()
+        refreshUndoManager()
         paletteKeepsAccess = false
     }
 
@@ -207,7 +230,9 @@ final class NotebookViewController: UIViewController {
     }
 
     private func acquireToolPicker() {
-        guard allowsEditing, inputGate.keepsPalette, !isTornDown, !observesToolPicker, let scene = view.window?.windowScene else { return }
+        guard allowsEditing, inputGate.keepsPalette, !paletteSuppressed, !isTornDown,
+              isAppearing || isCanvasVisible, !observesToolPicker,
+              let scene = view.window?.windowScene else { return }
         if let injectedToolPicker {
             toolPicker = injectedToolPicker
             injectedToolPicker.showsDrawingPolicyControls = false
@@ -228,36 +253,47 @@ final class NotebookViewController: UIViewController {
 
     func setInputGate(_ gate: NotebookInputGate) {
         let gate = allowsEditing && !isTornDown ? gate : .readOnly
-        guard gate != inputGate else { return }
+        guard gate != inputGate else {
+            if isViewLoaded { applyPaletteGate() }
+            return
+        }
         inputGate = gate
         if gate == .open { capacityHistoryActionReserved = false }
         guard isViewLoaded else { return }
         canvas.permitsMutation = gate.allowsMutation
         canvas.permitsHistoryAccess = gate.keepsPalette
         if gate == .open { acquireToolPicker() }
+        applyPaletteGate()
         refreshUndoManager()
         publishUndoAvailability()
-        applyPaletteGate()
     }
 
     func setPaletteSuppressed(_ suppressed: Bool) {
-        guard paletteSuppressed != suppressed else { return }
+        guard paletteSuppressed != suppressed else {
+            if isViewLoaded { applyPaletteGate() }
+            return
+        }
         paletteSuppressed = suppressed
-        publishUndoAvailability()
+        if !suppressed { acquireToolPicker() }
         applyPaletteGate()
+        publishUndoAvailability()
     }
 
     private func applyPaletteGate(force: Bool = false) {
         let visible = allowsEditing && inputGate.keepsPalette && !paletteSuppressed
-            && view.window != nil && ownsToolPicker && !isTornDown
-        guard !canvas.hasActiveTool, force || paletteKeepsAccess != visible else { return }
+            && (isAppearing || isCanvasVisible) && view.window != nil && ownsToolPicker && !isTornDown
+        let responderMismatch = canvas.isFirstResponder != visible
+        let pickerMismatch = ownsToolPicker && toolPicker?.isVisible != visible
+        guard !canvas.hasActiveTool,
+              force || paletteKeepsAccess != visible || responderMismatch || pickerMismatch else { return }
         paletteKeepsAccess = visible
-        toolPicker?.setVisible(visible, forFirstResponder: canvas)
+        if ownsToolPicker { toolPicker?.setVisible(visible, forFirstResponder: canvas) }
         if visible {
             canvas.becomeFirstResponder()
         } else {
             canvas.resignFirstResponder()
         }
+        refreshUndoManager()
         updateInsets()
     }
 
@@ -372,6 +408,8 @@ final class NotebookViewController: UIViewController {
         guard !isTornDown else { return }
         _ = captureBarrier()
         isTornDown = true
+        isAppearing = false
+        isCanvasVisible = false
         onUndoAvailabilityChange = nil
         for observer in undoObservers { NotificationCenter.default.removeObserver(observer) }
         undoObservers.removeAll()
