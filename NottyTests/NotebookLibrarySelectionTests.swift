@@ -44,6 +44,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         let fixture = try LibraryFixture()
         defer { fixture.remove() }
         _ = try await fixture.seed(NotebookSession.defaultNotebookID)
+        _ = try await fixture.library.readSelection(legacyNotebookID: NotebookSession.defaultNotebookID)
         try Data("invalid selection".utf8).write(to: fixture.notes.appendingPathComponent("SELECTION.json"))
         let before = try fixture.snapshot(fixture.root)
         let model = NotebookLibraryModel(openLibrary: { fixture.library })
