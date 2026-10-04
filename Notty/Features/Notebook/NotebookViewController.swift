@@ -269,7 +269,10 @@ final class NotebookViewController: UIViewController {
     }
 
     func setPaletteSuppressed(_ suppressed: Bool) {
-        guard paletteSuppressed != suppressed else { return }
+        guard paletteSuppressed != suppressed else {
+            if isViewLoaded { applyPaletteGate() }
+            return
+        }
         paletteSuppressed = suppressed
         if !suppressed { acquireToolPicker() }
         applyPaletteGate()
