@@ -17,6 +17,15 @@ public enum InkComparisonMode: Sendable, Equatable {
 
 @available(iOS 27.0, macOS 27.0, *)
 public actor InkCodec {
+    public enum Profile: Sendable, Equatable {
+        case notebook
+        case recovery
+
+        var maximumStrokeCount: Int { self == .notebook ? 10_000 : 20_000 }
+        var maximumStrokeBytes: Int { self == .notebook ? 10 * 1_024 * 1_024 : 128 * 1_024 * 1_024 }
+        var maximumDrawingBytes: Int { self == .notebook ? 64 * 1_024 * 1_024 : 128 * 1_024 * 1_024 }
+    }
+
     public enum CodecError: Error, Sendable {
         case duplicateStrokeID
         case invalidSingleStrokeArchive
@@ -55,6 +64,7 @@ public actor InkCodec {
     private let comparisonMode: InkComparisonMode
     private let strokeLimit: Int
     private let byteLimit: Int
+    private let assetLimit: Int
     private let retiredCountLimit: Int
     private let retiredByteLimit: Int
     private let forceRenderStateEncodingFallback: Bool
@@ -194,10 +204,11 @@ public actor InkCodec {
     private var retiredOrder: [UUID] = []
     private var retiredBytes = 0
 
-    public init(comparisonMode: InkComparisonMode = .native) {
+    public init(profile: Profile = .notebook, comparisonMode: InkComparisonMode = .native) {
         self.comparisonMode = comparisonMode
-        strokeLimit = Self.maximumStrokeCount
-        byteLimit = Self.maximumDrawingBytes
+        strokeLimit = profile.maximumStrokeCount
+        byteLimit = profile.maximumDrawingBytes
+        assetLimit = profile.maximumStrokeBytes
         retiredCountLimit = Self.maximumRetiredStrokeCount
         retiredByteLimit = Self.maximumRetiredBytes
         forceRenderStateEncodingFallback = false
@@ -207,17 +218,19 @@ public actor InkCodec {
     init(
         maximumStrokeCount: Int,
         maximumDrawingBytes: Int,
+        maximumStrokeBytes: Int = InkCodec.maximumStrokeBytes,
         comparisonMode: InkComparisonMode = .native,
         maximumRetiredStrokeCount: Int = InkCodec.maximumRetiredStrokeCount,
         maximumRetiredBytes: Int = InkCodec.maximumRetiredBytes,
         forceRenderStateEncodingFallback: Bool = false,
         forceNativeDrawingEqualityFallback: Bool = false
     ) {
-        precondition(maximumStrokeCount >= 0 && maximumDrawingBytes >= 0)
+        precondition(maximumStrokeCount >= 0 && maximumDrawingBytes >= 0 && maximumStrokeBytes >= 0)
         precondition(maximumRetiredStrokeCount >= 0 && maximumRetiredBytes >= 0)
         self.comparisonMode = comparisonMode
         strokeLimit = maximumStrokeCount
         byteLimit = maximumDrawingBytes
+        assetLimit = maximumStrokeBytes
         retiredCountLimit = maximumRetiredStrokeCount
         retiredByteLimit = maximumRetiredBytes
         self.forceRenderStateEncodingFallback = forceRenderStateEncodingFallback
@@ -255,7 +268,7 @@ public actor InkCodec {
             } else {
                 let archive = PKDrawing(strokes: [stroke]).dataRepresentation()
                 workMetrics.serializedStrokes += 1
-                guard archive.count <= Self.maximumStrokeBytes else {
+                guard archive.count <= assetLimit else {
                     throw CodecError.oversizedStrokeArchive
                 }
                 asset = ownedAsset(id: stroke.id, data: archive)
@@ -289,7 +302,7 @@ public actor InkCodec {
         strokes.reserveCapacity(assets.count)
 
         for asset in assets {
-            guard asset.data.count <= Self.maximumStrokeBytes else {
+            guard asset.data.count <= assetLimit else {
                 throw CodecError.oversizedStrokeArchive
             }
             guard asset.data.count <= byteLimit - totalBytes else {
