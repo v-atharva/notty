@@ -25,8 +25,8 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
             try NotebookRecoveryStateFingerprint(validating: fixture.batch)
         )
         let published = try RecoveryStateFixtures.regularBytes(in: root.appendingPathComponent(receipt.id.uuidString.lowercased()))
-        XCTAssertGreaterThan(fixture.baselineAssetBytes, 0)
-        XCTAssertLessThan(published, fixture.baselineAssetBytes * 2)
+        XCTAssertGreaterThan(fixture.baselineUniqueAssetBytes, 0)
+        XCTAssertLessThan(published, fixture.baselineUniqueAssetBytes * 2)
         XCTAssertEqual(loaded.edits.map(\.id), fixture.batch.edits.map(\.id))
         XCTAssertEqual(loaded.edits.map(\.stamp), fixture.batch.edits.map(\.stamp))
         XCTAssertEqual(loaded.edits.map(\.title), fixture.batch.edits.map(\.title))
@@ -221,9 +221,13 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let template = RecoveryStateFixtures.stroke(points: 8_192)
         let templateBytes = PKDrawing(strokes: [template]).dataRepresentation().count
+        guard templateBytes > 0 else { throw NotebookRepositoryError.invalidContent("The native template is empty.") }
         let count = (61 * 1_024 * 1_024 + templateBytes - 1) / templateBytes
         XCTAssertGreaterThan(count, 0)
         XCTAssertLessThanOrEqual(count, 10_000)
+        guard (1...10_000).contains(count) else {
+            throw NotebookRepositoryError.invalidContent("The native workload cannot meet its bounded stroke count.")
+        }
         let fixture = try await makeStates(strokeCount: count, template: template)
         let stateBytes = fixture.batch.edits.map { $0.strokes.reduce(0) { $0 + $1.data.count } }
         for bytes in stateBytes {
@@ -287,12 +291,14 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
         let assetBytes = try RecoveryStateFixtures.regularBytes(in: directory.appendingPathComponent("assets"))
         let referenceBytes = try RecoveryStateFixtures.regularBytes(in: directory.appendingPathComponent("references"))
         XCTAssertEqual(assetBytes, uniqueBytes)
-        XCTAssertLessThan(published, fixture.baselineAssetBytes * 2)
+        XCTAssertGreaterThanOrEqual(fixture.baselineUniqueAssetBytes, 60 * 1_024 * 1_024)
+        XCTAssertLessThan(published, fixture.baselineUniqueAssetBytes * 2)
         let sourceBefore = try RecoveryStateFixtures.fileSnapshot(in: directory)
+        let lastState = try XCTUnwrap(loaded.edits.last)
         let overBatch = NotebookRecoveryStrokeBatch(
             notebookID: fixture.batch.notebookID, baseRevisionID: fixture.batch.baseRevisionID,
             edits: fixture.batch.edits + [NotebookRecoveryStrokeEdit(
-                id: UUID(), strokes: loaded.edits.last!.strokes, title: "Over limit",
+                id: UUID(), strokes: lastState.strokes, title: "Over limit",
                 pageCount: 12, stamp: RecoveryStateFixtures.stamp(9)
             )]
         )
@@ -316,7 +322,7 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
         let metrics: [String: Any] = [
             "editCount": 8, "strokeCount": count, "pointCount": template.path.count,
             "logicalStateBytes": stateBytes, "totalLogicalBytes": totalLogical,
-            "baselineUniqueAssetBytes": fixture.baselineAssetBytes, "uniqueAssetBytes": uniqueBytes,
+            "baselineUniqueAssetBytes": fixture.baselineUniqueAssetBytes, "uniqueAssetBytes": uniqueBytes,
             "publishedRegularFileBytes": published, "referenceBytes": referenceBytes,
             "metadataBytes": published - assetBytes - referenceBytes,
             "serializedStrokes": codecWork.serializedStrokes,
@@ -330,6 +336,7 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
             "readerAssetHashBytes": readerWork.assetHashBytes,
             "readerNativeArchiveValidations": readerWork.nativeArchiveValidations,
             "readerNativeStateValidations": readerWork.nativeStateValidations,
+            "writer": metricsDictionary(writerWork), "reader": metricsDictionary(readerWork),
             "processPeakRSSBeforeBytes": beforePeak, "processPeakRSSAfterBytes": afterPeak
         ]
         let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
@@ -342,6 +349,23 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
         }
     }
 
+    private func metricsDictionary(_ work: NotebookRecoveryWorkMetrics) -> [String: Int] {
+        [
+            "assetCopiedBytes": work.assetCopiedBytes, "inputReferenceVisits": work.inputReferenceVisits,
+            "assetHashCalls": work.assetHashCalls, "assetHashBytes": work.assetHashBytes,
+            "assetReadCalls": work.assetReadCalls, "assetReadBytes": work.assetReadBytes,
+            "assetWriteCalls": work.assetWriteCalls, "assetWrittenBytes": work.assetWrittenBytes,
+            "metadataHashCalls": work.metadataHashCalls, "metadataHashBytes": work.metadataHashBytes,
+            "metadataReadCalls": work.metadataReadCalls, "metadataReadBytes": work.metadataReadBytes,
+            "metadataWriteCalls": work.metadataWriteCalls, "metadataWrittenBytes": work.metadataWrittenBytes,
+            "metadataEncodeCalls": work.metadataEncodeCalls, "metadataEncodedBytes": work.metadataEncodedBytes,
+            "nativeArchiveValidations": work.nativeArchiveValidations,
+            "nativeStateValidations": work.nativeStateValidations,
+            "nativeArchiveSerializations": work.nativeArchiveSerializations,
+            "nativeSerializedBytes": work.nativeSerializedBytes, "publications": work.publications
+        ]
+    }
+
     private func processPeakResidentBytes() throws -> Int64 {
         var usage = rusage()
         guard getrusage(RUSAGE_SELF, &usage) == 0 else { throw NotebookRepositoryError.ioFailure(errno) }
@@ -351,7 +375,7 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
 
     private struct StateFixture {
         let batch: NotebookRecoveryStrokeBatch
-        let baselineAssetBytes: Int
+        let baselineUniqueAssetBytes: Int
         let transforms: [[CGAffineTransform]]
         let codec: InkCodec
     }
@@ -361,9 +385,10 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
     }
 
     private func makeStates(strokeCount: Int, template: PKStroke) async throws -> StateFixture {
-        var strokes = (0..<strokeCount).map { _ in
+        var strokes = (0..<strokeCount).map { index in
             var stroke = template
             stroke.id = UUID()
+            stroke.transform = template.transform.translatedBy(x: CGFloat(index) * 0.25, y: CGFloat(index) * 0.125)
             return stroke
         }
         let codec = InkCodec(profile: .recovery)
@@ -375,13 +400,17 @@ final class NotebookRecoveryProportionalTests: XCTestCase {
             let drawing = PKDrawing(strokes: strokes)
             XCTAssertEqual(drawing.strokes.map(\.id), strokes.map(\.id))
             let assets = try await codec.encode(drawing)
-            if index == 0 { baseline = assets.reduce(0) { $0 + $1.data.count } }
+            if index == 0 {
+                var unique: [String: Data] = [:]
+                for asset in assets { unique[try XCTUnwrap(asset.cachedDigest)] = asset.data }
+                baseline = unique.values.reduce(0) { $0 + $1.count }
+            }
             edits.append(RecoveryStateFixtures.edit(strokes: assets, index: index))
             transforms.append(strokes.map(\.transform))
         }
         return StateFixture(
             batch: NotebookRecoveryStrokeBatch(notebookID: UUID(), baseRevisionID: UUID(), edits: edits),
-            baselineAssetBytes: baseline, transforms: transforms, codec: codec
+            baselineUniqueAssetBytes: baseline, transforms: transforms, codec: codec
         )
     }
 }
@@ -434,8 +463,10 @@ enum RecoveryStateFixtures {
 
     static func regularBytes(in directory: URL) throws -> Int {
         let base = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let failure = EnumerationFailure()
         guard let enumerator = FileManager.default.enumerator(
-            at: base, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            at: base, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            errorHandler: { _, error in failure.record(error); return false }
         ) else { throw NotebookRepositoryError.invalidContent("The published bundle could not be enumerated.") }
         var bytes = 0
         for case let url as URL in enumerator {
@@ -448,13 +479,16 @@ enum RecoveryStateFixtures {
             }
             bytes += size
         }
+        try failure.check()
         return bytes
     }
 
     static func fileSnapshot(in directory: URL) throws -> [String: Data] {
         let base = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let failure = EnumerationFailure()
         guard let enumerator = FileManager.default.enumerator(
-            at: base, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            at: base, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            errorHandler: { _, error in failure.record(error); return false }
         ) else { throw NotebookRepositoryError.invalidContent("The published bundle could not be enumerated.") }
         var result: [String: Data] = [:]
         for case let url as URL in enumerator {
@@ -465,7 +499,24 @@ enum RecoveryStateFixtures {
             guard file.path.hasPrefix(base.path + "/") else { throw NotebookRepositoryError.unsafePath("A published file escaped its bundle.") }
             result[String(file.path.dropFirst(base.path.count + 1))] = try Data(contentsOf: file)
         }
+        try failure.check()
         return result
+    }
+
+    private final class EnumerationFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var error: (any Error)?
+        func record(_ error: any Error) {
+            lock.lock()
+            self.error = error
+            lock.unlock()
+        }
+        func check() throws {
+            lock.lock()
+            let captured = error
+            lock.unlock()
+            if let captured { throw captured }
+        }
     }
 
     final class AssetObservations: @unchecked Sendable {
