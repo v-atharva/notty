@@ -788,7 +788,8 @@ final class NotebookWritingStatusTests: XCTestCase {
             window.rootViewController = nil
         }
         try await waitForUI {
-            controller.view.window?.windowScene != nil
+            controller.isCanvasVisible
+                && controller.view.window?.windowScene != nil
                 && controller.drawingToolPicker != nil
                 && controller.canvasView.isFirstResponder
         }
