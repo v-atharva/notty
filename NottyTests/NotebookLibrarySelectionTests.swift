@@ -109,8 +109,9 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         defer { fixture.remove() }
         let oldID = NotebookSession.defaultNotebookID
         _ = try await fixture.seed(oldID)
-        try Data("damaged".utf8).write(to: fixture.noteURL(oldID).appendingPathComponent("HEAD.json"))
-        let oldBytes = try fixture.snapshot(fixture.noteURL(oldID))
+        let head = fixture.noteURL(oldID).appendingPathComponent("HEAD.json")
+        let healthyHead = try Data(contentsOf: head)
+        try Data("damaged".utf8).write(to: head)
         let gate = LibrarySelectionGate()
         let newID = UUID()
         let model = NotebookLibraryModel(
@@ -123,10 +124,13 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         let task = Task { await model.startNewNotebook() }
         do {
             try await waitUntil { await gate.entered }
+            try healthyHead.write(to: head)
+            let repairedBytes = try fixture.snapshot(fixture.noteURL(oldID))
             await old.load()
             guard case .failed = old.loadState else { throw FixtureFailure.unexpectedState }
             XCTAssertTrue(try selectedSession(model) === old)
             XCTAssertTrue(model.isCreating)
+            XCTAssertEqual(try fixture.snapshot(fixture.noteURL(oldID)), repairedBytes)
             await gate.release()
             await task.value
         } catch {
@@ -135,7 +139,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
             throw error
         }
         XCTAssertEqual(try selectedSession(model).notebookID, newID)
-        XCTAssertEqual(try fixture.snapshot(fixture.noteURL(oldID)), oldBytes)
+        XCTAssertEqual(try Data(contentsOf: head), healthyHead)
         XCTAssertTrue(old.pendingEdits.isEmpty)
     }
 
@@ -187,6 +191,34 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         XCTAssertTrue(try selectedSession(model) === old)
         XCTAssertEqual(try fixture.snapshot(fixture.root), before)
         XCTAssertFalse(model.isCreating)
+    }
+
+    func testLibraryRetryCannotReplaceAReadySessionWithAcceptedPendingWork() async throws {
+        let fixture = try LibraryFixture()
+        defer { fixture.remove() }
+        _ = try await fixture.seed(NotebookSession.defaultNotebookID)
+        let model = NotebookLibraryModel(openLibrary: { fixture.library })
+        await model.load()
+        let session = try selectedSession(model)
+        await session.load()
+        let seed = session.makeCanvasSeed()
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil })
+        let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: drawing,
+                                      capturedAt: Date(timeIntervalSince1970: 80), uptime: 80),
+            ownerID: seed.ownerID
+        )
+        let accepted = try XCTUnwrap(session.pendingEdits.first)
+        XCTAssertEqual(session.pendingEdits.map(\.id), [accepted.id])
+        await model.retry()
+        XCTAssertTrue(try selectedSession(model) === session)
+        await session.waitUntilSettled()
+        let loaded = try await fixture.repository.load(id: session.notebookID)
+        let saved = try XCTUnwrap(loaded)
+        XCTAssertEqual(saved.content.editStamp, accepted.stamp)
+        XCTAssertEqual(saved.content.strokes.map(\.id), drawing.strokes.map(\.id))
+        XCTAssertEqual(session.loadState, .ready)
     }
 
     private func selectedSession(_ model: NotebookLibraryModel) throws -> NotebookSession {
@@ -251,9 +283,11 @@ private struct LibraryFixture: Sendable {
 
     func snapshot(_ directory: URL) throws -> [String: Data] {
         let base = directory.standardizedFileURL.resolvingSymlinksInPath()
+        var enumerationError: (any Error)?
         guard let enumerator = FileManager.default.enumerator(
-            at: base, includingPropertiesForKeys: [.isRegularFileKey]
-        ) else { return [:] }
+            at: base, includingPropertiesForKeys: [.isRegularFileKey],
+            errorHandler: { _, error in enumerationError = error; return false }
+        ) else { throw NotebookSaveFailure.storageUnavailable }
         var result: [String: Data] = [:]
         for case let item as URL in enumerator {
             let file = item.standardizedFileURL.resolvingSymlinksInPath()
@@ -263,6 +297,7 @@ private struct LibraryFixture: Sendable {
                 result[String(file.path.dropFirst(prefix.count))] = try Data(contentsOf: file)
             }
         }
+        if let enumerationError { throw enumerationError }
         return result
     }
 }

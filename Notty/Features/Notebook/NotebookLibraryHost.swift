@@ -73,6 +73,10 @@ final class NotebookLibraryModel: ObservableObject {
 
     func retry() async {
         guard !isCreating else { return }
+        switch state {
+        case .failed, .recoveryRequired: break
+        case .loading, .notebook: return
+        }
         started = false
         await load()
     }
