@@ -340,14 +340,14 @@ public actor NotebookRepository {
         id: UUID, content: NotebookContent, expectedRevisionID: UUID?
     ) throws -> StoredNotebook {
         do {
-            try validateContent(content)
+            try validateContent(content, notebookID: id)
             let owned = NotebookContent(
                 title: content.title, pageCount: content.pageCount,
                 strokes: content.strokes.map { stroke in
                     metrics.record(\.inputReferenceVisits)
                     return ownedAsset(stroke)
                 },
-                editStamp: content.editStamp
+                editStamp: content.editStamp, recoverySource: content.recoverySource
             )
             let result = try saveBatch(
                 id: id, edits: [NotebookSaveEdit(id: UUID(), content: owned)],
@@ -395,7 +395,7 @@ public actor NotebookRepository {
                 guard editIDs.insert(edit.id).inserted else {
                     throw NotebookRepositoryError.invalidContent("Save edit identifiers must be unique.")
                 }
-                try validateContent(edit.content)
+                try validateContent(edit.content, notebookID: id)
                 let prepared = try prepareAssets(edit.content.strokes)
                 candidates.append(PreparedContent(
                     edit: edit, references: prepared.references, dataByDigest: prepared.dataByDigest
@@ -510,6 +510,7 @@ public actor NotebookRepository {
         var acceptedCandidates: [String: Data] = [:]
         var introducedBytes = 0
         var finalStamp: NotebookEditStamp?
+        var finalRecoverySource: NotebookRecoveryProvenance?
         var finalSavedAt = Date()
         for (index, candidate) in candidates.enumerated() {
             var newBytes = 0
@@ -541,7 +542,8 @@ public actor NotebookRepository {
                 let prepared = try writer.prepare(
                     state: state, previous: previous, parent: parent, revisionID: UUID(),
                     sequence: sequence + 1, stamp: candidate.edit.content.editStamp,
-                    savedAt: savedAt, credit: credit, checkpointSize: size
+                    savedAt: savedAt, credit: credit, checkpointSize: size,
+                    recoverySource: candidate.edit.content.recoverySource
                 )
                 publications.append(prepared)
                 receipts.append(NotebookCommittedEdit(
@@ -558,6 +560,7 @@ public actor NotebookRepository {
                 parent = prepared.head
                 checkpointSize = size
                 finalStamp = candidate.edit.content.editStamp
+                finalRecoverySource = candidate.edit.content.recoverySource
                 finalSavedAt = savedAt
             } catch let error as NotebookRepositoryError {
                 switch error {
@@ -601,7 +604,8 @@ public actor NotebookRepository {
             snapshot: finalSnapshot,
             current: Format.Materialized(
                 revisionID: finalPublication.head.revisionID, sequence: sequence,
-                editStamp: finalStamp, savedAt: finalSavedAt, state: previous, checkpointCredit: credit
+                editStamp: finalStamp, savedAt: finalSavedAt, state: previous, checkpointCredit: credit,
+                recoverySource: finalRecoverySource
             ),
             verifiedSizes: verifiedSizes, checkpointSize: checkpointSize, verificationEpoch: epoch
         )
@@ -779,7 +783,8 @@ public actor NotebookRepository {
         return NotebookStroke(id: stroke.id, data: data, validatedDigest: metrics.assetDigest(data))
     }
 
-    private func validateContent(_ content: NotebookContent) throws {
+    private func validateContent(_ content: NotebookContent, notebookID: UUID) throws {
+        try Format.validateRecoverySource(content.recoverySource, notebookID: notebookID)
         try validateEditStamp(content.editStamp)
         guard (1...12).contains(content.pageCount) else {
             throw NotebookRepositoryError.invalidContent("The prototype supports 1 through 12 paper sections.")
@@ -820,7 +825,7 @@ public actor NotebookRepository {
             id: id, revisionID: revision.revisionID, sequence: revision.sequence,
             content: NotebookContent(
                 title: revision.state.title, pageCount: revision.state.pageCount,
-                strokes: strokes, editStamp: revision.editStamp
+                strokes: strokes, editStamp: revision.editStamp, recoverySource: revision.recoverySource
             ),
             savedAt: revision.savedAt
         )

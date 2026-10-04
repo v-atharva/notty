@@ -242,7 +242,7 @@ struct NotebookHistory {
                 return Format.Materialized(
                     revisionID: newest.revisionID, sequence: newest.sequence,
                     editStamp: newest.editStamp, savedAt: newest.savedAt,
-                    state: replay.state, checkpointCredit: credit
+                    state: replay.state, checkpointCredit: credit, recoverySource: newest.recoverySource
                 )
             }
             tail.append((event, bytes))
@@ -283,6 +283,7 @@ struct NotebookHistory {
             try auditCancellation?.check()
             let stamp: NotebookEditStamp?
             let savedAt: Date
+            let recoverySource: NotebookRecoveryProvenance?
             if let generation {
                 let (event, bytes) = try readEvent(id: link.revisionID, digest: link.digest, generation: generation)
                 try verifyDeltaAssets(event.delta, replay: replay, sizes: &sizes, totalBytes: &totalBytes)
@@ -303,18 +304,20 @@ struct NotebookHistory {
                 }
                 stamp = event.editStamp
                 savedAt = event.savedAt
+                recoverySource = event.recoverySource
             } else {
                 let revision = try readLegacy(link)
                 replay = Format.Replay(revision.state)
                 try verifyStateAssets(revision.state, sizes: &sizes)
                 stamp = revision.editStamp
                 savedAt = revision.savedAt
+                recoverySource = nil
             }
             if summaryLimit > 0, (lowerBound..<upperBound).contains(index) {
                 summaries.append(NotebookRevisionSummary(
                     notebookID: notebookID, revisionID: link.revisionID, sequence: link.sequence,
                     title: replay.title, pageCount: replay.pageCount, strokeCount: replay.count,
-                    editStamp: stamp, savedAt: savedAt
+                    editStamp: stamp, savedAt: savedAt, recoverySource: recoverySource
                 ))
             }
         }
@@ -427,7 +430,7 @@ struct NotebookHistory {
             var replay = SummaryReplay(try readCheckpoint(digest, event: event, generation: generation))
             index.summaries[event.revisionID] = summary(
                 base.link, title: replay.title, pageCount: replay.pageCount, count: replay.ids.count,
-                stamp: event.editStamp, savedAt: event.savedAt
+                stamp: event.editStamp, savedAt: event.savedAt, recoverySource: event.recoverySource
             )
             if baseline > start {
                 for offset in stride(from: baseline - 1, through: start, by: -1) {
@@ -438,7 +441,7 @@ struct NotebookHistory {
                     try replay.apply(event.delta)
                     index.summaries[event.revisionID] = summary(
                         entry.link, title: replay.title, pageCount: replay.pageCount, count: replay.ids.count,
-                        stamp: event.editStamp, savedAt: event.savedAt
+                        stamp: event.editStamp, savedAt: event.savedAt, recoverySource: event.recoverySource
                     )
                 }
             }
@@ -448,11 +451,12 @@ struct NotebookHistory {
 
     private func summary(
         _ link: Link, title: String, pageCount: Int, count: Int,
-        stamp: NotebookEditStamp?, savedAt: Date
+        stamp: NotebookEditStamp?, savedAt: Date, recoverySource: NotebookRecoveryProvenance? = nil
     ) -> NotebookRevisionSummary {
         NotebookRevisionSummary(
             notebookID: notebookID, revisionID: link.revisionID, sequence: link.sequence,
-            title: title, pageCount: pageCount, strokeCount: count, editStamp: stamp, savedAt: savedAt
+            title: title, pageCount: pageCount, strokeCount: count, editStamp: stamp, savedAt: savedAt,
+            recoverySource: recoverySource
         )
     }
 
@@ -565,6 +569,8 @@ struct NotebookHistory {
               event.checkpointDigest.map(Format.isDigest) ?? true else {
             throw NotebookRepositoryError.corruptData("A history event has invalid digest links.")
         }
+        do { try Format.validateRecoverySource(event.recoverySource, notebookID: notebookID) }
+        catch { throw NotebookRepositoryError.corruptData("A committed recovery source is invalid.") }
         try Format.validateDeltaShape(event.delta)
         return (event, data.count)
     }

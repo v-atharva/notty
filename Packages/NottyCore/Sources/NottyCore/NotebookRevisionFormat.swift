@@ -63,6 +63,26 @@ enum NotebookRevisionFormat {
         let editStamp: NotebookEditStamp?
         let savedAt: Date
         let checkpointDigest: String?
+        let recoverySource: NotebookRecoveryProvenance?
+
+        init(
+            schemaVersion: Int, notebookID: UUID, revisionID: UUID,
+            parentRevisionID: UUID?, parentDigest: String?, sequence: Int, delta: Delta,
+            editStamp: NotebookEditStamp?, savedAt: Date, checkpointDigest: String?,
+            recoverySource: NotebookRecoveryProvenance? = nil
+        ) {
+            self.schemaVersion = schemaVersion
+            self.notebookID = notebookID
+            self.revisionID = revisionID
+            self.parentRevisionID = parentRevisionID
+            self.parentDigest = parentDigest
+            self.sequence = sequence
+            self.delta = delta
+            self.editStamp = editStamp
+            self.savedAt = savedAt
+            self.checkpointDigest = checkpointDigest
+            self.recoverySource = recoverySource
+        }
     }
 
     struct Checkpoint: Codable {
@@ -80,6 +100,20 @@ enum NotebookRevisionFormat {
         let savedAt: Date
         let state: State
         let checkpointCredit: Int
+        let recoverySource: NotebookRecoveryProvenance?
+
+        init(
+            revisionID: UUID, sequence: Int, editStamp: NotebookEditStamp?, savedAt: Date,
+            state: State, checkpointCredit: Int, recoverySource: NotebookRecoveryProvenance? = nil
+        ) {
+            self.revisionID = revisionID
+            self.sequence = sequence
+            self.editStamp = editStamp
+            self.savedAt = savedAt
+            self.state = state
+            self.checkpointCredit = checkpointCredit
+            self.recoverySource = recoverySource
+        }
     }
 
     static func encode<T: Encodable>(
@@ -129,6 +163,14 @@ enum NotebookRevisionFormat {
               stamp.uptime.isFinite, stamp.uptime >= 0 else {
             throw NotebookRepositoryError.invalidContent("The notebook edit timestamp is invalid.")
         }
+    }
+
+    static func validateRecoverySource(_ source: NotebookRecoveryProvenance?, notebookID: UUID) throws {
+        guard let source else { return }
+        guard source.notebookID == notebookID else {
+            throw NotebookRepositoryError.invalidContent("The recovery source belongs to another notebook.")
+        }
+        try validateStamp(source.originalStamp)
     }
 
     static func validateState(_ state: State) throws {
