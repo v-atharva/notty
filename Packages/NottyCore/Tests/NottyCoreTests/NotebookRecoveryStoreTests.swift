@@ -646,6 +646,10 @@ final class NotebookRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(states.edits.map(\.recoverySource), batch.edits.map(\.recoverySource))
         XCTAssertEqual(statesAfter.nativeArchiveSerializations - statesBefore.nativeArchiveSerializations, 2)
         XCTAssertGreaterThan(statesAfter.nativeSerializedBytes - statesBefore.nativeSerializedBytes, 0)
+        XCTAssertEqual(
+            statesAfter.assetCopiedBytes - statesBefore.assetCopiedBytes,
+            statesAfter.nativeSerializedBytes - statesBefore.nativeSerializedBytes
+        )
         XCTAssertEqual(statesAfter.nativeStateValidations - statesBefore.nativeStateValidations, 4)
         let targeted = try await store.loadEdit(id: receipt.id, editID: recovered.id)
         XCTAssertEqual(targeted.state.strokes.map(\.id), recovered.strokeIDs)

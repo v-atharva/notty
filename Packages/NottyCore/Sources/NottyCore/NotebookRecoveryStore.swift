@@ -209,9 +209,11 @@ public actor NotebookRecoveryStore {
                     native.id = asset.id
                     return native
                 }
-                let data = PKDrawing(strokes: strokes).dataRepresentation()
+                let encoded = PKDrawing(strokes: strokes).dataRepresentation()
                 metrics.record(\.nativeArchiveSerializations)
-                metrics.record(\.nativeSerializedBytes, data.count)
+                metrics.record(\.nativeSerializedBytes, encoded.count)
+                let data = encoded.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: $0.count) }
+                metrics.record(\.assetCopiedBytes, data.count)
                 guard data.count <= Self.maximumArchiveBytes,
                       data.count <= Self.maximumBatchBytes - totalBytes else {
                     throw NotebookRepositoryError.sizeLimitExceeded("The recovery state cannot fit the legacy whole-drawing representation.")
@@ -363,9 +365,11 @@ public actor NotebookRecoveryStore {
                 var stateBytes = 0
                 var result: [NotebookStroke] = []
                 for (source, id) in zip(drawing.strokes, edit.strokeIDs) {
-                    let data = PKDrawing(strokes: [source]).dataRepresentation()
+                    let encoded = PKDrawing(strokes: [source]).dataRepresentation()
                     metrics.record(\.nativeArchiveSerializations)
-                    metrics.record(\.nativeSerializedBytes, data.count)
+                    metrics.record(\.nativeSerializedBytes, encoded.count)
+                    let data = encoded.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: $0.count) }
+                    metrics.record(\.assetCopiedBytes, data.count)
                     guard !data.isEmpty, data.count <= Self.maximumArchiveBytes - stateBytes else {
                         throw NotebookRepositoryError.sizeLimitExceeded("The converted legacy recovery state exceeds 128 MiB.")
                     }
