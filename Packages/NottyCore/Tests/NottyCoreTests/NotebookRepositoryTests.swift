@@ -1751,7 +1751,11 @@ final class NotebookRepositoryTests: XCTestCase {
             ) else { return XCTFail("Retained \(retained) content cannot be classified as an empty library.") }
             XCTAssertEqual(try fileSnapshot(root: notes), beforeNotes)
             // Selection may initialize only the regular zero-byte recovery writer lock.
+            let recoveryLock = recovery.appendingPathComponent(".writer.lock")
+            XCTAssertEqual(try NotebookFileSystem.kind(recoveryLock), .regularFile)
+            XCTAssertEqual(try Data(contentsOf: recoveryLock), Data())
             var afterRecovery = try fileSnapshot(root: recovery)
+            XCTAssertEqual(afterRecovery[".writer.lock"], Data())
             afterRecovery.removeValue(forKey: ".writer.lock")
             var retainedRecovery = beforeRecovery
             retainedRecovery.removeValue(forKey: ".writer.lock")
@@ -1839,19 +1843,31 @@ final class NotebookRepositoryTests: XCTestCase {
     }
 
     private func fileSnapshot(root: URL) throws -> [String: Data] {
+        let base = root.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = base.path + "/"
+        var enumerationError: Error?
         let enumerator = try XCTUnwrap(
             FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isRegularFileKey]
+                at: base,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                errorHandler: { _, error in
+                    enumerationError = error
+                    return false
+                }
             )
         )
         var snapshot: [String: Data] = [:]
         for case let url as URL in enumerator {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey])
             guard values.isRegularFile == true else { continue }
-            let relativePath = String(url.path.dropFirst(root.path.count + 1))
-            snapshot[relativePath] = try Data(contentsOf: url)
+            let file = url.standardizedFileURL
+            guard file.path.hasPrefix(prefix) else {
+                throw NotebookRepositoryError.unsafePath("The snapshot entry is outside its root.")
+            }
+            let relativePath = String(file.path.dropFirst(prefix.count))
+            snapshot[relativePath] = try Data(contentsOf: file)
         }
+        if let enumerationError { throw enumerationError }
         return snapshot
     }
 
