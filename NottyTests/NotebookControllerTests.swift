@@ -263,6 +263,12 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertFalse(controller.canvasView.isFirstResponder)
         XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
         XCTAssertFalse(controller.canvasView.isDrawingEnabled)
+        XCTAssertTrue(controller.canvasView.becomeFirstResponder())
+        XCTAssertTrue(controller.canvasView.isFirstResponder)
+        controller.setInputGate(.recovering)
+        XCTAssertFalse(controller.canvasView.isFirstResponder)
+        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertFalse(controller.canvasView.isDrawingEnabled)
     }
 
     func testObservedStatesDuringToolUseKeepGenerationsAndDeferCapacityDisableUntilEnd() async throws {

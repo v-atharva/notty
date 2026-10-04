@@ -253,7 +253,10 @@ final class NotebookViewController: UIViewController {
 
     func setInputGate(_ gate: NotebookInputGate) {
         let gate = allowsEditing && !isTornDown ? gate : .readOnly
-        guard gate != inputGate else { return }
+        guard gate != inputGate else {
+            if isViewLoaded { applyPaletteGate() }
+            return
+        }
         inputGate = gate
         if gate == .open { capacityHistoryActionReserved = false }
         guard isViewLoaded else { return }
