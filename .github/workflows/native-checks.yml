@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      recovery_stress:
+        description: Run the large native recovery-copy workload
+        required: false
+        default: false
+        type: boolean
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -78,6 +83,15 @@ jobs:
             NOTTY_SWIFT_TEST_FLAGS=(-Xswiftc -DNOTTY_STORAGE_STRESS)
           fi
           xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore --parallel --num-workers 2 "${NOTTY_SWIFT_TEST_FLAGS[@]}"
+
+      - name: Test large native recovery copy
+        if: github.event_name == 'workflow_dispatch' && inputs.recovery_stress
+        timeout-minutes: 6
+        env:
+          NOTTY_RUN_RECOVERY_STRESS: "1"
+          NOTTY_RECOVERY_METRICS_DIRECTORY: ${{ runner.temp }}/NottyRecoveryMetrics
+        run: |
+          xcrun --sdk macosx27.0 swift test --package-path Packages/NottyCore -Xswiftc -DNOTTY_RECOVERY_STRESS --filter 'NotebookRecoveryProportionalTests/testEightLargeNativeStatesRetainEveryEditWithProportionalPublishedBytes'
 
       - name: Record storage measurements
         if: always()
