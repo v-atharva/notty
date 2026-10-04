@@ -12,6 +12,13 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
     func testRestorePublishesFreshIdentityAndStampWithSeparateOriginalProvenance() async throws {
         let fixture = try await RestoreFixture()
         defer { fixture.remove() }
+        let advanced = try await fixture.repository.save(
+            id: fixture.notebookID,
+            content: NotebookContent(title: "More recent title", pageCount: 4, strokes: fixture.initial.content.strokes,
+                                     editStamp: NotebookTestFixtures.stamp(110)),
+            expectedRevisionID: fixture.initial.revisionID
+        )
+        XCTAssertNotEqual(advanced.revisionID, fixture.initial.revisionID)
         let trace = RestoreStorageTrace(base: fixture.storage, suspendSave: true)
         let session = try await fixture.session(storage: await trace.storage())
         let originalGeneration = session.canvasGeneration
@@ -35,7 +42,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
             XCTAssertEqual(source.originalStamp, fixture.state.stamp)
             XCTAssertEqual(source.baseRevisionID, fixture.initial.revisionID)
             XCTAssertNotEqual(session.canvasGeneration, originalGeneration)
-            XCTAssertEqual(session.integrityModel.state, .verified(revisions: 1))
+            XCTAssertEqual(session.integrityModel.state, .verified(revisions: 2))
             await trace.releaseAll()
             await session.waitUntilSettled()
             let loaded = try await fixture.repository.load(id: fixture.notebookID)
@@ -46,12 +53,16 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
             XCTAssertEqual(saved.content.pageCount, fixture.state.pageCount)
             XCTAssertEqual(saved.content.strokes.map(\.id), fixture.state.strokes.map(\.id))
             let history = try await fixture.repository.history(id: fixture.notebookID)
-            XCTAssertEqual(history.count, 2)
+            XCTAssertEqual(history.count, 3)
+            XCTAssertEqual(saved.sequence, advanced.sequence + 1)
+            XCTAssertEqual(history.dropFirst().first?.revisionID, advanced.revisionID)
             XCTAssertEqual(history.first?.revisionID, saved.revisionID)
             XCTAssertEqual(history.first?.editStamp, pending.stamp)
             XCTAssertEqual(history.first?.recoverySource, source)
             let offered = await trace.offered
             let receipts = await trace.receipts
+            let expectedRevisions = await trace.expectedRevisions
+            XCTAssertEqual(expectedRevisions, [advanced.revisionID])
             XCTAssertEqual(offered.map(\.id), [pending.id])
             XCTAssertEqual(receipts.map(\.editID), [pending.id])
             let retained = try await fixture.recovery.loadStates(id: fixture.receipt.id)
@@ -150,6 +161,11 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
                                           capturedAt: Date(timeIntervalSince1970: 30), uptime: 30), ownerID: owner
             )
             let pendingID = try XCTUnwrap(session.pendingEdits.first?.id)
+            try await waitUntil { session.pendingEdits.isEmpty }
+            XCTAssertTrue(session.pendingEdits.isEmpty)
+            let selectedBeforeRelease = try await fixture.repository.load(id: fixture.notebookID)
+            XCTAssertEqual(selectedBeforeRelease?.content.strokes.map(\.id), late.strokes.map(\.id))
+            XCTAssertEqual(selectedBeforeRelease?.content.editStamp?.capturedAt, Date(timeIntervalSince1970: 30))
             await trace.releaseAll()
             let restored = await task.value
             XCTAssertFalse(restored)
@@ -270,8 +286,12 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         )
         await session.waitUntilSettled()
         let pending = session.pendingEdits
-        let preserved = await session.preserveRecoveryCopy()
-        let receipt = try XCTUnwrap(preserved)
+        await session.saveRecoveryCopy()
+        XCTAssertNil(session.recoveryFailure)
+        await session.refreshRecoveryCopies()
+        let preserved = session.recoveryCopies.filter { $0.id != fixture.receipt.id }
+        XCTAssertEqual(preserved.count, 1)
+        let receipt = try XCTUnwrap(preserved.first)
         let states = try await fixture.recovery.loadStates(id: receipt.id)
         XCTAssertEqual(states.edits.map(\.id), pending.map(\.id))
         XCTAssertEqual(states.edits.map(\.stamp), pending.map(\.stamp))
@@ -299,8 +319,12 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         )
         await session.waitUntilSettled()
         let originalPending = try XCTUnwrap(session.pendingEdits.first)
-        let preserved = await session.preserveRecoveryCopy()
-        _ = try XCTUnwrap(preserved)
+        await session.saveRecoveryCopy()
+        XCTAssertNil(session.recoveryFailure)
+        await session.refreshRecoveryCopies()
+        let preserved = session.recoveryCopies.filter { $0.id != fixture.receipt.id }
+        XCTAssertEqual(preserved.count, 1)
+        _ = try XCTUnwrap(preserved.first)
         let generation = session.canvasGeneration
         let late = PKDrawing(strokes: [NotebookTestFixtures.stroke(x: 550)])
         session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: NotebookCanvasControls(
@@ -383,8 +407,12 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         )
         await session.waitUntilSettled()
         let originalPending = session.pendingEdits
-        let preserved = await session.preserveRecoveryCopy()
-        let receipt = try XCTUnwrap(preserved)
+        await session.saveRecoveryCopy()
+        XCTAssertNil(session.recoveryFailure)
+        await session.refreshRecoveryCopies()
+        let preserved = session.recoveryCopies.filter { $0.id != fixture.receipt.id }
+        XCTAssertEqual(preserved.count, 1)
+        let receipt = try XCTUnwrap(preserved.first)
         _ = try await session.inspectRecoveryCopy(id: receipt.id)
         let generation = session.canvasGeneration
         await session.reopenSavedNotebook()
@@ -470,6 +498,51 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
             if let notebook = notebookController(in: child) { return notebook }
         }
         return nil
+    }
+
+    func testRepositoryCASConflictRetainsFreshRestoredPendingEditAndOriginalCopy() async throws {
+        let fixture = try await RestoreFixture()
+        defer { fixture.remove() }
+        let trace = RestoreStorageTrace(base: fixture.storage, suspendSave: true)
+        let session = try await fixture.session(storage: await trace.storage())
+        let originalGeneration = session.canvasGeneration
+        let restored = await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id)
+        XCTAssertTrue(restored)
+        do {
+            try await waitUntil { await trace.saveEntered }
+            let pending = try XCTUnwrap(session.pendingEdits.first)
+            let foreign = try await fixture.repository.save(
+                id: fixture.notebookID,
+                content: NotebookContent(title: "Different current revision", pageCount: 4,
+                                         strokes: fixture.initial.content.strokes,
+                                         editStamp: NotebookTestFixtures.stamp(120)),
+                expectedRevisionID: fixture.initial.revisionID
+            )
+            await trace.releaseAll()
+            await session.waitUntilSettled()
+            XCTAssertEqual(session.pendingEdits.map(\.id), [pending.id])
+            XCTAssertEqual(session.pendingEdits.first?.stamp, pending.stamp)
+            XCTAssertEqual(session.pendingEdits.first?.snapshot.recoverySource, pending.snapshot.recoverySource)
+            XCTAssertEqual(session.pendingEdits.first?.snapshot.recoverySource?.baseRevisionID, fixture.initial.revisionID)
+            XCTAssertEqual(session.pendingEdits.first?.snapshot.drawing.strokes.map(\.id), fixture.state.strokes.map(\.id))
+            XCTAssertEqual(session.saveState, .failed(.revisionConflict))
+            XCTAssertNotEqual(session.canvasGeneration, originalGeneration)
+            XCTAssertEqual(session.integrityModel.state, .verified(revisions: 1))
+            let committed = await trace.receipts
+            XCTAssertTrue(committed.isEmpty)
+            let current = try await fixture.repository.load(id: fixture.notebookID)
+            XCTAssertEqual(current?.revisionID, foreign.revisionID)
+            XCTAssertEqual(current?.content, foreign.content)
+            let history = try await fixture.repository.history(id: fixture.notebookID)
+            XCTAssertEqual(history.count, 2)
+            XCTAssertFalse(history.contains(where: { $0.recoverySource?.copyID == fixture.receipt.id }))
+            let retained = try await fixture.recovery.loadStates(id: fixture.receipt.id)
+            XCTAssertEqual(retained.edits, [fixture.state])
+        } catch {
+            await trace.releaseAll()
+            await session.waitUntilSettled()
+            throw error
+        }
     }
 
     private func waitUntil(_ predicate: () async -> Bool) async throws {
@@ -575,6 +648,7 @@ private actor RestoreStorageTrace {
     private(set) var targetLoadCalls = 0
     private(set) var offered: [NotebookSaveEdit] = []
     private(set) var receipts: [NotebookCommittedEdit] = []
+    private(set) var expectedRevisions: [UUID?] = []
 
     init(
         base: NotebookStorage, suspendSave: Bool = false, suspendTarget: Bool = false,
@@ -625,6 +699,7 @@ private actor RestoreStorageTrace {
 
     private func save(_ edits: [NotebookSaveEdit], revision: UUID?) async throws -> NotebookBatchSaveResult {
         saveEntered = true
+        expectedRevisions.append(revision)
         if suspendSave { await withCheckedContinuation { saveContinuation = $0 } }
         if let saveFailure { throw saveFailure }
         let result = try await base.saveBatch(edits, revision)
