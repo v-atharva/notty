@@ -39,17 +39,20 @@ public struct NotebookContent: Sendable, Equatable {
     public let pageCount: Int
     public let strokes: [NotebookStroke]
     public let editStamp: NotebookEditStamp?
+    public let recoverySource: NotebookRecoveryProvenance?
 
     public init(
         title: String,
         pageCount: Int,
         strokes: [NotebookStroke],
-        editStamp: NotebookEditStamp? = nil
+        editStamp: NotebookEditStamp? = nil,
+        recoverySource: NotebookRecoveryProvenance? = nil
     ) {
         self.title = title
         self.pageCount = pageCount
         self.strokes = strokes
         self.editStamp = editStamp
+        self.recoverySource = recoverySource
     }
 }
 
@@ -122,10 +125,12 @@ public struct NotebookRevisionSummary: Sendable, Equatable {
     public let strokeCount: Int
     public let editStamp: NotebookEditStamp?
     public let savedAt: Date
+    public let recoverySource: NotebookRecoveryProvenance?
 
     public init(
         notebookID: UUID, revisionID: UUID, sequence: Int, title: String,
-        pageCount: Int, strokeCount: Int, editStamp: NotebookEditStamp?, savedAt: Date
+        pageCount: Int, strokeCount: Int, editStamp: NotebookEditStamp?, savedAt: Date,
+        recoverySource: NotebookRecoveryProvenance? = nil
     ) {
         self.notebookID = notebookID
         self.revisionID = revisionID
