@@ -176,8 +176,6 @@ enum NotebookTheme {
     static let presetDotDiameter: CGFloat = 10
     static let presetCheckmarkSize: CGFloat = 11
     static let swatchCheckmarkSize: CGFloat = 12
-    /// Swatches lighter than this relative luminance carry a dark checkmark, darker ones a light checkmark.
-    static let lightSwatchLuminance = 0.4
     /// Point size of the chevrons that page a scrolling strip.
     static let chevronSize: CGFloat = 15
     /// Seconds a chevron tap takes to page a strip.

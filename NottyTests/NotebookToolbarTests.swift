@@ -441,6 +441,57 @@ final class NotebookToolbarTests: XCTestCase {
             let shelf = store.toolbar.customSwatches
             actions.addCustomColor(NotebookSwatchShelf.color(from: swatch.platformColor))
             XCTAssertEqual(store.toolbar.customSwatches, shelf, "A quick swatch is never duplicated as a custom colour.")
+            XCTAssertEqual(store.tool.color, swatch)
+            let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
+            XCTAssertEqual(marks.color, swatch)
+            XCTAssertFalse(marks.marksCustomColor)
+        }
+    }
+
+    func testPickingTheCurrentPresetColorKeepsItsIdentity() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+        for preset in EditorInkCatalog.presets {
+            actions.apply(preset)
+            let original = store.tool
+            actions.addCustomColor(NotebookSwatchShelf.color(from: preset.color.platformColor))
+            XCTAssertEqual(store.tool, original, preset.id)
+            XCTAssertEqual(store.tool.activePresetID, preset.id)
+        }
+    }
+
+    func testPresetSelectionKeepsTheChipSizeStable() throws {
+        for preset in EditorInkCatalog.presets {
+            func size(selected: Bool) -> CGSize {
+                let host = UIHostingController(rootView: NotebookPresetChip(
+                    preset: preset, isSelected: selected, action: {}
+                ))
+                return host.sizeThatFits(in: CGSize(width: 1_000, height: 1_000))
+            }
+            let idle = size(selected: false)
+            let selected = size(selected: true)
+            XCTAssertGreaterThan(idle.width, 0)
+            XCTAssertEqual(idle.width, selected.width, accuracy: 0.1, preset.id)
+            XCTAssertEqual(idle.height, selected.height, accuracy: 0.1, preset.id)
+        }
+    }
+
+    func testCustomSwatchSelectionMarksStayReadable() {
+        let mediumGray = EditorInkColor(red: 0.6, green: 0.6, blue: 0.6)
+        XCTAssertEqual(NotebookSwatchContrast.mark(for: mediumGray).uiColor, NotebookTheme.glyph.uiColor)
+        let colors = EditorInkCatalog.swatches + (0...20).flatMap { index in
+            [1.0, 0.5, 0.0].map { alpha in
+                let channel = Double(index) / 20
+                return EditorInkColor(red: channel, green: channel, blue: channel, alpha: alpha)
+            }
+        }
+        for color in colors {
+            let mark = NotebookSwatchShelf.color(from: NotebookSwatchContrast.mark(for: color).uiColor)
+            XCTAssertGreaterThanOrEqual(
+                mark.contrastRatio(against: NotebookSwatchContrast.background(for: color)), 3,
+                "Selection must remain visible on \(color)."
+            )
         }
     }
 

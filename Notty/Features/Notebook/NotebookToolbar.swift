@@ -53,7 +53,7 @@ struct NotebookToolbarActions {
     /// Selects the colour as the shelf stores it, so the ink in use and its swatch stay equal.
     func addCustomColor(_ color: EditorInkColor) {
         guard isEnabled else { return }
-        let picked = color.quantized
+        let picked = NotebookSwatchShelf.canonicalColor(color, preserving: store.tool.color)
         selectColor(picked)
         var preferences = store.toolbar
         preferences.addCustomSwatch(picked)
@@ -98,6 +98,14 @@ enum NotebookSwatchShelf {
         var alpha: CGFloat = 0
         uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return EditorInkColor(red: red, green: green, blue: blue, alpha: alpha).quantized
+    }
+
+    /// Picker rounding must not turn an existing ink into a different toolbar selection.
+    static func canonicalColor(_ color: EditorInkColor, preserving current: EditorInkColor) -> EditorInkColor {
+        let picked = color.quantized
+        if current.quantized == picked { return current }
+        let known = EditorInkCatalog.swatches + EditorInkCatalog.presets.map(\.color)
+        return known.first { $0.quantized == picked } ?? picked
     }
 
     static func displayed(custom: [EditorInkColor]) -> [EditorInkColor] {
@@ -694,7 +702,7 @@ private struct NotebookEraserButton: View {
 }
 
 @MainActor
-private struct NotebookPresetChip: View {
+struct NotebookPresetChip: View {
     let preset: EditorInkPreset
     let isSelected: Bool
     let action: () -> Void
@@ -702,10 +710,10 @@ private struct NotebookPresetChip: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: NotebookTheme.itemSpacing) {
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: NotebookTheme.presetCheckmarkSize, weight: .bold))
-                }
+                Image(systemName: "checkmark")
+                    .font(.system(size: NotebookTheme.presetCheckmarkSize, weight: .bold))
+                    .opacity(isSelected ? 1 : 0)
+                    .accessibilityHidden(true)
                 Circle()
                     .fill(preset.color.swiftUIColor)
                     .frame(width: NotebookTheme.presetDotDiameter, height: NotebookTheme.presetDotDiameter)
@@ -767,7 +775,28 @@ private struct NotebookSwatchCheckmark: View {
     }
 
     private var tone: NotebookTheme.Tone {
-        color.relativeLuminance > NotebookTheme.lightSwatchLuminance ? NotebookTheme.glyph : NotebookTheme.paperIvory
+        NotebookSwatchContrast.mark(for: color)
+    }
+}
+
+/// Chooses a readable mark against the actual selected swatch, including transparent ink.
+enum NotebookSwatchContrast {
+    static func background(for color: EditorInkColor) -> EditorInkColor {
+        let well = NotebookSwatchShelf.color(from: NotebookTheme.selectedWell.uiColor)
+        let alpha = color.alpha
+        return EditorInkColor(
+            red: color.red * alpha + well.red * (1 - alpha),
+            green: color.green * alpha + well.green * (1 - alpha),
+            blue: color.blue * alpha + well.blue * (1 - alpha)
+        )
+    }
+
+    static func mark(for color: EditorInkColor) -> NotebookTheme.Tone {
+        let surface = background(for: color)
+        let dark = NotebookSwatchShelf.color(from: NotebookTheme.glyph.uiColor)
+        let light = NotebookSwatchShelf.color(from: NotebookTheme.paperIvory.uiColor)
+        return dark.contrastRatio(against: surface) >= light.contrastRatio(against: surface)
+            ? NotebookTheme.glyph : NotebookTheme.paperIvory
     }
 }
 
