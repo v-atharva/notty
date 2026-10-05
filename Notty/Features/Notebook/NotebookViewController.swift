@@ -10,7 +10,7 @@ enum NotebookInputGate: Sendable, Equatable {
     case readOnly
 
     var allowsMutation: Bool { self == .open }
-    var keepsPalette: Bool { self == .open || self == .capacity }
+    var keepsToolbar: Bool { self == .open || self == .capacity }
 }
 
 @MainActor
@@ -21,10 +21,12 @@ final class NotebookViewController: UIViewController {
     private let logicalWidth = CGFloat(NotebookPaperMetrics.pageWidth)
     private let canvas = NotebookCanvasView()
     let paperView: NotebookPaperView
-    private let injectedToolPicker: PKToolPicker?
+    private let injectedToolStore: NotebookSceneToolStore?
     private let allowsEditing: Bool
-    private var scenePickerOwner: NotebookSceneToolPicker?
-    private var toolPicker: PKToolPicker?
+    private var toolStore: NotebookSceneToolStore?
+    private var pencilInteraction: UIPencilInteraction?
+    /// A tool chosen while a stroke is in progress, applied once the stroke ends.
+    private var pendingTool: EditorToolState?
     private var undoObservers: [NSObjectProtocol] = []
     private var retainedUndoManager: UndoManager?
     private var capacityHistoryActionReserved = false
@@ -40,7 +42,7 @@ final class NotebookViewController: UIViewController {
     var onCompletedEdit: ((PKDrawing) -> NotebookInputGate)?
     var onDetach: (() -> Void)?
     var canvasView: PKCanvasView { canvas }
-    var drawingToolPicker: PKToolPicker? { toolPicker }
+    var drawingToolStore: NotebookSceneToolStore? { toolStore }
     var onUndoAvailabilityChange: ((NotebookUndoAvailability) -> Void)?
     var onToolCompletion: ((NotebookToolCompletion) -> Void)?
     var onInteractionInterrupted: (() -> Void)?
@@ -68,18 +70,18 @@ final class NotebookViewController: UIViewController {
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
-    private var observesToolPicker = false
-    private var paletteKeepsAccess = false
+    private var observesToolStore = false
+    private var toolbarKeepsAccess = false
 
     private var logicalHeight: CGFloat {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
     }
 
     init(
-        pageCount: Int, initialDrawing: PKDrawing, toolPicker: PKToolPicker? = nil,
+        pageCount: Int, initialDrawing: PKDrawing, toolStore: NotebookSceneToolStore? = nil,
         allowsEditing: Bool = true, paperView: NotebookPaperView? = nil
     ) {
-        self.injectedToolPicker = toolPicker
+        self.injectedToolStore = toolStore
         self.allowsEditing = allowsEditing
         self.paperView = paperView ?? NotebookPaperView(frame: .zero)
         self.initialDrawing = initialDrawing
@@ -97,13 +99,15 @@ final class NotebookViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = NotebookPaperView.paperColor
+        view.backgroundColor = NotebookTheme.leatherMid.uiColor
         view.clipsToBounds = true
+        // The paper is always light; PencilKit would otherwise adapt ink colours for dark mode.
+        overrideUserInterfaceStyle = .light
 
         canvas.drawing = initialDrawing
         canvas.delegate = self
         canvas.permitsMutation = inputGate.allowsMutation
-        canvas.permitsHistoryAccess = inputGate.keepsPalette
+        canvas.permitsHistoryAccess = inputGate.keepsToolbar
         canvas.onUndo = { [weak self] in self?.performUndo() }
         canvas.onRedo = { [weak self] in self?.performRedo() }
         canvas.historyAvailability = { [weak self] in self?.currentUndoAvailability ?? .unavailable }
@@ -128,6 +132,13 @@ final class NotebookViewController: UIViewController {
         canvas.accessibilityHint =
             "Write with Apple Pencil. Use a finger to scroll and pinch to zoom."
 
+        // Without Apple's tool picker, Pencil tap and squeeze reach the app only through its own interaction.
+        if allowsEditing, !isTornDown {
+            let interaction = UIPencilInteraction(delegate: self)
+            canvas.addInteraction(interaction)
+            pencilInteraction = interaction
+        }
+
         view.addSubview(paperView)
         view.addSubview(canvas)
         updatePaperGeometry()
@@ -138,8 +149,8 @@ final class NotebookViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         if isAppearing || isCanvasVisible {
-            acquireToolPicker()
-            applyPaletteGate()
+            acquireToolStore()
+            applyToolbarGate()
         }
         let newSize = view.bounds.size
         guard newSize.width > 0, newSize.height > 0 else { return }
@@ -151,6 +162,7 @@ final class NotebookViewController: UIViewController {
         }
 
         let hadViewport = previousViewportSize.width > 0
+        let restsAtTop = hadViewport && isAtTopOfPaper
         let oldScale = max(canvas.zoomScale, 0.001)
         let oldFit = previousViewportSize.width / logicalWidth
         let wasWidthFitted = !hadViewport || abs(oldScale - oldFit) < 0.01
@@ -175,9 +187,11 @@ final class NotebookViewController: UIViewController {
 
         let proposedOffset: CGPoint
         if hadViewport {
+            // A page resting at its top stays there, so a toolbar band appearing above it
+            // never hides the first lines; elsewhere the view keeps its centre.
             proposedOffset = CGPoint(
                 x: logicalCenter.x * scale - newSize.width / 2,
-                y: logicalCenter.y * scale - newSize.height / 2
+                y: restsAtTop ? -canvas.contentInset.top : logicalCenter.y * scale - newSize.height / 2
             )
         } else {
             proposedOffset = CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top)
@@ -198,8 +212,8 @@ final class NotebookViewController: UIViewController {
     override func viewIsAppearing(_ animated: Bool) {
         super.viewIsAppearing(animated)
         guard !isTornDown else { return }
-        acquireToolPicker()
-        applyPaletteGate(force: true)
+        acquireToolStore()
+        applyToolbarGate(force: true)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -207,8 +221,8 @@ final class NotebookViewController: UIViewController {
         guard !isTornDown else { return }
         isAppearing = false
         isCanvasVisible = true
-        acquireToolPicker()
-        applyPaletteGate(force: true)
+        acquireToolStore()
+        applyToolbarGate(force: true)
         updatePaperViewport()
     }
 
@@ -219,32 +233,50 @@ final class NotebookViewController: UIViewController {
         _ = captureBarrier()
         onInteractionInterrupted?()
         resetActiveTool()
-        if ownsToolPicker { toolPicker?.setVisible(false, forFirstResponder: canvas) }
+        if ownsToolStore { toolStore?.setToolbarAvailable(false, for: self) }
         canvas.resignFirstResponder()
         refreshUndoManager()
-        paletteKeepsAccess = false
+        toolbarKeepsAccess = false
     }
 
-    private var ownsToolPicker: Bool {
-        observesToolPicker && (scenePickerOwner?.belongs(to: self) ?? true)
+    private var ownsToolStore: Bool {
+        observesToolStore && (toolStore?.belongs(to: self) ?? false)
     }
 
-    private func acquireToolPicker() {
-        guard allowsEditing, inputGate.keepsPalette, !paletteSuppressed, !isTornDown,
-              isAppearing || isCanvasVisible, !observesToolPicker,
+    private func acquireToolStore() {
+        guard allowsEditing, inputGate.keepsToolbar, !paletteSuppressed, !isTornDown,
+              isAppearing || isCanvasVisible, !observesToolStore,
               let scene = view.window?.windowScene else { return }
-        if let injectedToolPicker {
-            toolPicker = injectedToolPicker
-            injectedToolPicker.showsDrawingPolicyControls = false
-            injectedToolPicker.addObserver(canvas)
-            injectedToolPicker.addObserver(self)
-        } else {
-            let owner = NotebookSceneToolPicker.owner(for: scene)
-            scenePickerOwner = owner
-            toolPicker = owner.picker
-            owner.attach(self)
+        let store = injectedToolStore ?? NotebookSceneToolStore.owner(for: scene)
+        toolStore = store
+        store.attach(self)
+        observesToolStore = true
+        store.setToolActive(canvas.hasActiveTool, for: self)
+        applyTool(store.tool)
+        updateInsets()
+    }
+
+    /// Applies an app toolbar selection to the native canvas. Drawing admission is
+    /// untouched: a tool choice can never reopen a paused canvas.
+    func applyTool(_ state: EditorToolState) {
+        guard !isTornDown, ownsToolStore else { return }
+        guard !canvas.hasActiveTool else {
+            pendingTool = state
+            return
         }
-        observesToolPicker = true
+        pendingTool = nil
+        canvas.tool = state.nativeTool
+        canvas.isRulerActive = state.isRulerActive
+    }
+
+    /// Performs the user's Apple Pencil tap or squeeze setting. Only the owning controller
+    /// forwards it, and only while its own gate keeps the toolbar; the store additionally
+    /// requires toolbar availability, so failed, recovering, suppressed and read-only
+    /// canvases ignore gestures.
+    func handlePencilPreference(_ preference: EditorPencilTapPreference) {
+        guard !isTornDown, allowsEditing, inputGate.keepsToolbar, !paletteSuppressed,
+              ownsToolStore, let toolStore else { return }
+        toolStore.handlePencil(preference, from: self)
     }
 
     func setEditingEnabled(_ enabled: Bool) {
@@ -254,40 +286,42 @@ final class NotebookViewController: UIViewController {
     func setInputGate(_ gate: NotebookInputGate) {
         let gate = allowsEditing && !isTornDown ? gate : .readOnly
         guard gate != inputGate else {
-            if isViewLoaded { applyPaletteGate() }
+            if isViewLoaded { applyToolbarGate() }
             return
         }
         inputGate = gate
         if gate == .open { capacityHistoryActionReserved = false }
         guard isViewLoaded else { return }
         canvas.permitsMutation = gate.allowsMutation
-        canvas.permitsHistoryAccess = gate.keepsPalette
-        if gate == .open { acquireToolPicker() }
-        applyPaletteGate()
+        canvas.permitsHistoryAccess = gate.keepsToolbar
+        if gate == .open { acquireToolStore() }
+        applyToolbarGate()
         refreshUndoManager()
         publishUndoAvailability()
     }
 
     func setPaletteSuppressed(_ suppressed: Bool) {
         guard paletteSuppressed != suppressed else {
-            if isViewLoaded { applyPaletteGate() }
+            if isViewLoaded { applyToolbarGate() }
             return
         }
         paletteSuppressed = suppressed
-        if !suppressed { acquireToolPicker() }
-        applyPaletteGate()
+        if !suppressed { acquireToolStore() }
+        applyToolbarGate()
         publishUndoAvailability()
     }
 
-    private func applyPaletteGate(force: Bool = false) {
-        let visible = allowsEditing && inputGate.keepsPalette && !paletteSuppressed
-            && (isAppearing || isCanvasVisible) && view.window != nil && ownsToolPicker && !isTornDown
+    private func applyToolbarGate(force: Bool = false) {
+        let visible = allowsEditing && inputGate.keepsToolbar && !paletteSuppressed
+            && (isAppearing || isCanvasVisible) && view.window != nil && ownsToolStore && !isTornDown
         let responderMismatch = canvas.isFirstResponder != visible
-        let pickerMismatch = ownsToolPicker && toolPicker?.isVisible != visible
+        let availabilityMismatch = ownsToolStore && toolStore?.isToolbarAvailable != visible
+        // Tool choices stop as soon as the gate closes; resigning or restoring access waits for the stroke to end.
+        if !visible, ownsToolStore { toolStore?.setToolbarAvailable(false, for: self) }
         guard !canvas.hasActiveTool,
-              force || paletteKeepsAccess != visible || responderMismatch || pickerMismatch else { return }
-        paletteKeepsAccess = visible
-        if ownsToolPicker { toolPicker?.setVisible(visible, forFirstResponder: canvas) }
+              force || toolbarKeepsAccess != visible || responderMismatch || availabilityMismatch else { return }
+        toolbarKeepsAccess = visible
+        if ownsToolStore { toolStore?.setToolbarAvailable(visible, for: self) }
         if visible {
             canvas.becomeFirstResponder()
         } else {
@@ -346,8 +380,17 @@ final class NotebookViewController: UIViewController {
     private func resetActiveTool() {
         toolBeginSignature = nil
         toolBeginGeneration = nil
-        canvas.hasActiveTool = false
+        setToolActive(false)
+        if let pendingTool { applyTool(pendingTool) }
+        applyOverlayObstruction()
         publishUndoAvailability()
+    }
+
+    /// The store mirrors tool use so the toolbar host can hold back layout changes that
+    /// would move the canvas under a stroke.
+    private func setToolActive(_ active: Bool) {
+        canvas.hasActiveTool = active
+        if ownsToolStore { toolStore?.setToolActive(active, for: self) }
     }
 
     private func observeDrawing(signature: InkDrawingSignature? = nil) {
@@ -427,15 +470,15 @@ final class NotebookViewController: UIViewController {
         retainedUndoManager = nil
         onDetach?()
         onDetach = nil
-        if let scenePickerOwner {
-            scenePickerOwner.detach(self)
-        } else if observesToolPicker {
-            toolPicker?.setVisible(false, forFirstResponder: canvas)
-            toolPicker?.removeObserver(canvas)
-            toolPicker?.removeObserver(self)
+        toolStore?.detach(self)
+        observesToolStore = false
+        if let pencilInteraction {
+            pencilInteraction.delegate = nil
+            canvas.removeInteraction(pencilInteraction)
         }
-        observesToolPicker = false
-        paletteKeepsAccess = false
+        pencilInteraction = nil
+        pendingTool = nil
+        toolbarKeepsAccess = false
         canvas.resignFirstResponder()
         canvas.delegate = nil
         canvas.onUndo = nil
@@ -469,22 +512,46 @@ final class NotebookViewController: UIViewController {
         paperView.setViewport(scale: canvas.zoomScale, offset: canvas.contentOffset)
     }
 
+    /// Reserves the canvas edges a floating toolbar covers as scroll space. Reserving space
+    /// leaves the visible page where it is, except that a page resting at its top moves to the
+    /// new top, below the toolbar; releasing space can only move a page scrolled past the new
+    /// end back to that end.
+    func applyOverlayObstruction() {
+        guard isViewLoaded, !isTornDown, ownsToolStore else { return }
+        updateInsets()
+    }
+
     private func updateInsets() {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
-        let horizontalInset = max((canvas.bounds.width - logicalWidth * canvas.zoomScale) / 2, 0)
-        let obscuredFrame = ownsToolPicker && paletteKeepsAccess
-            ? toolPicker?.frameObscured(in: view) ?? .null : .null
-        let intersection = view.bounds.intersection(obscuredFrame)
-        let coversBottom = !intersection.isNull && !intersection.isEmpty
-            && intersection.maxY >= view.bounds.maxY - 1
-        let bottomInset = coversBottom ? max(view.bounds.maxY - intersection.minY, 0) : 0
-        let insets = UIEdgeInsets(top: 0, left: horizontalInset, bottom: bottomInset, right: horizontalInset)
-        if canvas.contentInset != insets {
-            canvas.contentInset = insets
+        // A docked toolbar shrinks the canvas instead. A floating one overlays it, so the
+        // vertical edges it covers become extra scroll space; horizontally the page stays centred.
+        let obstruction = ownsToolStore ? toolStore?.overlayObstruction ?? .zero : .zero
+        var top = max(obstruction.top, 0)
+        var bottom = max(obstruction.bottom, 0)
+        if canvas.hasActiveTool {
+            // A smaller inset pulls an offset beyond it back into range, which would move the
+            // page under the stroke; the space is released when the stroke ends.
+            top = max(top, canvas.contentInset.top)
+            bottom = max(bottom, canvas.contentInset.bottom)
         }
-        canvas.verticalScrollIndicatorInsets = UIEdgeInsets(
-            top: 0, left: 0, bottom: bottomInset, right: 0
-        )
+        let horizontalInset = max((canvas.bounds.width - logicalWidth * canvas.zoomScale) / 2, 0)
+        let insets = UIEdgeInsets(top: top, left: horizontalInset, bottom: bottom, right: horizontalInset)
+        if canvas.contentInset != insets {
+            let keepsTop = isAtTopOfPaper && !canvas.hasActiveTool && insets.top != canvas.contentInset.top
+            canvas.contentInset = insets
+            if keepsTop {
+                canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -insets.top), animated: false)
+            }
+        }
+        let indicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
+        if canvas.verticalScrollIndicatorInsets != indicatorInsets {
+            canvas.verticalScrollIndicatorInsets = indicatorInsets
+        }
+    }
+
+    /// True while the top of the first page sits at the top of the scrollable range.
+    private var isAtTopOfPaper: Bool {
+        abs(canvas.contentOffset.y + canvas.contentInset.top) < 0.5
     }
 
     private func clampedOffset(_ proposed: CGPoint) -> CGPoint {
@@ -506,7 +573,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         toolBeginGeneration = observedGeneration
         toolBeginSignature = try? InkDrawingSignature(canvas.drawing)
         if let toolBeginSignature { observationWork.add(toolBeginSignature.constructionWork) }
-        canvas.hasActiveTool = true
+        setToolActive(true)
         publishUndoAvailability()
     }
 
@@ -521,7 +588,9 @@ extension NotebookViewController: PKCanvasViewDelegate {
         let beginGeneration = toolBeginGeneration
         toolBeginSignature = nil
         toolBeginGeneration = nil
-        canvas.hasActiveTool = false
+        setToolActive(false)
+        if let pendingTool { applyTool(pendingTool) }
+        applyOverlayObstruction()
         publishUndoAvailability()
         if let begin, let end = lastDeliveredSignature, let beginGeneration,
            begin.constructionWork.nativeDrawingFallbackSnapshots == 0,
@@ -539,7 +608,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
                 ))
             }
         }
-        applyPaletteGate()
+        applyToolbarGate()
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
@@ -561,15 +630,43 @@ extension NotebookViewController: PKCanvasViewDelegate {
     }
 }
 
-extension NotebookViewController: PKToolPickerObserver {
-    func toolPickerVisibilityDidChange(_ toolPicker: PKToolPicker) {
-        updateInsets()
-        updatePaperViewport()
+extension NotebookViewController: UIPencilInteractionDelegate {
+    /// The user's system setting for a double tap.
+    static func tapPreference() -> EditorPencilTapPreference {
+        EditorPencilTapPreference(UIPencilInteraction.preferredTapAction)
     }
 
-    func toolPickerFramesObscuredDidChange(_ toolPicker: PKToolPicker) {
-        updateInsets()
-        updatePaperViewport()
+    /// The user's system setting for a squeeze, or nil before it ends: a held squeeze can
+    /// report began and changed phases first, and acting on each would undo itself.
+    static func squeezePreference(for phase: UIPencilInteraction.Phase) -> EditorPencilTapPreference? {
+        guard phase == .ended else { return nil }
+        return EditorPencilTapPreference(UIPencilInteraction.preferredSqueezeAction)
+    }
+
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        handlePencilPreference(Self.tapPreference())
+    }
+
+    func pencilInteraction(
+        _ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze
+    ) {
+        guard let preference = Self.squeezePreference(for: squeeze.phase) else { return }
+        handlePencilPreference(preference)
+    }
+}
+
+extension EditorPencilTapPreference {
+    init(_ action: UIPencilPreferredAction) {
+        switch action {
+        case .ignore: self = .ignore
+        case .switchEraser: self = .switchEraser
+        case .switchPrevious: self = .switchPrevious
+        case .showColorPalette: self = .showColorPalette
+        case .showInkAttributes: self = .showInkAttributes
+        case .showContextualPalette: self = .showContextualPalette
+        case .runSystemShortcut: self = .runSystemShortcut
+        @unknown default: self = .ignore
+        }
     }
 }
 

@@ -7,6 +7,7 @@ import SwiftUI
 final class NotebookLibraryModel: ObservableObject {
     enum State {
         case loading
+        case creatingFirstNotebook
         case notebook(NotebookSession)
         case recoveryRequired
         case failed(NotebookSaveFailure)
@@ -58,7 +59,7 @@ final class NotebookLibraryModel: ObservableObject {
                 installSession(id: id, library: access)
             case .empty(let token):
                 selection = token
-                state = .recoveryRequired
+                state = .creatingFirstNotebook
                 await startNewNotebook()
             case .recoveryRequired(let token):
                 selection = token
@@ -74,7 +75,7 @@ final class NotebookLibraryModel: ObservableObject {
     func retry() async {
         guard !isCreating else { return }
         switch state {
-        case .failed, .recoveryRequired: break
+        case .failed, .recoveryRequired, .creatingFirstNotebook: break
         case .loading, .notebook: return
         }
         started = false
@@ -85,14 +86,15 @@ final class NotebookLibraryModel: ObservableObject {
         guard !isCreating, let library, let selection else { return }
         let previousSession: NotebookSession?
         let transitionID: UUID?
-        if case .notebook(let session) = state {
+        switch state {
+        case .notebook(let session):
             guard let transition = session.beginNewNotebookTransition() else { return }
             previousSession = session
             transitionID = transition
-        } else if case .recoveryRequired = state {
+        case .recoveryRequired, .creatingFirstNotebook:
             previousSession = nil
             transitionID = nil
-        } else {
+        case .loading, .failed:
             return
         }
         let operation = UUID()
@@ -155,6 +157,19 @@ struct NotebookLibraryHost: View {
             switch model.state {
             case .loading:
                 ProgressView("Opening library")
+            case .creatingFirstNotebook:
+                if let failure = model.creationFailure {
+                    ContentUnavailableView {
+                        Label("Couldn't create your first notebook", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(failure.message)
+                    } actions: {
+                        Button("Try again") { Task { await model.retry() } }
+                            .disabled(model.isCreating)
+                    }
+                } else {
+                    ProgressView("Creating your first notebook")
+                }
             case .notebook(let session):
                 NotebookScreen(session: session, startNewNotebook: {
                     await model.startNewNotebook()
@@ -170,7 +185,7 @@ struct NotebookLibraryHost: View {
                 }
             case .recoveryRequired:
                 ContentUnavailableView {
-                    Label("Retained notebooks need recovery", systemImage: "doc.badge.exclamationmark")
+                    Label("Retained notebooks need recovery", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text("Your existing notebooks and recovery copies will be kept. You can start a separate notebook.")
                     if let failure = model.creationFailure { Text(failure.message) }

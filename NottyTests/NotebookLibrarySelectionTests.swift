@@ -1,6 +1,7 @@
 import Foundation
 import NottyCore
 import PencilKit
+import UIKit
 import XCTest
 @testable import Notty
 
@@ -23,6 +24,50 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         let selection = try await fixture.library.readSelection(legacyNotebookID: NotebookSession.defaultNotebookID)
         guard case .selected(let id, _) = selection else { return XCTFail("The published note must be selected.") }
         XCTAssertEqual(id, newID)
+    }
+
+    func testEmptyLibraryShowsFirstNotebookCreationInsteadOfRecovery() async throws {
+        let fixture = try LibraryFixture()
+        defer { fixture.remove() }
+        let gate = LibrarySelectionGate()
+        let newID = UUID()
+        let model = NotebookLibraryModel(
+            openLibrary: { fixture.library }, makeNotebookID: { newID },
+            beforeSelection: { await gate.suspend() }
+        )
+        let task = Task { await model.load() }
+        do {
+            try await waitUntil { await gate.entered }
+            guard case .creatingFirstNotebook = model.state else { throw FixtureFailure.unexpectedState }
+            XCTAssertTrue(model.isCreating)
+            await gate.release()
+            await task.value
+        } catch {
+            await gate.release()
+            await task.value
+            throw error
+        }
+        XCTAssertEqual(try selectedSession(model).notebookID, newID)
+    }
+
+    func testFailedFirstNotebookCreationOffersRetryWithoutRecoveryWording() async throws {
+        let fixture = try LibraryFixture(selectionFailure: true)
+        defer { fixture.remove() }
+        let model = NotebookLibraryModel(openLibrary: { fixture.library })
+        await model.load()
+        guard case .creatingFirstNotebook = model.state else {
+            return XCTFail("A failed first creation must stay on its own screen.")
+        }
+        XCTAssertNotNil(model.creationFailure)
+        XCTAssertFalse(model.isCreating)
+        await model.retry()
+        guard case .recoveryRequired = model.state else {
+            return XCTFail("An unselected published note must require recovery, not promotion.")
+        }
+    }
+
+    func testLibraryStatusSymbolsExistInTheSystemSet() {
+        XCTAssertNotNil(UIImage(systemName: "exclamationmark.triangle"))
     }
 
     func testExistingLegacyNoteIsOpenedWithoutCreatingAnotherNotebook() async throws {

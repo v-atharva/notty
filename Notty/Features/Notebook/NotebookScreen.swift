@@ -25,6 +25,7 @@ struct NotebookScreen: View {
                 case .loading:
                     ProgressView("Opening notebook")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(NotebookTheme.paperIvory.color)
                 case .failed(let failure):
                     ContentUnavailableView {
                         Label("Couldn't open notebook", systemImage: "exclamationmark.triangle")
@@ -38,21 +39,46 @@ struct NotebookScreen: View {
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(NotebookTheme.paperIvory.color)
                 case .ready:
-                    NotebookCanvas(session: session)
-                        .id(session.canvasGeneration)
+                    NotebookToolbarHost {
+                        NotebookCanvas(session: session)
+                            .id(session.canvasGeneration)
+                    }
                 }
             }
-            .background(Color(red: 0.98, green: 0.96, blue: 0.91))
+            // Leather runs behind the navigation bar and meets the dock band without a seam.
+            .background { NotebookLeatherSurface().ignoresSafeArea() }
+            .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
             .navigationTitle(session.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    ForEach(NotebookUpcomingFeature.placed(.navigationLeading)) { feature in
+                        NotebookUpcomingBarButton(feature: feature)
+                    }
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Text("notty")
-                        .font(.system(.title3, design: .serif, weight: .semibold))
-                        .foregroundStyle(Color(red: 0.28, green: 0.23, blue: 0.18))
+                        .font(NotebookTheme.wordmark.font)
+                        .foregroundStyle(NotebookTheme.bandText.color)
+                        // The leading bar items share their width; the wordmark is never truncated.
+                        .fixedSize()
                         .accessibilityLabel("Notty")
                 }
+                .sharedBackgroundVisibility(.hidden)
+                ToolbarItem(placement: .principal) {
+                    Text(session.title)
+                        .font(NotebookTheme.noteTitle.font)
+                        .foregroundStyle(NotebookTheme.bandText.color)
+                        .lineLimit(1)
+                        // The typewriter face runs wide; shrink a little before truncating.
+                        .minimumScaleFactor(0.85)
+                        .layoutPriority(1)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                .sharedBackgroundVisibility(.hidden)
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     NotebookHistoryButtons(session: session, model: session.commandModel)
                     NotebookRecoveryCopiesButton(session: session, model: session.commandModel) {
@@ -63,9 +89,14 @@ struct NotebookScreen: View {
                     NotebookIntegrityIndicator(session: session, model: session.integrityModel)
                     NotebookExtendPaperButton(session: session, model: session.gateModel)
                 }
+                // Its own capsule, apart from the working actions.
+                ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                ToolbarItem(placement: .topBarTrailing) {
+                    NotebookUpcomingMenu()
+                }
             }
         }
-        .tint(Color(red: 0.36, green: 0.29, blue: 0.22))
+        .tint(NotebookTheme.paperControlTint.color)
         .preferredColorScheme(.light)
         .sheet(isPresented: $showsRecoveryCopies, onDismiss: session.endRecoveryCopiesPresentation) {
             NotebookRecoveryView(session: session)
@@ -137,6 +168,9 @@ private struct NotebookSaveStatusView: View {
     @ObservedObject var model: NotebookSavePresentationModel
     @State private var showsDetails = false
 
+    /// Captions seen while writing; the slot fits the widest so the capsule holds still on every save.
+    private static let steadyCaptions = ["Ready", "Saving", "Saved"]
+
     private var caption: String {
         guard model.state.isReady else { return "Not ready" }
         if model.state.performingRecovery { return "Recovery" }
@@ -164,10 +198,17 @@ private struct NotebookSaveStatusView: View {
             HStack(spacing: 5) {
                 Image(systemName: symbol)
                     .frame(width: 18)
-                Text(caption).lineLimit(1)
+                // Rarer, longer captions widen the slot rather than being cut off.
+                ZStack(alignment: .leading) {
+                    ForEach(Self.steadyCaptions, id: \.self) { Text($0).hidden() }
+                    Text(caption)
+                }
+                .lineLimit(1)
             }
             .font(.caption)
-            .frame(width: 112, height: 28, alignment: .leading)
+            // The inherited tint is too faint for caption text on the glass capsule.
+            .foregroundStyle(NotebookTheme.glyph.color)
+            .frame(height: 28)
         }
         .accessibilityLabel(caption + ". Notebook save details")
         .popover(isPresented: $showsDetails) {
@@ -301,28 +342,28 @@ private struct NotebookLimitsIndicator: View {
     @State private var showsDetails = false
 
     var body: some View {
-        Button {
-            showsDetails = true
-        } label: {
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(.orange)
-                .opacity(model.state.isNearLimit ? 1 : 0)
-                .frame(width: 28, height: 28)
-        }
-        .disabled(!model.state.isNearLimit)
-        .accessibilityHidden(!model.state.isNearLimit)
-        .accessibilityLabel("Notebook nearing save limit")
-        .popover(isPresented: $showsDetails) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Notebook nearing save limit").font(.headline)
-                Text("This drawing contains \(model.state.strokeCount) of 10,000 supported strokes.")
-                if let bytes = model.state.encodedBytes {
-                    Text("Its most recent encoding uses \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)) of 64 MiB.")
-                }
-                Text("If an edit exceeds the save limit, preserve a recovery copy before reopening. Larger preserved states remain available for inspection.")
+        // Present only near the limit, so the bar does not reserve an empty slot the rest of the time.
+        if model.state.isNearLimit {
+            Button {
+                showsDetails = true
+            } label: {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                    .frame(width: 28, height: 28)
             }
-            .padding()
-            .frame(maxWidth: 320)
+            .accessibilityLabel("Notebook nearing save limit")
+            .popover(isPresented: $showsDetails) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Notebook nearing save limit").font(.headline)
+                    Text("This drawing contains \(model.state.strokeCount) of 10,000 supported strokes.")
+                    if let bytes = model.state.encodedBytes {
+                        Text("Its most recent encoding uses \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)) of 64 MiB.")
+                    }
+                    Text("If an edit exceeds the save limit, preserve a recovery copy before reopening. Larger preserved states remain available for inspection.")
+                }
+                .padding()
+                .frame(maxWidth: 320)
+            }
         }
     }
 }

@@ -1,4 +1,7 @@
+import Combine
+import NottyCore
 import PencilKit
+import SwiftUI
 import UIKit
 import XCTest
 @testable import Notty
@@ -71,7 +74,7 @@ final class NotebookControllerTests: XCTestCase {
         let firstPaused = canvas.isFirstResponder
         let insetsPaused = canvas.contentInset
         controller.setInputGate(.open)
-        XCTAssertEqual(firstPaused, firstBefore, "N1: a pause resigns first responder, hiding the tool picker")
+        XCTAssertEqual(firstPaused, firstBefore, "N1: a pause resigns first responder, disabling the toolbar")
         XCTAssertEqual(insetsPaused, insetsBefore, "N1: a pause changes content insets")
         controller.tearDown()
         window.isHidden = true
@@ -86,7 +89,7 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        let picker = try XCTUnwrap(controller.drawingToolPicker)
+        let store = try XCTUnwrap(controller.drawingToolStore)
         canvas.setZoomScale(
             min(canvas.minimumZoomScale * 1.25, canvas.maximumZoomScale), animated: false
         )
@@ -96,8 +99,8 @@ final class NotebookControllerTests: XCTestCase {
         let indicatorInsets = canvas.verticalScrollIndicatorInsets
         let scale = canvas.zoomScale
         let initialDrawing = canvas.drawing
-        let pickerVisible = picker.isVisible
-        XCTAssertTrue(pickerVisible)
+        let toolbarAvailable = store.isToolbarAvailable
+        XCTAssertTrue(toolbarAvailable)
         XCTAssertTrue(canvas.isFirstResponder)
         for _ in 0..<20 {
             controller.setInputGate(.capacity)
@@ -106,7 +109,7 @@ final class NotebookControllerTests: XCTestCase {
             XCTAssertFalse(canvas.isDrawingEnabled)
             XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
             XCTAssertNotNil(canvas.undoManager)
-            XCTAssertEqual(picker.isVisible, pickerVisible)
+            XCTAssertEqual(store.isToolbarAvailable, toolbarAvailable)
             XCTAssertEqual(canvas.contentInset, insets)
             XCTAssertEqual(canvas.verticalScrollIndicatorInsets, indicatorInsets)
             XCTAssertEqual(canvas.contentOffset, offset)
@@ -115,7 +118,7 @@ final class NotebookControllerTests: XCTestCase {
             controller.setInputGate(.open)
             XCTAssertTrue(canvas.isFirstResponder)
             XCTAssertTrue(canvas.isDrawingEnabled)
-            XCTAssertEqual(picker.isVisible, pickerVisible)
+            XCTAssertEqual(store.isToolbarAvailable, toolbarAvailable)
             XCTAssertEqual(canvas.contentInset, insets)
             XCTAssertEqual(canvas.verticalScrollIndicatorInsets, indicatorInsets)
             XCTAssertEqual(canvas.contentOffset, offset)
@@ -127,26 +130,27 @@ final class NotebookControllerTests: XCTestCase {
 
     func testNativeToolChoicesDuringCapacityCannotReenableMutation() async throws {
         let drawing = PKDrawing(strokes: [NotebookTestFixtures.stroke()])
-        let controller = NotebookViewController(pageCount: 3, initialDrawing: drawing)
+        let controller = NotebookViewController(
+            pageCount: 3, initialDrawing: drawing, toolStore: NotebookTestFixtures.toolStore()
+        )
         let window = try await present(controller)
         defer {
             controller.tearDown()
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        let picker = try XCTUnwrap(controller.drawingToolPicker)
-        let originalTool = picker.selectedToolItem
+        let store = try XCTUnwrap(controller.drawingToolStore)
+        let originalTool = store.tool.kind
         let initialDrawing = canvas.drawing
-        let tools = picker.toolItems.filter {
-            $0 is PKToolPickerInkingItem || $0 is PKToolPickerEraserItem || $0 is PKToolPickerLassoItem
-        }
-        XCTAssertTrue(tools.contains { $0 is PKToolPickerInkingItem })
-        XCTAssertTrue(tools.contains { $0 is PKToolPickerEraserItem })
-        XCTAssertTrue(tools.contains { $0 is PKToolPickerLassoItem })
+        let tools: [EditorToolKind] = EditorInkFamily.allCases.map { .ink($0) } + [.eraser(.vector), .eraser(.bitmap), .lasso]
+        // Start away from the first choice so every selection below is a real change.
+        store.update { $0.select(.lasso) }
         controller.setInputGate(.capacity)
-        for item in tools {
-            picker.selectedToolItem = item
+        for kind in tools {
+            store.update { $0.select(kind) }
             await Task.yield()
+            XCTAssertEqual(store.tool.kind, kind)
+            assertCanvasTool(canvas, is: kind, "a capacity pause still delivers the chosen native tool")
             XCTAssertEqual(controller.inputGate, .capacity)
             XCTAssertTrue(canvas.isFirstResponder)
             XCTAssertFalse(canvas.isDrawingEnabled)
@@ -168,7 +172,7 @@ final class NotebookControllerTests: XCTestCase {
             XCTAssertEqual(canvas.drawing, initialDrawing)
             XCTAssertEqual(canvas.drawing.strokes.map(\.id), drawing.strokes.map(\.id))
         }
-        picker.selectedToolItem = originalTool
+        store.update { $0.select(originalTool) }
         await Task.yield()
         controller.setInputGate(.open)
         XCTAssertTrue(canvas.isFirstResponder)
@@ -182,14 +186,10 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(canvas.isDrawingEnabled)
     }
 
-    func testNativeCustomItemDrawingRequestSurvivesCapacityResume() async throws {
-        let pen = PKToolPickerInkingItem(type: .pen, color: .black, width: 3, identifier: "test.pen")
-        var configuration = PKToolPickerCustomItem.Configuration(identifier: "test.inspect", name: "Inspect")
-        configuration.imageProvider = { _ in UIImage(systemName: "hand.draw")! }
-        let custom = PKToolPickerCustomItem(configuration: configuration)
-        let picker = PKToolPicker(toolItems: [pen, custom])
+    func testCanvasDrawingPauseRequestSurvivesToolChoicesAndCapacityResume() async throws {
+        let store = NotebookTestFixtures.toolStore()
         let controller = NotebookViewController(
-            pageCount: 3, initialDrawing: PKDrawing(), toolPicker: picker
+            pageCount: 3, initialDrawing: PKDrawing(), toolStore: store
         )
         let window = try await present(controller)
         let canvas = controller.canvasView
@@ -198,19 +198,25 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         controller.setInputGate(.capacity)
-        picker.selectedToolItem = pen
-        await Task.yield()
+        canvas.isDrawingEnabled = false
+        store.update { $0.select(.lasso) }
+        XCTAssertTrue(canvas.tool is PKLassoTool)
         XCTAssertFalse(canvas.isDrawingEnabled)
-        picker.selectedToolItem = custom
-        await Task.yield()
+        store.update { $0.isRulerActive = true }
+        XCTAssertTrue(canvas.isRulerActive)
+        XCTAssertFalse(canvas.isDrawingEnabled)
+        store.update { $0.select(.ink(.marker)) }
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .marker)
         XCTAssertFalse(canvas.isDrawingEnabled)
         controller.setInputGate(.open)
-        XCTAssertFalse(canvas.isDrawingEnabled)
+        XCTAssertFalse(canvas.isDrawingEnabled, "reopening the gate must not override a requested drawing pause")
         XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertTrue(canvas.isFirstResponder)
+        store.update { $0.select(.ink(.pen)) }
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen)
+        XCTAssertFalse(canvas.isDrawingEnabled, "a tool choice must not override a requested drawing pause")
         controller.setInputGate(.capacity)
-        picker.selectedToolItem = pen
-        await Task.yield()
+        canvas.isDrawingEnabled = true
         XCTAssertFalse(canvas.isDrawingEnabled)
         controller.setInputGate(.open)
         XCTAssertTrue(canvas.isDrawingEnabled)
@@ -251,7 +257,7 @@ final class NotebookControllerTests: XCTestCase {
             controller.setInputGate(gate)
             controller.setInputGate(gate)
             XCTAssertFalse(controller.canvasView.isFirstResponder)
-            XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+            XCTAssertFalse(controller.drawingToolStore?.isToolbarAvailable == true)
             XCTAssertFalse(controller.canvasView.isDrawingEnabled)
             XCTAssertTrue(controller.canvasView.panGestureRecognizer.isEnabled)
             XCTAssertTrue(controller.canvasView.pinchGestureRecognizer?.isEnabled == true)
@@ -261,13 +267,13 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(controller.canvasView.isFirstResponder)
         controller.setInputGate(.recovering)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
-        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertFalse(controller.drawingToolStore?.isToolbarAvailable == true)
         XCTAssertFalse(controller.canvasView.isDrawingEnabled)
         XCTAssertTrue(controller.canvasView.becomeFirstResponder())
         XCTAssertTrue(controller.canvasView.isFirstResponder)
         controller.setInputGate(.recovering)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
-        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertFalse(controller.drawingToolStore?.isToolbarAvailable == true)
         XCTAssertFalse(controller.canvasView.isDrawingEnabled)
     }
 
@@ -305,13 +311,13 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(canvas.isDrawingEnabled)
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertTrue(canvas.isFirstResponder)
-        XCTAssertTrue(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertTrue(controller.drawingToolStore?.isToolbarAvailable == false)
         controller.canvasViewDidEndUsingTool(canvas)
         XCTAssertFalse(canvas.isDrawingEnabled)
         XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
         XCTAssertEqual(observations.count, 2)
         XCTAssertFalse(canvas.isFirstResponder)
-        XCTAssertFalse(controller.drawingToolPicker?.isVisible == true)
+        XCTAssertFalse(controller.drawingToolStore?.isToolbarAvailable == true)
         controller.tearDown()
         XCTAssertEqual(observations.count, 2)
     }
@@ -355,24 +361,740 @@ final class NotebookControllerTests: XCTestCase {
         if let metrics { print("NOTTY_BARRIER_METRIC \(String(decoding: metrics, as: UTF8.self))") }
     }
 
-    private func present(_ controller: NotebookViewController) async throws -> UIWindow {
-        let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+    func testToolChangeDuringActiveStrokeAppliesAfterTheStrokeEnds() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        store.update { $0.select(.ink(.marker)) }
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, "the stroke in progress keeps its tool")
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .marker)
+    }
+
+    func testRetiredControllerIgnoresLaterToolChanges() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let first = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let firstWindow = try await present(first)
+        let second = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let secondWindow = try await present(second)
+        defer {
+            first.tearDown()
+            second.tearDown()
+            firstWindow.isHidden = true
+            secondWindow.isHidden = true
+        }
+        XCTAssertFalse(store.belongs(to: first))
+        XCTAssertTrue(store.belongs(to: second))
+        store.update { $0.select(.lasso) }
+        XCTAssertTrue(second.canvasView.tool is PKLassoTool)
+        XCTAssertFalse(first.canvasView.tool is PKLassoTool)
+        first.applyTool(store.tool)
+        XCTAssertFalse(first.canvasView.tool is PKLassoTool, "a retired controller never takes a later tool")
+    }
+
+    func testStoredToolRestoresOnFirstAcquire() async throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        var stored = EditorToolState.standard
+        stored.select(.ink(.marker))
+        stored.widthStep = .bold
+        defaults.set(stored.encoded(), forKey: "notty.editor.tool." + suite)
+        let store = NotebookSceneToolStore(identifier: suite, defaults: defaults)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let tool = try XCTUnwrap(controller.canvasView.tool as? PKInkingTool)
+        let expected = try XCTUnwrap(stored.nativeTool as? PKInkingTool)
+        XCTAssertEqual(tool.inkType, .marker)
+        XCTAssertEqual(tool.width, expected.width, accuracy: 0.001)
+    }
+
+    func testCorruptStoredToolAndToolbarOpenWithDefaults() async throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set(Data("not a tool".utf8), forKey: "notty.editor.tool." + suite)
+        defaults.set(Data("not a toolbar".utf8), forKey: NotebookSceneToolStore.toolbarDefaultsKey)
+        let store = NotebookSceneToolStore(identifier: suite, defaults: defaults)
+        XCTAssertEqual(store.tool, .standard)
+        XCTAssertEqual(store.toolbar, .standard)
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(store: store)
+        defer { fixture.close() }
+        let controller = fixture.controller
+        XCTAssertTrue(controller.isCanvasVisible)
+        XCTAssertTrue(store.isToolbarAvailable)
+        XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, EditorToolState.standard.inkFamily?.inkType)
+        let band = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular).dockBandHeight
+        XCTAssertEqual(fixture.canvasFrame.minY, band, accuracy: 0.5, "the toolbar falls back to the standard dock above the canvas")
+        XCTAssertEqual(fixture.canvasFrame.maxY, fixture.host.bounds.maxY, accuracy: 0.5)
+    }
+
+    func testCorruptLastToolSeedsANewSceneWithDefaults() throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set(Data("not a tool".utf8), forKey: NotebookSceneToolStore.lastToolDefaultsKey)
+        let store = NotebookSceneToolStore(identifier: UUID().uuidString, defaults: defaults)
+        XCTAssertEqual(store.tool, .standard)
+        XCTAssertEqual(store.toolbar, .standard)
+    }
+
+    func testToolChoiceIsStoredForTheSceneAndSeedsNewScenes() throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(CountingDefaults(suiteName: suite))
+        let store = NotebookSceneToolStore(identifier: "scene-a", defaults: defaults)
+        store.update { state in
+            state.select(.ink(.marker))
+            state.widthStep = .bold
+            state.isRulerActive = true
+        }
+        store.update { $0.select(.ink(.marker)) }
+        XCTAssertEqual(defaults.writes[store.toolDefaultsKey], 1, "an unchanged choice is not written again")
+        XCTAssertEqual(defaults.writes[NotebookSceneToolStore.lastToolDefaultsKey], 1)
+        // The Pencil's return-to-previous-tool history lasts only for the session; the rest is stored.
+        let stored = EditorToolState.decode(store.tool.encoded())
+        XCTAssertEqual(stored.kind, .ink(.marker))
+        XCTAssertEqual(stored.widthStep, .bold)
+        XCTAssertTrue(stored.isRulerActive)
+        XCTAssertEqual(EditorToolState.decode(defaults.data(forKey: store.toolDefaultsKey)), stored)
+        XCTAssertEqual(EditorToolState.decode(defaults.data(forKey: NotebookSceneToolStore.lastToolDefaultsKey)), stored)
+
+        let reopened = NotebookSceneToolStore(identifier: "scene-a", defaults: defaults)
+        XCTAssertEqual(reopened.tool, stored)
+        let newScene = NotebookSceneToolStore(identifier: "scene-b", defaults: defaults)
+        XCTAssertEqual(newScene.tool, stored, "a scene with no stored tool starts from the last choice")
+        XCTAssertNil(defaults.data(forKey: newScene.toolDefaultsKey))
+
+        newScene.update { $0.select(.lasso) }
+        XCTAssertEqual(NotebookSceneToolStore(identifier: "scene-a", defaults: defaults).tool, stored)
+        XCTAssertEqual(NotebookSceneToolStore(identifier: "scene-c", defaults: defaults).tool.kind, .lasso)
+    }
+
+    func testSettledToolbarDragIsStoredExactlyOnce() throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(CountingDefaults(suiteName: suite))
+        let store = NotebookSceneToolStore(identifier: suite, defaults: defaults)
+        let owner = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        store.attach(owner)
+        store.setToolbarAvailable(true, for: owner)
+        let actions = NotebookToolbarActions(store: store)
+        let resolver = NotebookToolbarDragResolver(
+            placement: store.toolbar.placement, size: CGSize(width: 480, height: 60),
+            usable: CGRect(x: 0, y: 0, width: 1_024, height: 1_200)
         )
-        let window = UIWindow(windowScene: scene)
+        let session = NotebookToolbarDragSession()
+        let translation = CGSize(width: -120, height: 640)
+        for step in 1...10 {
+            let fraction = CGFloat(step) / 10
+            session.move(
+                to: CGSize(width: translation.width * fraction, height: translation.height * fraction),
+                resolver: resolver
+            )
+        }
+        XCTAssertNil(defaults.writes[NotebookSceneToolStore.toolbarDefaultsKey], "moves only update the preview")
+        let placement = try XCTUnwrap(session.end(at: translation, resolver: resolver, actions: actions))
+        guard case .floating = placement else { return XCTFail("A drag into the page floats the toolbar.") }
+        // SwiftUI may deliver the end again through the gesture's own resolver after the session resets.
+        XCTAssertEqual(session.end(at: translation, resolver: resolver, actions: actions), placement)
+
+        XCTAssertEqual(defaults.writes[NotebookSceneToolStore.toolbarDefaultsKey], 1)
+        XCTAssertEqual(
+            EditorToolbarPreferences.decode(defaults.data(forKey: NotebookSceneToolStore.toolbarDefaultsKey)),
+            store.toolbar
+        )
+        XCTAssertEqual(NotebookSceneToolStore(identifier: UUID().uuidString, defaults: defaults).toolbar.placement, placement)
+        owner.tearDown()
+    }
+
+    func testPruningStoredToolsKeepsOpenScenesAndTheLastChoice() throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let tool = EditorToolState.standard.encoded()
+        for key in ["notty.editor.tool.open", "notty.editor.tool.discarded", NotebookSceneToolStore.lastToolDefaultsKey] {
+            defaults.set(tool, forKey: key)
+        }
+        defaults.set(Data([1]), forKey: NotebookSceneToolStore.toolbarDefaultsKey)
+        defaults.set("kept", forKey: "notty.editor.toolbox")
+        NotebookSceneToolStore.pruneStoredTools(in: defaults, keepingSessions: ["open"])
+        XCTAssertNotNil(defaults.data(forKey: "notty.editor.tool.open"))
+        XCTAssertNil(defaults.object(forKey: "notty.editor.tool.discarded"))
+        XCTAssertNotNil(defaults.data(forKey: NotebookSceneToolStore.lastToolDefaultsKey))
+        XCTAssertNotNil(defaults.data(forKey: NotebookSceneToolStore.toolbarDefaultsKey))
+        XCTAssertEqual(defaults.string(forKey: "notty.editor.toolbox"), "kept")
+    }
+
+    func testAttachAndDetachPublishOnlyRealChanges() {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        let changes = ChangeCounter(store)
+        let activity = ChangeCounter(store.activity)
+        store.attach(controller)
+        store.detach(controller)
+        XCTAssertEqual(changes.count, 0, "an unavailable toolbar stays unavailable without a change notification")
+        XCTAssertEqual(activity.count, 0)
+        store.attach(controller)
+        store.setToolbarAvailable(true, for: controller)
+        XCTAssertEqual(changes.count, 1)
+        store.setToolActive(true, for: controller)
+        XCTAssertEqual(changes.count, 1, "a pen going down never invalidates the views that show the tools")
+        XCTAssertEqual(activity.count, 1)
+        store.setToolActive(false, for: controller)
+        store.setToolActive(true, for: controller)
+        XCTAssertEqual(changes.count, 1, "nor does a pen coming up")
+        XCTAssertEqual(activity.count, 3)
+        store.detach(controller)
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(activity.count, 4)
+        XCTAssertFalse(store.isToolbarAvailable)
+        XCTAssertFalse(store.isToolActive)
+        store.detach(controller)
+        store.attach(controller)
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(activity.count, 4)
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 80, right: 0))
+        XCTAssertEqual(changes.count, 2, "the obstruction goes to the canvas, not to the toolbar's views")
+        controller.tearDown()
+    }
+
+    func testCanvasResolvesLightAppearanceInADarkWindow() async throws {
+        let controller = NotebookViewController(
+            pageCount: 3, initialDrawing: PKDrawing(), toolStore: NotebookTestFixtures.toolStore()
+        )
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        window.overrideUserInterfaceStyle = .dark
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(controller.canvasView.traitCollection.userInterfaceStyle, .light)
+    }
+
+    func testPresetChangesOnlySubsequentInk() async throws {
+        let existing = NotebookTestFixtures.stroke()
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(
+            pageCount: 3, initialDrawing: PKDrawing(strokes: [existing]), toolStore: store
+        )
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let preset = try XCTUnwrap(EditorInkCatalog.presets.first { $0.family == .fountainPen })
+        store.update { $0.apply(preset) }
+        XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, .fountainPen)
+        let stroke = try XCTUnwrap(controller.canvasView.drawing.strokes.first)
+        XCTAssertEqual(stroke.ink.inkType, existing.ink.inkType)
+        XCTAssertEqual(stroke.ink.color, existing.ink.color)
+        XCTAssertEqual(controller.canvasView.drawing.strokes.map(\.id), [existing.id])
+    }
+
+    func testEditingCanvasInstallsOnePencilInteractionUntilTearDown() async throws {
+        let controller = NotebookViewController(
+            pageCount: 3, initialDrawing: PKDrawing(), toolStore: NotebookTestFixtures.toolStore()
+        )
+        let window = try await present(controller)
+        defer { window.isHidden = true }
+        let interactions = pencilInteractions(on: controller.canvasView)
+        XCTAssertEqual(interactions.count, 1)
+        XCTAssertTrue(interactions.first?.delegate === controller)
+        controller.tearDown()
+        XCTAssertTrue(pencilInteractions(on: controller.canvasView).isEmpty)
+    }
+
+    func testCanvasLoadedAfterTearDownInstallsNoPencilInteraction() {
+        let controller = NotebookViewController(
+            pageCount: 3,
+            initialDrawing: PKDrawing(),
+            toolStore: NotebookTestFixtures.toolStore()
+        )
+        controller.tearDown()
+        controller.loadViewIfNeeded()
+        XCTAssertTrue(pencilInteractions(on: controller.canvasView).isEmpty)
+    }
+
+    func testReadOnlyCanvasInstallsNoPencilInteraction() {
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        controller.loadViewIfNeeded()
+        controller.view.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+        controller.view.layoutIfNeeded()
+        XCTAssertTrue(pencilInteractions(on: controller.canvasView).isEmpty)
+        controller.tearDown()
+    }
+
+    func testPencilSwitchEraserTogglesBetweenEraserAndInk() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let ink = store.tool.kind
+        controller.handlePencilPreference(.switchEraser)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertTrue(canvas.tool is PKEraserTool)
+        controller.handlePencilPreference(.switchEraser)
+        XCTAssertEqual(store.tool.kind, ink)
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen)
+    }
+
+    func testPencilGestureDuringCapacityChangesToolButKeepsDrawingPaused() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        controller.setInputGate(.capacity)
+        XCTAssertTrue(store.isToolbarAvailable)
+        controller.handlePencilPreference(.switchEraser)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertTrue(canvas.tool is PKEraserTool)
+        XCTAssertFalse(canvas.isDrawingEnabled)
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(controller.inputGate, .capacity)
+    }
+
+    func testPencilGestureIsIgnoredWhileSuppressedOrPaused() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let tool = store.tool
+        let reveals = store.revealRequest
+
+        controller.setPaletteSuppressed(true)
+        XCTAssertFalse(store.isToolbarAvailable)
+        controller.handlePencilPreference(.switchEraser)
+        controller.handlePencilPreference(.showColorPalette)
+        XCTAssertEqual(store.tool, tool)
+        XCTAssertEqual(store.revealRequest, reveals)
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen)
+        controller.setPaletteSuppressed(false)
+
+        for gate in [NotebookInputGate.failed, .recovering, .readOnly] {
+            controller.setInputGate(.open)
+            XCTAssertTrue(store.isToolbarAvailable)
+            controller.setInputGate(gate)
+            XCTAssertFalse(store.isToolbarAvailable)
+            controller.handlePencilPreference(.switchEraser)
+            controller.handlePencilPreference(.showContextualPalette)
+            XCTAssertEqual(store.tool, tool, "\(gate)")
+            XCTAssertEqual(store.revealRequest, reveals, "\(gate)")
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, "\(gate)")
+        }
+    }
+
+    func testGateClosingDuringAStrokeWithdrawsToolChoicesAtOnceButKeepsTheResponder() async throws {
+        let closures: [(String, (NotebookViewController) -> Void)] = [
+            ("failed", { $0.setInputGate(.failed) }),
+            ("recovering", { $0.setInputGate(.recovering) }),
+            ("readOnly", { $0.setInputGate(.readOnly) }),
+            ("suppressed", { $0.setPaletteSuppressed(true) })
+        ]
+        for (name, close) in closures {
+            let store = NotebookTestFixtures.toolStore()
+            let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+            let window = try await present(controller)
+            let canvas = controller.canvasView
+            let tool = store.tool
+            let reveals = store.revealRequest
+            controller.canvasViewDidBeginUsingTool(canvas)
+            close(controller)
+            XCTAssertFalse(store.isToolbarAvailable, name)
+            XCTAssertTrue(canvas.isFirstResponder, name)
+            controller.handlePencilPreference(.switchEraser)
+            controller.handlePencilPreference(.showColorPalette)
+            store.handlePencil(.switchEraser, from: controller)
+            XCTAssertTrue(canvas.isFirstResponder, name)
+            controller.canvasViewDidEndUsingTool(canvas)
+            XCTAssertFalse(canvas.isFirstResponder, name)
+            XCTAssertFalse(store.isToolbarAvailable, name)
+            XCTAssertEqual(store.tool, tool, name)
+            XCTAssertEqual(store.revealRequest, reveals, name)
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, name)
+            controller.tearDown()
+            window.isHidden = true
+        }
+    }
+
+    func testPencilGestureActsAgainOnceTheGateReopens() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let reopenings: [(String, () -> Void, () -> Void)] = [
+            ("suppressed", { controller.setPaletteSuppressed(true) }, { controller.setPaletteSuppressed(false) }),
+            ("failed", { controller.setInputGate(.failed) }, { controller.setInputGate(.open) }),
+            ("recovering", { controller.setInputGate(.recovering) }, { controller.setInputGate(.open) }),
+            ("readOnly", { controller.setInputGate(.readOnly) }, { controller.setInputGate(.open) })
+        ]
+        for (name, close, reopen) in reopenings {
+            close()
+            controller.handlePencilPreference(.switchEraser)
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, name)
+            reopen()
+            controller.handlePencilPreference(.switchEraser)
+            XCTAssertTrue(canvas.tool is PKEraserTool, name)
+            controller.handlePencilPreference(.switchEraser)
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, name)
+
+            controller.canvasViewDidBeginUsingTool(canvas)
+            close()
+            reopen()
+            XCTAssertFalse(store.isToolbarAvailable, "\(name): restored only when the stroke ends")
+            controller.canvasViewDidEndUsingTool(canvas)
+            XCTAssertTrue(store.isToolbarAvailable, name)
+            XCTAssertTrue(canvas.isFirstResponder, name)
+            controller.handlePencilPreference(.switchEraser)
+            XCTAssertTrue(canvas.tool is PKEraserTool, name)
+            controller.handlePencilPreference(.switchEraser)
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, name)
+        }
+    }
+
+    func testRetiredControllerPencilGestureLeavesTheReplacementUntouched() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let retired = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let retiredWindow = try await present(retired)
+        let replacement = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(replacement)
+        defer {
+            retired.tearDown()
+            replacement.tearDown()
+            retiredWindow.isHidden = true
+            window.isHidden = true
+        }
+        XCTAssertTrue(pencilInteractions(on: retired.canvasView).isEmpty)
+        XCTAssertEqual(pencilInteractions(on: replacement.canvasView).count, 1)
+        let tool = store.tool
+        retired.handlePencilPreference(.switchEraser)
+        XCTAssertEqual(store.tool, tool)
+        XCTAssertEqual((replacement.canvasView.tool as? PKInkingTool)?.inkType, .pen)
+        replacement.handlePencilPreference(.switchEraser)
+        XCTAssertTrue(replacement.canvasView.tool is PKEraserTool)
+    }
+
+    func testPencilGestureAfterTearDownChangesNothing() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer { window.isHidden = true }
+        let tool = store.tool
+        let reveals = store.revealRequest
+        controller.tearDown()
+        controller.handlePencilPreference(.switchEraser)
+        controller.handlePencilPreference(.showInkAttributes)
+        XCTAssertEqual(store.tool, tool)
+        XCTAssertEqual(store.revealRequest, reveals)
+        XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, .pen)
+    }
+
+    func testPencilGestureDuringActiveStrokeAppliesAfterTheStrokeEnds() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.handlePencilPreference(.switchEraser)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .pen, "the stroke in progress keeps its tool")
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertTrue(canvas.tool is PKEraserTool)
+    }
+
+    func testPencilRevealPreferencesRequestToolsWithoutChangingTheTool() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let tool = store.tool
+        var reveals = store.revealRequest
+        for preference in [EditorPencilTapPreference.showColorPalette, .showInkAttributes, .showContextualPalette] {
+            controller.handlePencilPreference(preference)
+            XCTAssertEqual(store.revealRequest, reveals + 1, "\(preference)")
+            XCTAssertEqual(store.tool, tool, "\(preference)")
+            reveals = store.revealRequest
+        }
+        for preference in [EditorPencilTapPreference.ignore, .runSystemShortcut] {
+            controller.handlePencilPreference(preference)
+            XCTAssertEqual(store.revealRequest, reveals, "\(preference)")
+            XCTAssertEqual(store.tool, tool, "\(preference)")
+        }
+        XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, .pen)
+    }
+
+    func testPencilPreferredActionsMapToEditorPreferences() throws {
+        let expected: [(UIPencilPreferredAction, EditorPencilTapPreference)] = [
+            (.ignore, .ignore),
+            (.switchEraser, .switchEraser),
+            (.switchPrevious, .switchPrevious),
+            (.showColorPalette, .showColorPalette),
+            (.showInkAttributes, .showInkAttributes),
+            (.showContextualPalette, .showContextualPalette),
+            (.runSystemShortcut, .runSystemShortcut)
+        ]
+        for (action, preference) in expected {
+            XCTAssertEqual(EditorPencilTapPreference(action), preference, "\(action.rawValue)")
+        }
+        let future = try XCTUnwrap(UIPencilPreferredAction(rawValue: 99))
+        XCTAssertEqual(EditorPencilTapPreference(future), .ignore)
+    }
+
+    func testPencilSqueezeActsOnlyWhenItEnds() {
+        for phase in [UIPencilInteraction.Phase.began, .changed, .cancelled] {
+            XCTAssertNil(NotebookViewController.squeezePreference(for: phase), "\(phase.rawValue)")
+        }
+        XCTAssertNotNil(NotebookViewController.squeezePreference(for: .ended), "a completed squeeze acts")
+    }
+
+    func testOwningCanvasPublishesToolUseUntilTheStrokeEnds() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        XCTAssertFalse(store.isToolActive)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        XCTAssertTrue(store.isToolActive)
+        controller.setInputGate(.capacity)
+        XCTAssertTrue(store.isToolActive, "a pause does not end the stroke in progress")
+        controller.setInputGate(.open)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertFalse(store.isToolActive)
+
+        let outsider = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        store.setToolActive(true, for: outsider)
+        XCTAssertFalse(store.isToolActive, "only the owning canvas reports tool use")
+        outsider.tearDown()
+    }
+
+    func testToolUseEndsWhenTheCanvasDisappearsOrIsTornDown() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        controller.canvasViewDidBeginUsingTool(controller.canvasView)
+        XCTAssertTrue(store.isToolActive)
+        controller.beginAppearanceTransition(false, animated: false)
+        controller.endAppearanceTransition()
+        XCTAssertFalse(store.isToolActive)
+
+        let replacement = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let replacementWindow = try await present(replacement)
+        defer {
+            replacement.tearDown()
+            replacementWindow.isHidden = true
+        }
+        replacement.canvasViewDidBeginUsingTool(replacement.canvasView)
+        XCTAssertTrue(store.isToolActive)
+        replacement.tearDown()
+        XCTAssertFalse(store.isToolActive)
+    }
+
+    func testFloatingToolbarObstructionLetsThePageEndsScrollClearWithoutMovingThePage() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let horizontal = canvas.contentInset.left
+        canvas.setContentOffset(CGPoint(x: -horizontal, y: 400), animated: false)
+        let offset = canvas.contentOffset
+        let unobstructedEnd = maximumOffsetY(canvas)
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 300, bottom: 140, right: 0))
+        XCTAssertEqual(canvas.contentInset, UIEdgeInsets(top: 0, left: horizontal, bottom: 140, right: horizontal))
+        XCTAssertEqual(canvas.verticalScrollIndicatorInsets.bottom, 140)
+        XCTAssertEqual(canvas.contentOffset, offset, "reserving space never moves the visible page")
+        XCTAssertEqual(maximumOffsetY(canvas), unobstructedEnd + 140, accuracy: 0.5)
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 90, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 90)
+        XCTAssertEqual(canvas.contentInset.bottom, 0)
+        XCTAssertEqual(canvas.contentOffset, offset)
+        canvas.setContentOffset(CGPoint(x: -horizontal, y: -90), animated: false)
+        XCTAssertEqual(canvas.contentOffset.y, -90, "the top of the first page can scroll below the toolbar")
+
+        store.setOverlayObstruction(.zero)
+        XCTAssertEqual(canvas.contentInset, UIEdgeInsets(top: 0, left: horizontal, bottom: 0, right: horizontal))
+        XCTAssertEqual(canvas.contentOffset.y, 0, accuracy: 0.001, "an offset left outside the smaller range settles at its edge")
+        XCTAssertEqual(canvas.verticalScrollIndicatorInsets, .zero)
+    }
+
+    func testObstructionAtTheEndOfTheLastPageIsReleasedAfterTheStroke() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 140, right: 0))
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: maximumOffsetY(canvas)), animated: false)
+        let end = canvas.contentOffset
+        controller.canvasViewDidBeginUsingTool(canvas)
+        store.setOverlayObstruction(.zero)
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentInset.bottom, 140, "the space is held until the stroke ends")
+        XCTAssertEqual(canvas.contentOffset, end, "the page never moves under a stroke in progress")
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 200, right: 0))
+        XCTAssertEqual(canvas.contentInset.bottom, 200, "more space can be reserved at once")
+        XCTAssertEqual(canvas.contentOffset, end)
+        store.setOverlayObstruction(.zero)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(canvas.contentInset.bottom, 0)
+        XCTAssertEqual(canvas.contentOffset.y, maximumOffsetY(canvas), accuracy: 0.5, "the page settles at its new end")
+    }
+
+    func testCanvasAdoptsTheObstructionWhenItAcquiresTheStoreAndAcrossResizes() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 120, right: 0))
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        XCTAssertEqual(controller.canvasView.contentInset.bottom, 120)
+        window.frame = CGRect(x: 0, y: 0, width: 1_366, height: 1_024)
+        controller.view.frame = window.bounds
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(controller.canvasView.contentInset.bottom, 120)
+
+        let unowned = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing())
+        unowned.loadViewIfNeeded()
+        unowned.view.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+        unowned.view.layoutIfNeeded()
+        XCTAssertEqual(unowned.canvasView.contentInset.bottom, 0, "only the owning canvas reserves the toolbar's space")
+        unowned.tearDown()
+    }
+
+    func testPageRestingAtItsTopStaysThereWhenAFloatingToolbarFirstReservesSpace() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top, "a notebook opens at the top of its first page")
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 90, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 90)
+        XCTAssertEqual(canvas.contentOffset.y, -90, "the first lines move clear of a toolbar that arrives after opening")
+
+        controller.canvasViewDidBeginUsingTool(canvas)
+        store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentOffset.y, -90, "the page never moves under a stroke in progress")
+        controller.canvasViewDidEndUsingTool(canvas)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentOffset.y, 300, "a page scrolled away from its top stays where it is")
+    }
+
+    func testDockingAtTheTopOfThePageKeepsTheFirstLinesInView() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        defer { fixture.close() }
+        let canvas = fixture.controller.canvasView
+        let actions = NotebookToolbarActions(store: fixture.store)
+        let host = fixture.host
+        XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top)
+
+        for placement in [
+            EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.6)), .docked(.topLeading),
+            .floating(CGPoint(x: 0.5, y: 0)), .docked(.topCenter)
+        ] {
+            actions.place(placement)
+            let band = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
+                .dockBandHeight
+            try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (host.bounds.height - band)) < 0.5 }
+            for _ in 0..<5 {
+                try await Task.sleep(for: .milliseconds(20))
+                host.layoutIfNeeded()
+            }
+            XCTAssertEqual(
+                canvas.contentOffset.y, -canvas.contentInset.top, accuracy: 0.5,
+                "\(placement): the page stays at the top of its first page"
+            )
+        }
+    }
+
+    private func maximumOffsetY(_ canvas: PKCanvasView) -> CGFloat {
+        canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
+    }
+
+    private func assertCanvasTool(
+        _ canvas: PKCanvasView, is kind: EditorToolKind, _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        switch kind {
+        case let .ink(family):
+            XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, family.inkType, message, file: file, line: line)
+        case .eraser(.vector):
+            XCTAssertEqual((canvas.tool as? PKEraserTool)?.eraserType, .vector, message, file: file, line: line)
+        case .eraser(.bitmap):
+            XCTAssertEqual((canvas.tool as? PKEraserTool)?.eraserType, .bitmap, message, file: file, line: line)
+        case .lasso:
+            XCTAssertTrue(canvas.tool is PKLassoTool, message, file: file, line: line)
+        }
+    }
+
+    private func pencilInteractions(on canvas: PKCanvasView) -> [UIPencilInteraction] {
+        canvas.interactions.compactMap { $0 as? UIPencilInteraction }
+    }
+
+    private func present(_ controller: NotebookViewController) async throws -> UIWindow {
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
         do {
-            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while !controller.isCanvasVisible || controller.view.window !== window
-                || controller.drawingToolPicker?.isVisible != true || !controller.canvasView.isFirstResponder {
-                guard ContinuousClock.now < deadline else {
-                    XCTFail("The scene-backed canvas did not become visible and ready.")
-                    throw FixtureFailure.readiness
-                }
-                try await Task.sleep(for: .milliseconds(5))
+            try await NotebookTestFixtures.waitUntil {
+                controller.isCanvasVisible && controller.view.window === window
+                    && controller.drawingToolStore?.isToolbarAvailable == true && controller.canvasView.isFirstResponder
             }
         } catch {
             controller.tearDown()
@@ -382,6 +1104,27 @@ final class NotebookControllerTests: XCTestCase {
         }
         return window
     }
+}
 
-    private enum FixtureFailure: Error { case readiness }
+/// Counts the change notifications an observable object sends to the views observing it.
+@MainActor
+private final class ChangeCounter {
+    private(set) var count = 0
+    private var subscription: AnyCancellable?
+
+    init<Object: ObservableObject>(_ object: Object) where Object.ObjectWillChangePublisher == ObservableObjectPublisher {
+        subscription = object.objectWillChange.sink { [weak self] _ in
+            MainActor.assumeIsolated { self?.count += 1 }
+        }
+    }
+}
+
+/// Records how often each key is written, to tell one settled write from repeated ones.
+private final class CountingDefaults: UserDefaults, @unchecked Sendable {
+    private(set) var writes: [String: Int] = [:]
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        writes[defaultName, default: 0] += 1
+        super.set(value, forKey: defaultName)
+    }
 }

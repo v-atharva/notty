@@ -776,10 +776,9 @@ final class NotebookWritingStatusTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         await probe.setSuspendSave()
         let seed = session.makeCanvasSeed()
-        let picker = PKToolPicker()
-        picker.stateAutosaveName = nil
         let controller = NotebookViewController(
-            pageCount: seed.pageCount, initialDrawing: seed.drawing, toolPicker: picker
+            pageCount: seed.pageCount, initialDrawing: seed.drawing,
+            toolStore: NotebookTestFixtures.toolStore()
         )
         let window = makeWindow(controller)
         defer {
@@ -790,7 +789,7 @@ final class NotebookWritingStatusTests: XCTestCase {
         try await waitForUI {
             controller.isCanvasVisible
                 && controller.view.window?.windowScene != nil
-                && controller.drawingToolPicker != nil
+                && controller.drawingToolStore != nil
                 && controller.canvasView.isFirstResponder
         }
         // This fixture controls session states and exercises the real native command stack.
