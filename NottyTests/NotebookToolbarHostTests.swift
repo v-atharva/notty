@@ -397,6 +397,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let session = NotebookSession(notebookID: id, openStorage: { storage })
         let scene = try NotebookTestFixtures.windowScene()
         let owner = preserveSceneStore(for: scene)
+        owner.updateToolbar(.standard)
 
         let window = UIWindow(windowScene: scene)
         let hosting = UIHostingController(rootView: NotebookScreen(session: session))
@@ -447,7 +448,11 @@ final class NotebookToolbarHostTests: XCTestCase {
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 450), animated: false)
         try await NotebookTestFixtures.waitUntil { abs(paper.contentLayer.transform.m42 + 450) < 0.5 }
         XCTAssertFalse(NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view))
-        XCTAssertTrue(NotebookTestFixtures.hit(CGPoint(x: 30, y: bar.maxY + 4), in: window).isDescendant(of: canvas))
+        let exposedPoint = CGPoint(x: toolbar.midX, y: toolbar.maxY + 20)
+        let exposedHit = NotebookTestFixtures.hit(exposedPoint, in: window)
+        XCTAssertTrue(exposedHit.isDescendant(of: canvas), "Exposed paper hit: \(exposedHit)")
+        XCTAssertGreaterThanOrEqual(canvas.contentInset.top, toolbar.maxY - 0.5,
+            "Canvas: \(canvasFrame), host: \(hostArea), toolbar: \(toolbar), obstruction: \(owner.overlayObstruction)")
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
         try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= toolbar.maxY - 0.5 }
         XCTAssertEqual(canvas.drawing, drawing)
