@@ -188,11 +188,6 @@ struct NotebookToolbarComposition: Equatable {
         CGFloat(rowCount) * NotebookTheme.rowHeight + CGFloat(rowCount - 1) * NotebookTheme.rowSpacing
     }
 
-    /// Height of the leather band a docked toolbar sits in; the canvas gives up exactly this much.
-    var dockBandHeight: CGFloat {
-        isFloating ? 0 : expandedHeight + 2 * EditorToolbarLayout.margin
-    }
-
     /// The least distance a toolbar keeps between neighbouring docks, by paging its planned
     /// tools when the window is too narrow for them as well, so a move between docks is plain.
     static let minimumDockTravel: CGFloat = 150

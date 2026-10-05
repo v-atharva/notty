@@ -134,40 +134,36 @@ final class NotebookToolbarHostTests: XCTestCase {
         let size = CGSize(width: 600, height: 112)
         func toolbar(minY: CGFloat) -> CGRect { CGRect(origin: CGPoint(x: 200, y: minY), size: size) }
 
-        XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: toolbar(minY: 112), canvas: canvas, isFloating: false), .zero,
-            "A docked toolbar takes its band instead."
-        )
         let atTheBottom = toolbar(minY: canvas.maxY - 12 - size.height)
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: atTheBottom, canvas: canvas, isFloating: true),
+            NotebookToolbarObstruction.insets(toolbar: atTheBottom, canvas: canvas),
             UIEdgeInsets(top: 0, left: 0, bottom: canvas.maxY - atTheBottom.minY, right: 0)
         )
         let atTheTop = toolbar(minY: canvas.minY + 12)
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: atTheTop, canvas: canvas, isFloating: true),
+            NotebookToolbarObstruction.insets(toolbar: atTheTop, canvas: canvas),
             UIEdgeInsets(top: atTheTop.maxY - canvas.minY, left: 0, bottom: 0, right: 0)
         )
         let quarterDown = toolbar(minY: canvas.minY + canvas.height / 4 - size.height / 2)
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: quarterDown, canvas: canvas, isFloating: true), .zero,
+            NotebookToolbarObstruction.insets(toolbar: quarterDown, canvas: canvas), .zero,
             "The default floating position leaves the page where it opens."
         )
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: toolbar(minY: canvas.minY + size.height), canvas: canvas, isFloating: true),
+            NotebookToolbarObstruction.insets(toolbar: toolbar(minY: canvas.minY + size.height), canvas: canvas),
             .zero
         )
         let handle = CGRect(origin: CGPoint(x: 20, y: canvas.maxY - 12 - 44), size: NotebookTheme.collapsedHandleSize)
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: handle, canvas: canvas, isFloating: true).bottom,
+            NotebookToolbarObstruction.insets(toolbar: handle, canvas: canvas).bottom,
             canvas.maxY - handle.minY, "A collapsed handle at the edge reserves its own height."
         )
         XCTAssertEqual(
-            NotebookToolbarObstruction.insets(toolbar: toolbar(minY: 2_000), canvas: canvas, isFloating: true), .zero
+            NotebookToolbarObstruction.insets(toolbar: toolbar(minY: 2_000), canvas: canvas), .zero
         )
     }
 
-    // MARK: - Band and canvas
+    // MARK: - Overlay and canvas
 
     func testFloatingRestoreLaysTheContentOutOnceWhileTheSceneStoreResolves() async throws {
         let scene = try NotebookTestFixtures.windowScene()
@@ -190,7 +186,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         }
         try await settle(host)
 
-        XCTAssertEqual(probe.laidOutSizes, [host.bounds.size], "A floating restore never reserves a dock band first.")
+        XCTAssertEqual(probe.laidOutSizes, [host.bounds.size], "Restoring the toolbar never reserves space outside the canvas.")
     }
 
     func testDockChangeDuringAStrokeWaitsForTheStrokeToEnd() async throws {
@@ -200,8 +196,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let canvas = fixture.controller.canvasView
         let host = fixture.hosting.view!
         let actions = NotebookToolbarActions(store: store)
-        let docked = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
-        XCTAssertEqual(canvas.bounds.height, host.bounds.height - docked.dockBandHeight, accuracy: 0.5)
+        XCTAssertEqual(canvas.bounds.height, host.bounds.height, accuracy: 0.5)
 
         fixture.controller.canvasViewDidBeginUsingTool(canvas)
         XCTAssertTrue(store.isToolActive)
@@ -224,15 +219,14 @@ final class NotebookToolbarHostTests: XCTestCase {
         try await settle(host)
         XCTAssertEqual(canvas.bounds, floatingBounds)
         fixture.controller.canvasViewDidEndUsingTool(canvas)
-        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (host.bounds.height - docked.dockBandHeight)) < 0.5 }
-        XCTAssertEqual(fixture.canvasFrame.minY, docked.dockBandHeight, accuracy: 0.5)
+        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (host.bounds.height)) < 0.5 }
+        XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
 
-        // Floating to the bottom during a stroke: the held band still sits above the canvas,
-        // and the published obstruction is measured against the canvas where it actually is.
+        // Edge scroll space changes without moving the page under an active stroke.
         fixture.controller.canvasViewDidBeginUsingTool(canvas)
         XCTAssertTrue(actions.place(.floating(CGPoint(x: 0.5, y: 1))))
         try await NotebookTestFixtures.waitUntil { store.overlayObstruction.bottom > 0 }
-        XCTAssertEqual(fixture.canvasFrame.minY, docked.dockBandHeight, accuracy: 0.5)
+        XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
         let toolbar = toolbarFrame(for: store.toolbar, in: host.bounds)
         XCTAssertEqual(store.overlayObstruction.bottom, fixture.canvasFrame.maxY - toolbar.minY, accuracy: 0.5)
         fixture.controller.canvasViewDidEndUsingTool(canvas)
@@ -246,7 +240,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let canvas = fixture.controller.canvasView
         let host = fixture.hosting.view!
         let actions = NotebookToolbarActions(store: store)
-        XCTAssertEqual(store.overlayObstruction, .zero, "A docked toolbar takes a band instead of covering the canvas.")
+        try await NotebookTestFixtures.waitUntil { store.overlayObstruction.top > 0 }
 
         actions.place(.floating(CGPoint(x: 0.5, y: 1)))
         try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - host.bounds.height) < 0.5 && store.overlayObstruction.bottom > 0 }
@@ -269,7 +263,42 @@ final class NotebookToolbarHostTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { store.overlayObstruction.top > 0 }
         XCTAssertEqual(store.overlayObstruction.bottom, 0)
         actions.place(.docked(.topCenter))
-        try await NotebookTestFixtures.waitUntil { store.overlayObstruction == .zero && canvas.contentInset.top == 0 }
+        try await NotebookTestFixtures.waitUntil { store.overlayObstruction.top > 0 && canvas.contentInset.top > 0 }
+    }
+
+    func testEveryTopAnchorLetsPaperScrollBehindTheToolbarAndRevealItsFirstLines() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        defer { fixture.close() }
+        let canvas = fixture.controller.canvasView
+        let paper = fixture.controller.paperView
+        let actions = NotebookToolbarActions(store: fixture.store)
+        let host = fixture.host
+        XCTAssertEqual(canvas.contentOffset.y, 0, accuracy: 0.5, "Opening keeps paper beneath the overlay.")
+        var observations = 0
+        fixture.controller.onObservation = { _ in observations += 1; return .open }
+        let drawing = canvas.drawing
+
+        for dock in EditorToolbarDock.allCases {
+            actions.place(.docked(dock))
+            try await settle(host)
+            let toolbar = toolbarFrame(for: fixture.store.toolbar, in: host.bounds)
+            XCTAssertEqual(fixture.canvasFrame, host.bounds)
+            XCTAssertFalse(fixture.hit(toolbar.center).isDescendant(of: fixture.controller.view))
+            XCTAssertTrue(fixture.hit(CGPoint(x: toolbar.midX, y: toolbar.minY / 2)).isDescendant(of: canvas))
+
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 450), animated: false)
+            try await NotebookTestFixtures.waitUntil { abs(paper.contentLayer.position.y + 450) < 0.5 }
+            XCTAssertEqual(toolbarFrame(for: fixture.store.toolbar, in: host.bounds), toolbar)
+            XCTAssertFalse(fixture.hit(toolbar.center).isDescendant(of: fixture.controller.view))
+            XCTAssertEqual(canvas.contentOffset.y, 450, accuracy: 0.5)
+
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+            try await NotebookTestFixtures.waitUntil { paper.contentLayer.position.y >= toolbar.maxY - 0.5 }
+            XCTAssertGreaterThanOrEqual(paper.contentLayer.position.y, toolbar.maxY - 0.5,
+                "The first lines can be scrolled clear of every top anchor.")
+        }
+        XCTAssertEqual(canvas.drawing, drawing)
+        XCTAssertEqual(observations, 0)
     }
 
     // MARK: - Touches
@@ -293,10 +322,7 @@ final class NotebookToolbarHostTests: XCTestCase {
             .floating(CGPoint(x: 0.4, y: 0.6))
         ] {
             actions.place(placement)
-            try await NotebookTestFixtures.waitUntil {
-                let floating = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular).isFloating
-                return floating == (fixture.canvasFrame.minY < 0.5)
-            }
+            XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
             try await settle(host)
             let toolbar = toolbarFrame(for: store.toolbar, in: host.bounds)
             let grip = CGPoint(x: toolbar.minX + NotebookTheme.dragHandleHitSize.width / 2, y: toolbar.midY)
@@ -307,13 +333,8 @@ final class NotebookToolbarHostTests: XCTestCase {
             for point in [grip, toolRow, inkRow] {
                 XCTAssertFalse(fixture.hit(point).isDescendant(of: controller.view), "\(placement) \(point)")
             }
-            if isFloating(store) {
-                let belowTheToolbar = CGPoint(x: toolbar.midX, y: toolbar.maxY + 40)
-                XCTAssertTrue(fixture.hit(belowTheToolbar).isDescendant(of: controller.canvasView), "\(placement)")
-            } else {
-                let inTheBand = CGPoint(x: toolbar.midX, y: toolbar.maxY + EditorToolbarLayout.margin / 2)
-                XCTAssertFalse(fixture.hit(inTheBand).isDescendant(of: controller.view), "\(placement)")
-            }
+            let belowTheToolbar = CGPoint(x: toolbar.midX, y: toolbar.maxY + EditorToolbarLayout.margin / 2)
+            XCTAssertTrue(fixture.hit(belowTheToolbar).isDescendant(of: controller.canvasView), "\(placement)")
         }
 
         actions.setCollapsed(true)
@@ -322,7 +343,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertEqual(handle.size, NotebookTheme.collapsedHandleSize)
         XCTAssertFalse(fixture.hit(handle.center).isDescendant(of: controller.view), "The collapsed handle keeps its touches.")
 
-        XCTAssertEqual(observations, 0, "Resizing the canvas for the toolbar never reports a drawing change.")
+        XCTAssertEqual(observations, 0, "Moving the overlay never reports a drawing change.")
         XCTAssertEqual(controller.canvasView.drawing.dataRepresentation(), drawing.dataRepresentation())
     }
 
@@ -380,12 +401,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
         XCTAssertTrue(controller.drawingToolStore === owner, "The screen's canvas uses the scene's store.")
 
-        let composition = NotebookToolbarComposition(preferences: owner.toolbar, horizontalSizeClass: .regular)
-        let canvas = controller.view.convert(controller.view.bounds, to: window)
-        let hostArea = CGRect(
-            x: canvas.minX, y: canvas.minY - composition.dockBandHeight,
-            width: canvas.width, height: canvas.height + composition.dockBandHeight
-        )
+        let hostArea = controller.view.convert(controller.view.bounds, to: window)
         let toolbar = toolbarFrame(for: owner.toolbar, in: hostArea)
         try await NotebookTestFixtures.waitUntil {
             !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
@@ -434,10 +450,6 @@ final class NotebookToolbarHostTests: XCTestCase {
             owner.updateToolbar(toolbar)
         }
         return owner
-    }
-
-    private func isFloating(_ store: NotebookSceneToolStore) -> Bool {
-        NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular).isFloating
     }
 
     private func toolbarFrame(for preferences: EditorToolbarPreferences, in area: CGRect) -> CGRect {

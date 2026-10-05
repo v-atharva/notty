@@ -268,7 +268,6 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertTrue(composition.showsRevealHandle)
         XCTAssertFalse(composition.showsCollapseControl)
         XCTAssertEqual(composition.toolbarSize(forHostWidth: 900), NotebookTheme.collapsedHandleSize)
-        XCTAssertEqual(composition.dockBandHeight, 0)
     }
 
     func testDockedRestoreIsNeverCollapsed() throws {
@@ -279,7 +278,6 @@ final class NotebookToolbarTests: XCTestCase {
         let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
         XCTAssertFalse(composition.showsRevealHandle)
         XCTAssertFalse(composition.showsCollapseControl, "Docked toolbars never offer to collapse.")
-        XCTAssertGreaterThan(composition.dockBandHeight, 0)
 
         let (available, owner) = availableStore()
         defer { available.detach(owner) }
@@ -643,7 +641,6 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertEqual(regular.rowCount, 2)
         XCTAssertEqual(compact.rowCount, 1)
         XCTAssertLessThan(compact.expandedHeight, regular.expandedHeight)
-        XCTAssertEqual(regular.dockBandHeight, regular.expandedHeight + 2 * EditorToolbarLayout.margin)
         XCTAssertGreaterThanOrEqual(compact.expandedHeight, NotebookTheme.controlSize)
 
         let narrow = regular.toolbarSize(forHostWidth: 360)
@@ -692,17 +689,16 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Placement around the real canvas
 
-    func testDockedBandShrinksTheCanvasAndFloatingRestoresItWithoutMovingThePage() async throws {
+    func testEveryPlacementOverlaysTheFullCanvasWithoutMovingThePage() async throws {
         let fixture = try await NotebookTestFixtures.mountToolbarHost()
         defer { fixture.close() }
         let store = fixture.store
         let canvas = fixture.controller.canvasView
         let actions = NotebookToolbarActions(store: store)
-        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
         let hostHeight = fixture.hosting.view.bounds.height
         XCTAssertEqual(store.toolbar.placement, .docked(.topCenter))
-        XCTAssertEqual(canvas.bounds.height, hostHeight - composition.dockBandHeight, accuracy: 0.5)
-        XCTAssertEqual(fixture.canvasFrame.minY, composition.dockBandHeight, accuracy: 0.5)
+        XCTAssertEqual(canvas.bounds.height, hostHeight, accuracy: 0.5)
+        XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
 
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 900), animated: false)
         let centre = logicalCentre(canvas)
@@ -716,7 +712,7 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertEqual(logicalCentre(canvas).y, centre.y, accuracy: 0.5)
 
         actions.place(.docked(.topTrailing))
-        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (hostHeight - composition.dockBandHeight)) < 0.5 }
+        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (hostHeight)) < 0.5 }
         XCTAssertEqual(logicalCentre(canvas).y, centre.y, accuracy: 0.5)
         XCTAssertEqual(canvas.zoomScale, zoom, accuracy: 0.001)
         XCTAssertTrue(store.isToolbarAvailable)
@@ -832,8 +828,7 @@ final class NotebookToolbarTests: XCTestCase {
         try await settled { canvas.bounds.height }
         let dockedHeight = canvas.bounds.height
         actions.place(.floating(CGPoint(x: 0.5, y: 0.4)))
-        let band = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular).dockBandHeight
-        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (dockedHeight + band)) < 0.5 }
+        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - dockedHeight) < 0.5 }
 
         actions.select(.lasso)
         XCTAssertTrue(canvas.tool is PKLassoTool, "The scene toolbar drives the scene's canvas.")

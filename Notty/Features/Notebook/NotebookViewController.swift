@@ -187,14 +187,13 @@ final class NotebookViewController: UIViewController {
 
         let proposedOffset: CGPoint
         if hadViewport {
-            // A page resting at its top stays there, so a toolbar band appearing above it
-            // never hides the first lines; elsewhere the view keeps its centre.
+            // Preserve the leading scroll edge across a resize; elsewhere keep the page centre.
             proposedOffset = CGPoint(
                 x: logicalCenter.x * scale - newSize.width / 2,
                 y: restsAtTop ? -canvas.contentInset.top : logicalCenter.y * scale - newSize.height / 2
             )
         } else {
-            proposedOffset = CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top)
+            proposedOffset = CGPoint(x: -canvas.contentInset.left, y: 0)
         }
         canvas.setContentOffset(clampedOffset(proposedOffset), animated: false)
         previousViewportSize = newSize
@@ -523,8 +522,8 @@ final class NotebookViewController: UIViewController {
 
     private func updateInsets() {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
-        // A docked toolbar shrinks the canvas instead. A floating one overlays it, so the
-        // vertical edges it covers become extra scroll space; horizontally the page stays centred.
+        // Overlay edges add scroll range to reveal covered writing without moving the page.
+        // Horizontally the page stays centred.
         let obstruction = ownsToolStore ? toolStore?.overlayObstruction ?? .zero : .zero
         var top = max(obstruction.top, 0)
         var bottom = max(obstruction.bottom, 0)
@@ -537,11 +536,7 @@ final class NotebookViewController: UIViewController {
         let horizontalInset = max((canvas.bounds.width - logicalWidth * canvas.zoomScale) / 2, 0)
         let insets = UIEdgeInsets(top: top, left: horizontalInset, bottom: bottom, right: horizontalInset)
         if canvas.contentInset != insets {
-            let keepsTop = isAtTopOfPaper && !canvas.hasActiveTool && insets.top != canvas.contentInset.top
             canvas.contentInset = insets
-            if keepsTop {
-                canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -insets.top), animated: false)
-            }
         }
         let indicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
         if canvas.verticalScrollIndicatorInsets != indicatorInsets {
