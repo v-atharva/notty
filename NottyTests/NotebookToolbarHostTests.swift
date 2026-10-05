@@ -189,7 +189,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertEqual(probe.laidOutSizes, [host.bounds.size], "Restoring the toolbar never reserves space outside the canvas.")
     }
 
-    func testDockChangeDuringAStrokeWaitsForTheStrokeToEnd() async throws {
+    func testPlacementChangesDuringAStrokeKeepTheViewportStable() async throws {
         let fixture = try await NotebookTestFixtures.mountToolbarHost()
         defer { fixture.close() }
         let store = fixture.store
@@ -219,7 +219,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         try await settle(host)
         XCTAssertEqual(canvas.bounds, floatingBounds)
         fixture.controller.canvasViewDidEndUsingTool(canvas)
-        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (host.bounds.height)) < 0.5 }
+        try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - host.bounds.height) < 0.5 }
         XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
 
         // Edge scroll space changes without moving the page under an active stroke.
@@ -287,14 +287,14 @@ final class NotebookToolbarHostTests: XCTestCase {
             XCTAssertTrue(fixture.hit(CGPoint(x: toolbar.midX, y: toolbar.minY / 2)).isDescendant(of: canvas))
 
             canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 450), animated: false)
-            try await NotebookTestFixtures.waitUntil { abs(paper.contentLayer.position.y + 450) < 0.5 }
+            try await NotebookTestFixtures.waitUntil { abs(CATransform3DGetAffineTransform(paper.contentLayer.transform).ty + 450) < 0.5 }
             XCTAssertEqual(toolbarFrame(for: fixture.store.toolbar, in: host.bounds), toolbar)
             XCTAssertFalse(fixture.hit(toolbar.center).isDescendant(of: fixture.controller.view))
             XCTAssertEqual(canvas.contentOffset.y, 450, accuracy: 0.5)
 
             canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
-            try await NotebookTestFixtures.waitUntil { paper.contentLayer.position.y >= toolbar.maxY - 0.5 }
-            XCTAssertGreaterThanOrEqual(paper.contentLayer.position.y, toolbar.maxY - 0.5,
+            try await NotebookTestFixtures.waitUntil { CATransform3DGetAffineTransform(paper.contentLayer.transform).ty >= toolbar.maxY - 0.5 }
+            XCTAssertGreaterThanOrEqual(CATransform3DGetAffineTransform(paper.contentLayer.transform).ty, toolbar.maxY - 0.5,
                 "The first lines can be scrolled clear of every top anchor.")
         }
         XCTAssertEqual(canvas.drawing, drawing)
