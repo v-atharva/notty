@@ -163,6 +163,17 @@ final class NotebookToolbarHostTests: XCTestCase {
         )
     }
 
+    func testExpandedCanvasReservesHeaderAndHomeIndicatorPlusToolbarScrollRange() {
+        let canvas = CGRect(x: 0, y: -96, width: 500, height: 900)
+        let usable = CGRect(x: 0, y: 0, width: 500, height: 784)
+        let compact = CGRect(x: 12, y: 12, width: 450, height: 52)
+        XCTAssertEqual(NotebookToolbarObstruction.insets(toolbar: compact, canvas: canvas, usable: usable),
+            UIEdgeInsets(top: 160, left: 0, bottom: 20, right: 0))
+        let floating = compact.offsetBy(dx: 0, dy: 300)
+        XCTAssertEqual(NotebookToolbarObstruction.insets(toolbar: floating, canvas: canvas, usable: usable),
+            UIEdgeInsets(top: 96, left: 0, bottom: 20, right: 0))
+    }
+
     // MARK: - Overlay and canvas
 
     func testFloatingRestoreLaysTheContentOutOnceWhileTheSceneStoreResolves() async throws {
@@ -376,7 +387,15 @@ final class NotebookToolbarHostTests: XCTestCase {
 
     // MARK: - Production wiring
 
-    func testNotebookScreenSharesTheSceneStoreWithItsCanvasAndShowsLeatherBehindTheNavigationBar() async throws {
+    func testNotebookScreenFillsTheWindowWithScrollingPaperBeneathFloatingControls() async throws {
+        try await verifyFullScreenPaper(preloadsNotebook: true)
+    }
+
+    func testOpeningTransitionKeepsTheFullScreenPaperAndFloatingControlsUsable() async throws {
+        try await verifyFullScreenPaper(preloadsNotebook: false)
+    }
+
+    private func verifyFullScreenPaper(preloadsNotebook: Bool) async throws {
         let id = UUID()
         let root = NotebookTestFixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -384,44 +403,78 @@ final class NotebookToolbarHostTests: XCTestCase {
         let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
         let storage = await probe.storage(notebookID: id)
         let session = NotebookSession(notebookID: id, openStorage: { storage })
+        if preloadsNotebook { await session.load() }
         let scene = try NotebookTestFixtures.windowScene()
+        let previousKeyWindow = scene.keyWindow
         let owner = preserveSceneStore(for: scene)
+        owner.updateToolbar(.standard)
 
         let window = UIWindow(windowScene: scene)
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-        show(hosting, in: window)
+        let hosting = EdgePaperHostingController(rootView: NotebookScreen(session: session))
+        window.frame = scene.effectiveGeometry.coordinateSpace.bounds
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        hosting.view.layoutIfNeeded()
         defer {
             session.flush()
             close(window)
+            previousKeyWindow?.makeKey()
         }
         try await NotebookTestFixtures.waitUntil(seconds: 10) {
             guard let controller = NotebookTestFixtures.notebookController(in: hosting) else { return false }
-            return controller.isCanvasVisible && controller.canvasView.isFirstResponder && owner.isToolbarAvailable
+            return hosting.hasAppeared && controller.isCanvasVisible && controller.canvasView.isFirstResponder && owner.isToolbarAvailable
         }
+        try await settle(hosting.view)
         let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
         XCTAssertTrue(controller.drawingToolStore === owner, "The screen's canvas uses the scene's store.")
 
-        let hostArea = controller.view.convert(controller.view.bounds, to: window)
+        let navigationBar = try XCTUnwrap(NotebookTestFixtures.navigationController(in: hosting)?.navigationBar)
+        let bar = navigationBar.convert(navigationBar.bounds, to: window)
+        let canvasFrame = controller.view.convert(controller.view.bounds, to: window)
+        XCTAssertEqual(canvasFrame.minX, 0, accuracy: 0.5)
+        XCTAssertEqual(canvasFrame.minY, 0, accuracy: 0.5, "Paper reaches behind the navigation and status regions.")
+        XCTAssertEqual(canvasFrame.width, window.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(canvasFrame.maxY, window.bounds.maxY, accuracy: 0.5, "Paper reaches behind the home indicator.")
+        XCTAssertEqual(controller.canvasView.contentOffset.y, 0, accuracy: 0.5)
+        let hostArea = CGRect(x: 0, y: bar.maxY, width: window.bounds.width,
+            height: window.bounds.height - bar.maxY - window.safeAreaInsets.bottom)
         let toolbar = toolbarFrame(for: owner.toolbar, in: hostArea)
+        XCTAssertGreaterThan(toolbar.minY, bar.maxY)
         try await NotebookTestFixtures.waitUntil {
-            !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
+            let hit = NotebookTestFixtures.hit(toolbar.center, in: window)
+            return owner.overlayObstruction.top > 0 && hit !== window && hit !== hosting.view
+                && !hit.isDescendant(of: controller.view)
         }
 
+        XCTAssertEqual(controller.canvasView.contentOffset.y, 0, accuracy: 0.5,
+            "Publishing overlay scroll space leaves paper beneath the controls.")
         let family: EditorInkFamily = owner.tool.kind == .ink(.marker) ? .pencil : .marker
         NotebookToolbarActions(store: owner).select(.ink(family))
         XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, family.inkType)
 
-        let navigationBar = try XCTUnwrap(NotebookTestFixtures.navigationController(in: hosting)?.navigationBar)
-        let bar = navigationBar.convert(navigationBar.bounds, to: window)
         let rendered = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
         }
         let pixels = try RenderedPixels(try XCTUnwrap(rendered.cgImage), scale: rendered.scale)
-        // Between the wordmark and the title, where only the band backdrop shows.
+        // Between floating header controls, the writing paper shows through.
         let sample = pixels.rgba(at: CGPoint(x: bar.minX + bar.width * 0.3, y: bar.midY)).map { Double($0) / 255 }
         let luminance = 0.2126 * sample[0] + 0.7152 * sample[1] + 0.0722 * sample[2]
-        XCTAssertLessThan(luminance, 0.45, "Leather shows behind the navigation bar, not ivory.")
-        XCTAssertGreaterThan(sample[0], sample[2], "The band is warm leather.")
+        XCTAssertGreaterThan(luminance, 0.85, "Ivory paper reaches behind the header.")
+        XCTAssertGreaterThan(sample[0], sample[2], "The paper keeps its warm tone.")
+        let canvas = controller.canvasView
+        let paper = controller.paperView
+        let drawing = canvas.drawing
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 450), animated: false)
+        try await NotebookTestFixtures.waitUntil { abs(paper.contentLayer.transform.m42 + 450) < 0.5 }
+        XCTAssertFalse(NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view))
+        let exposedPoint = CGPoint(x: toolbar.midX, y: toolbar.maxY + 20)
+        let exposedHit = NotebookTestFixtures.hit(exposedPoint, in: window)
+        XCTAssertTrue(exposedHit.isDescendant(of: canvas), "Exposed paper hit: \(exposedHit)")
+        XCTAssertGreaterThanOrEqual(canvas.contentInset.top, toolbar.maxY - 0.5,
+            "Canvas: \(canvasFrame), host: \(hostArea), toolbar: \(toolbar), obstruction: \(owner.overlayObstruction)")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+        try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= toolbar.maxY - 0.5 }
+        XCTAssertEqual(canvas.drawing, drawing)
     }
 
     // MARK: - Fixtures
@@ -514,4 +567,14 @@ private struct LayoutProbe: UIViewRepresentable {
     func makeUIView(context: Context) -> LayoutProbeView { view }
 
     func updateUIView(_ view: LayoutProbeView, context: Context) {}
+}
+
+@MainActor
+private final class EdgePaperHostingController<Content: View>: UIHostingController<Content> {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
+    }
 }

@@ -8,12 +8,19 @@ import UIKit
 struct NotebookToolbarHost<Content: View>: View {
     private let injectedStore: NotebookSceneToolStore?
     private let content: Content
+    private let extendsCanvasUnderChrome: Bool
     @State private var sceneStore: NotebookSceneToolStore?
     @State private var canvasFrame = CGRect.zero
 
-    /// - Parameter store: a store to use instead of the window scene's, for tests.
-    init(store: NotebookSceneToolStore? = nil, @ViewBuilder content: () -> Content) {
+    /// - Parameters:
+    ///   - store: a store to use instead of the window scene's, for tests.
+    ///   - extendsCanvasUnderChrome: lets paper cover system edges while controls stay in the safe area.
+    init(
+        store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false,
+        @ViewBuilder content: () -> Content
+    ) {
         injectedStore = store
+        self.extendsCanvasUnderChrome = extendsCanvasUnderChrome
         self.content = content()
     }
 
@@ -27,6 +34,8 @@ struct NotebookToolbarHost<Content: View>: View {
                 } action: { canvasFrame = $0 }
                 // Toolbar movement never animates the canvas viewport.
                 .transaction { $0.animation = nil }
+                // Measure the expanded canvas inside the safe-area modifier, not its safe proposal.
+                .ignoresSafeArea(extendsCanvasUnderChrome ? .container : .keyboard)
             if let store {
                 NotebookToolbarLayer(store: store, canvasFrame: canvasFrame)
                     // The toolbar is read before the canvas, as it sits above it.
@@ -34,6 +43,7 @@ struct NotebookToolbarHost<Content: View>: View {
                     .accessibilitySortPriority(1)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .coordinateSpace(.named(NotebookToolbarLayer.coordinateSpace))
         .ignoresSafeArea(.keyboard)
         .background {
@@ -103,7 +113,15 @@ struct NotebookToolbarDragResolver: Equatable {
 /// leaves room to scroll any covered writing past it, so it reserves nothing; this also
 /// keeps a notebook opening with its first page at the top.
 enum NotebookToolbarObstruction {
-    static func insets(toolbar: CGRect, canvas: CGRect) -> UIEdgeInsets {
+    static func insets(toolbar: CGRect, canvas: CGRect, usable: CGRect? = nil) -> UIEdgeInsets {
+        if let usable {
+            guard !canvas.isEmpty else { return .zero }
+            let overlay = insets(toolbar: toolbar, canvas: usable)
+            return UIEdgeInsets(
+                top: max(usable.minY - canvas.minY, 0) + overlay.top, left: 0,
+                bottom: max(canvas.maxY - usable.maxY, 0) + overlay.bottom, right: 0
+            )
+        }
         guard toolbar.intersects(canvas) else { return .zero }
         let topGap = toolbar.minY - canvas.minY
         let bottomGap = canvas.maxY - toolbar.maxY
@@ -207,7 +225,7 @@ private struct NotebookToolbarLayer: View {
             }
             .onChange(
                 of: NotebookToolbarObstruction.insets(
-                    toolbar: resting, canvas: canvasFrame
+                    toolbar: resting, canvas: canvasFrame, usable: usable
                 ),
                 initial: true
             ) { _, insets in

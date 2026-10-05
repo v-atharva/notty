@@ -5,9 +5,8 @@ import UIKit
 class NotebookPaperView: UIView {
     static var paperColor: UIColor { NotebookTheme.paperIvory.uiColor }
 
-    /// Leather around the page. Its pattern is anchored to the window, so it continues the
-    /// leather bands above the canvas without a seam.
-    let leatherLayer = CALayer()
+    /// Ivory beneath the page keeps the viewport paper-toned while zooming or overscrolling.
+    let backdropLayer = CALayer()
     let contentLayer = CALayer()
     /// Paper fibres under the dividers and the edge. It repeats a cached tile and moves with
     /// `contentLayer`, so scrolling and zooming never redraw it.
@@ -31,17 +30,16 @@ class NotebookPaperView: UIView {
     ) {
         self.accessibility = accessibility
         super.init(frame: frame)
-        // Leather is the desk around the page. PencilKit draws finished ink only over the page,
-        // so no stroke rests on the leather. Flat until the tile is ready.
-        backgroundColor = NotebookTheme.leatherMid.uiColor
+        // The page fills the viewport at width fit; exposed margins stay ivory at other scales.
+        backgroundColor = Self.paperColor
         isOpaque = true
         isUserInteractionEnabled = false
         isAccessibilityElement = false
         clipsToBounds = true
         // Core Animation draws pattern colours upside down relative to the tile image.
-        leatherLayer.transform = CATransform3DMakeScale(1, -1, 1)
-        leatherLayer.isHidden = accessibility.prefersPlainMaterials
-        layer.addSublayer(leatherLayer)
+        backdropLayer.transform = CATransform3DMakeScale(1, -1, 1)
+        backdropLayer.isHidden = accessibility.prefersPlainMaterials
+        layer.addSublayer(backdropLayer)
         contentLayer.anchorPoint = .zero
         contentLayer.position = .zero
         contentLayer.backgroundColor = Self.paperColor.cgColor
@@ -75,13 +73,13 @@ class NotebookPaperView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        updateLeatherPhase()
+        updateBackdropPhase()
         finishZoom()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        updateLeatherPhase()
+        updateBackdropPhase()
     }
 
     func setGeometry(width: CGFloat, height: CGFloat, boundaries: [CGFloat]) {
@@ -141,20 +139,20 @@ class NotebookPaperView: UIView {
         let plain = accessibility.prefersPlainMaterials
         withoutAnimations {
             grainLayer.isHidden = plain
-            leatherLayer.isHidden = plain
+            backdropLayer.isHidden = plain
         }
     }
 
     private func applyMaterials(_ materials: NotebookMaterials) {
         withoutAnimations {
             grainLayer.backgroundColor = materials.paperFibrePattern
-            leatherLayer.backgroundColor = materials.leatherPattern
+            backdropLayer.backgroundColor = materials.paperFibrePattern
         }
     }
 
-    /// Shifts the leather so its pattern starts at the window origin. The layer spans whole
+    /// Aligns the backdrop pattern with the window origin. The layer spans whole
     /// tiles, so flipping it about its centre leaves that phase in place.
-    private func updateLeatherPhase() {
+    private func updateBackdropPhase() {
         let side = NotebookMaterials.tileSide
         let phase = NotebookMaterials.patternPhase(at: convert(CGPoint.zero, to: nil))
         let size = CGSize(
@@ -162,8 +160,8 @@ class NotebookPaperView: UIView {
             height: ((bounds.height + phase.y) / side).rounded(.up) * side
         )
         withoutAnimations {
-            leatherLayer.bounds = CGRect(origin: .zero, size: size)
-            leatherLayer.position = CGPoint(x: size.width / 2 - phase.x, y: size.height / 2 - phase.y)
+            backdropLayer.bounds = CGRect(origin: .zero, size: size)
+            backdropLayer.position = CGPoint(x: size.width / 2 - phase.x, y: size.height / 2 - phase.y)
         }
     }
 

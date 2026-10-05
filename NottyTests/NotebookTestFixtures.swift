@@ -122,7 +122,7 @@ extension NotebookTestFixtures {
     /// The view a touch at `point`, in `view`'s coordinates, reaches in its window.
     @MainActor
     static func hit(_ point: CGPoint, in view: UIView) -> UIView {
-        guard let window = view.window else { return view }
+        guard let window = (view as? UIWindow) ?? view.window else { return view }
         return window.hitTest(view.convert(point, to: window), with: nil) ?? window
     }
 
