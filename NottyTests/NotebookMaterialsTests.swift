@@ -334,57 +334,45 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertLessThan(stacked.meanDifference(to: continuous), misaligned * 0.1)
     }
 
-    func testCanvasSurroundContinuesTheBandLeatherWithoutASeam() async throws {
+    func testCanvasMarginsStayIvoryWhenThePageIsScrolledOutOfView() async throws {
         await ready(.shared)
         let size = CGSize(width: 300, height: 500)
-        let bandHeight: CGFloat = 132
-        let band = try await renderSwiftUI(NotebookLeatherSurface(), size: size, scale: 2)
-        let paper = NotebookPaperView(
-            frame: CGRect(x: 0, y: bandHeight, width: size.width, height: size.height - bandHeight),
-            accessibility: AccessibilitySettings().source
-        )
-        let host = UIViewController()
-        let window = try hostInWindow(host: host, size: size)
-        defer { window.close() }
-        host.view.frame = window.window.bounds
-        host.view.addSubview(paper)
+        let paper = NotebookPaperView(frame: CGRect(origin: .zero, size: size), accessibility: AccessibilitySettings().source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        // Scroll the page out of sight so only the surround shows.
         paper.setViewport(scale: 1, offset: CGPoint(x: 2_000, y: 0))
-        host.view.layoutIfNeeded()
-        try await waitForRenderedFrames()
-        let surround = try render(host.view, scale: 2)
-        let rows = Int(bandHeight * 2)..<band.height
-        XCTAssertGreaterThan(band.luminanceRange, 0.005)
-        let misaligned = band.meanDifference(to: band, rows: rows, shiftedDown: 9)
-        XCTAssertLessThan(surround.meanDifference(to: band, rows: rows), misaligned * 0.1)
+        let pixels = try render(paper, scale: 2)
+        let expected = try XCTUnwrap(SRGBPixels.components(NotebookTheme.paperIvory.uiColor))
+        XCTAssertEqual(pixels.meanColor.red, expected.red, accuracy: 0.02)
+        XCTAssertEqual(pixels.meanColor.green, expected.green, accuracy: 0.02)
+        XCTAssertEqual(pixels.meanColor.blue, expected.blue, accuracy: 0.02)
+        XCTAssertGreaterThan(pixels.luminanceRange, 0.005)
     }
 
-    func testLeatherSurroundsThePageAndFlattensForAccessibility() async throws {
+    func testIvorySurroundsThePageAndFlattensForAccessibility() async throws {
         let materials = NotebookMaterials()
         let settings = AccessibilitySettings()
         let paper = NotebookPaperView(frame: .zero, materials: materials, accessibility: settings.source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        XCTAssertEqual(paper.backgroundColor, NotebookTheme.leatherMid.uiColor, "flat leather until the tile is ready")
-        XCTAssertNil(paper.leatherLayer.backgroundColor)
-        XCTAssertTrue(paper.layer.sublayers?.first === paper.leatherLayer, "the leather lies under the page")
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.paperIvory.uiColor, "flat ivory until the tile is ready")
+        XCTAssertNil(paper.backdropLayer.backgroundColor)
+        XCTAssertTrue(paper.layer.sublayers?.first === paper.backdropLayer, "the ivory lies under the page")
 
         await ready(materials)
-        let pattern = try XCTUnwrap(paper.leatherLayer.backgroundColor)
+        let pattern = try XCTUnwrap(paper.backdropLayer.backgroundColor)
         XCTAssertNotNil(pattern.pattern)
-        XCTAssertTrue(pattern === materials.leatherPattern, "textured leather around the page")
-        XCTAssertFalse(paper.leatherLayer.isHidden)
+        XCTAssertTrue(pattern === materials.paperFibrePattern, "textured ivory around the page")
+        XCTAssertFalse(paper.backdropLayer.isHidden)
         settings.increasesContrast = true
         settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
-        XCTAssertTrue(paper.leatherLayer.isHidden, "flat leather under Increase Contrast")
-        XCTAssertEqual(paper.backgroundColor, NotebookTheme.leatherMid.uiColor)
+        XCTAssertTrue(paper.backdropLayer.isHidden, "flat ivory under Increase Contrast")
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.paperIvory.uiColor)
         settings.increasesContrast = false
         settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
-        XCTAssertFalse(paper.leatherLayer.isHidden)
+        XCTAssertFalse(paper.backdropLayer.isHidden)
         settings.reducesTransparency = true
         settings.post(UIAccessibility.reduceTransparencyStatusDidChangeNotification)
-        XCTAssertTrue(paper.leatherLayer.isHidden, "flat leather under Reduce Transparency")
-        XCTAssertTrue(paper.leatherLayer.animationKeys()?.isEmpty ?? true)
+        XCTAssertTrue(paper.backdropLayer.isHidden, "flat ivory under Reduce Transparency")
+        XCTAssertTrue(paper.backdropLayer.animationKeys()?.isEmpty ?? true)
     }
 
     func testPaperDrawsWithThemeTones() {

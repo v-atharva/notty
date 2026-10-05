@@ -45,11 +45,11 @@ struct NotebookScreen: View {
                     NotebookToolbarHost {
                         NotebookCanvas(session: session)
                             .id(session.canvasGeneration)
+                            .ignoresSafeArea(.container)
                     }
                 }
             }
-            // Leather runs behind the navigation bar and meets the dock band without a seam.
-            .background { NotebookLeatherSurface().ignoresSafeArea() }
+            .background { NotebookTheme.paperIvory.color.ignoresSafeArea() }
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
             .navigationTitle(session.title)
             .navigationBarTitleDisplayMode(.inline)
@@ -62,7 +62,7 @@ struct NotebookScreen: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Text("notty")
                         .font(NotebookTheme.wordmark.font)
-                        .foregroundStyle(NotebookTheme.bandText.color)
+                        .foregroundStyle(NotebookTheme.glyph.color)
                         // The leading bar items share their width; the wordmark is never truncated.
                         .fixedSize()
                         .accessibilityLabel("Notty")
@@ -71,7 +71,7 @@ struct NotebookScreen: View {
                 ToolbarItem(placement: .principal) {
                     Text(session.title)
                         .font(NotebookTheme.noteTitle.font)
-                        .foregroundStyle(NotebookTheme.bandText.color)
+                        .foregroundStyle(NotebookTheme.glyph.color)
                         .lineLimit(1)
                         // The typewriter face runs wide; shrink a little before truncating.
                         .minimumScaleFactor(0.85)
@@ -98,7 +98,7 @@ struct NotebookScreen: View {
         }
         .tint(NotebookTheme.paperControlTint.color)
         .preferredColorScheme(.light)
-        .toolbarColorScheme(.dark, for: .statusBar)
+        .toolbarColorScheme(.light, for: .statusBar)
         .sheet(isPresented: $showsRecoveryCopies, onDismiss: session.endRecoveryCopiesPresentation) {
             NotebookRecoveryView(session: session)
         }

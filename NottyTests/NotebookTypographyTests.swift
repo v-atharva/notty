@@ -23,7 +23,7 @@ final class NotebookTypographyTests: XCTestCase {
         XCTAssertEqual(registered, Self.bundledFaces.map { "\($0).ttf" })
     }
 
-    func testStatusBarTextIsLightOnTheLeatherBand() async throws {
+    func testStatusBarTextIsDarkOnTheEdgeToEdgePaper() async throws {
         XCTAssertNotEqual(Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool, false)
         let scene = try NotebookTestFixtures.windowScene()
         NotebookTestFixtures.restoreSceneToolDefaults(for: scene, after: self)
@@ -42,7 +42,7 @@ final class NotebookTypographyTests: XCTestCase {
         let window = UIWindow(windowScene: scene)
         window.frame = scene.effectiveGeometry.coordinateSpace.bounds
         let control = StatusBarHostingController(rootView:
-            Color.white.preferredColorScheme(.light).toolbarColorScheme(.light, for: .statusBar)
+            Color.white.preferredColorScheme(.light).toolbarColorScheme(.dark, for: .statusBar)
         )
         window.rootViewController = control
         window.makeKeyAndVisible()
@@ -57,16 +57,16 @@ final class NotebookTypographyTests: XCTestCase {
             previousKeyWindow?.makeKey()
         }
         try await NotebookTestFixtures.waitUntil {
-            control.hasAppeared && scene.statusBarManager?.statusBarStyle == .darkContent
+            control.hasAppeared && scene.statusBarManager?.statusBarStyle == .lightContent
         }
         window.rootViewController = hosting
         hosting.view.layoutIfNeeded()
         try await NotebookTestFixtures.waitUntil {
             mounted = NotebookTestFixtures.notebookController(in: hosting)
             return hosting.hasAppeared && mounted?.isCanvasVisible == true
-                && scene.statusBarManager?.statusBarStyle == .lightContent
+                && scene.statusBarManager?.statusBarStyle == .darkContent
         }
-        XCTAssertEqual(scene.statusBarManager?.statusBarStyle, .lightContent)
+        XCTAssertEqual(scene.statusBarManager?.statusBarStyle, .darkContent)
         XCTAssertEqual(mounted?.canvasView.traitCollection.userInterfaceStyle, .light)
     }
 

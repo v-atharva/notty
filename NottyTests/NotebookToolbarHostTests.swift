@@ -163,6 +163,17 @@ final class NotebookToolbarHostTests: XCTestCase {
         )
     }
 
+    func testExpandedCanvasReservesHeaderAndHomeIndicatorPlusToolbarScrollRange() {
+        let canvas = CGRect(x: 0, y: -96, width: 500, height: 900)
+        let usable = CGRect(x: 0, y: 0, width: 500, height: 784)
+        let compact = CGRect(x: 12, y: 12, width: 450, height: 52)
+        XCTAssertEqual(NotebookToolbarObstruction.insets(toolbar: compact, canvas: canvas, usable: usable),
+            UIEdgeInsets(top: 160, left: 0, bottom: 20, right: 0))
+        let floating = compact.offsetBy(dx: 0, dy: 300)
+        XCTAssertEqual(NotebookToolbarObstruction.insets(toolbar: floating, canvas: canvas, usable: usable),
+            UIEdgeInsets(top: 96, left: 0, bottom: 20, right: 0))
+    }
+
     // MARK: - Overlay and canvas
 
     func testFloatingRestoreLaysTheContentOutOnceWhileTheSceneStoreResolves() async throws {
@@ -376,7 +387,7 @@ final class NotebookToolbarHostTests: XCTestCase {
 
     // MARK: - Production wiring
 
-    func testNotebookScreenSharesTheSceneStoreWithItsCanvasAndShowsLeatherBehindTheNavigationBar() async throws {
+    func testNotebookScreenFillsTheWindowWithScrollingPaperBeneathFloatingControls() async throws {
         let id = UUID()
         let root = NotebookTestFixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -401,8 +412,18 @@ final class NotebookToolbarHostTests: XCTestCase {
         let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
         XCTAssertTrue(controller.drawingToolStore === owner, "The screen's canvas uses the scene's store.")
 
-        let hostArea = controller.view.convert(controller.view.bounds, to: window)
+        let navigationBar = try XCTUnwrap(NotebookTestFixtures.navigationController(in: hosting)?.navigationBar)
+        let bar = navigationBar.convert(navigationBar.bounds, to: window)
+        let canvasFrame = controller.view.convert(controller.view.bounds, to: window)
+        XCTAssertEqual(canvasFrame.minX, 0, accuracy: 0.5)
+        XCTAssertEqual(canvasFrame.minY, 0, accuracy: 0.5, "Paper reaches behind the navigation and status regions.")
+        XCTAssertEqual(canvasFrame.width, window.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(canvasFrame.maxY, window.bounds.maxY, accuracy: 0.5, "Paper reaches behind the home indicator.")
+        XCTAssertEqual(controller.canvasView.contentOffset.y, 0, accuracy: 0.5)
+        let hostArea = CGRect(x: 0, y: bar.maxY, width: window.bounds.width,
+            height: window.bounds.height - bar.maxY - window.safeAreaInsets.bottom)
         let toolbar = toolbarFrame(for: owner.toolbar, in: hostArea)
+        XCTAssertGreaterThan(toolbar.minY, bar.maxY)
         try await NotebookTestFixtures.waitUntil {
             !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
         }
@@ -411,17 +432,25 @@ final class NotebookToolbarHostTests: XCTestCase {
         NotebookToolbarActions(store: owner).select(.ink(family))
         XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, family.inkType)
 
-        let navigationBar = try XCTUnwrap(NotebookTestFixtures.navigationController(in: hosting)?.navigationBar)
-        let bar = navigationBar.convert(navigationBar.bounds, to: window)
         let rendered = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
         }
         let pixels = try RenderedPixels(try XCTUnwrap(rendered.cgImage), scale: rendered.scale)
-        // Between the wordmark and the title, where only the band backdrop shows.
+        // Between floating header controls, the writing paper shows through.
         let sample = pixels.rgba(at: CGPoint(x: bar.minX + bar.width * 0.3, y: bar.midY)).map { Double($0) / 255 }
         let luminance = 0.2126 * sample[0] + 0.7152 * sample[1] + 0.0722 * sample[2]
-        XCTAssertLessThan(luminance, 0.45, "Leather shows behind the navigation bar, not ivory.")
-        XCTAssertGreaterThan(sample[0], sample[2], "The band is warm leather.")
+        XCTAssertGreaterThan(luminance, 0.85, "Ivory paper reaches behind the header.")
+        XCTAssertGreaterThan(sample[0], sample[2], "The paper keeps its warm tone.")
+        let canvas = controller.canvasView
+        let paper = controller.paperView
+        let drawing = canvas.drawing
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 450), animated: false)
+        try await NotebookTestFixtures.waitUntil { abs(paper.contentLayer.transform.m42 + 450) < 0.5 }
+        XCTAssertFalse(NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view))
+        XCTAssertTrue(NotebookTestFixtures.hit(CGPoint(x: 30, y: bar.maxY + 4), in: window).isDescendant(of: canvas))
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+        try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= toolbar.maxY - 0.5 }
+        XCTAssertEqual(canvas.drawing, drawing)
     }
 
     // MARK: - Fixtures

@@ -103,7 +103,15 @@ struct NotebookToolbarDragResolver: Equatable {
 /// leaves room to scroll any covered writing past it, so it reserves nothing; this also
 /// keeps a notebook opening with its first page at the top.
 enum NotebookToolbarObstruction {
-    static func insets(toolbar: CGRect, canvas: CGRect) -> UIEdgeInsets {
+    static func insets(toolbar: CGRect, canvas: CGRect, usable: CGRect? = nil) -> UIEdgeInsets {
+        if let usable {
+            guard !canvas.isEmpty else { return .zero }
+            let overlay = insets(toolbar: toolbar, canvas: usable)
+            return UIEdgeInsets(
+                top: max(usable.minY - canvas.minY, 0) + overlay.top, left: 0,
+                bottom: max(canvas.maxY - usable.maxY, 0) + overlay.bottom, right: 0
+            )
+        }
         guard toolbar.intersects(canvas) else { return .zero }
         let topGap = toolbar.minY - canvas.minY
         let bottomGap = canvas.maxY - toolbar.maxY
@@ -207,7 +215,7 @@ private struct NotebookToolbarLayer: View {
             }
             .onChange(
                 of: NotebookToolbarObstruction.insets(
-                    toolbar: resting, canvas: canvasFrame
+                    toolbar: resting, canvas: canvasFrame, usable: usable
                 ),
                 initial: true
             ) { _, insets in
