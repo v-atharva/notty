@@ -40,7 +40,7 @@ final class NotebookTypographyTests: XCTestCase {
         await session.load()
         let hosting = StatusBarHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        window.frame = scene.effectiveGeometry.coordinateSpace.bounds
         let control = StatusBarHostingController(rootView:
             Color.white.preferredColorScheme(.light).toolbarColorScheme(.light, for: .statusBar)
         )
