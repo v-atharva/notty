@@ -8,12 +8,17 @@ import UIKit
 struct NotebookToolbarHost<Content: View>: View {
     private let injectedStore: NotebookSceneToolStore?
     private let content: Content
+    private let extendsCanvasUnderChrome: Bool
     @State private var sceneStore: NotebookSceneToolStore?
     @State private var canvasFrame = CGRect.zero
 
     /// - Parameter store: a store to use instead of the window scene's, for tests.
-    init(store: NotebookSceneToolStore? = nil, @ViewBuilder content: () -> Content) {
+    init(
+        store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false,
+        @ViewBuilder content: () -> Content
+    ) {
         injectedStore = store
+        self.extendsCanvasUnderChrome = extendsCanvasUnderChrome
         self.content = content()
     }
 
@@ -27,6 +32,8 @@ struct NotebookToolbarHost<Content: View>: View {
                 } action: { canvasFrame = $0 }
                 // Toolbar movement never animates the canvas viewport.
                 .transaction { $0.animation = nil }
+                // Measure the expanded canvas inside the safe-area modifier, not its safe proposal.
+                .ignoresSafeArea(extendsCanvasUnderChrome ? .container : .keyboard)
             if let store {
                 NotebookToolbarLayer(store: store, canvasFrame: canvasFrame)
                     // The toolbar is read before the canvas, as it sits above it.

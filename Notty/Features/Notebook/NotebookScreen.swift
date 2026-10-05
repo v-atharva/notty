@@ -42,10 +42,9 @@ struct NotebookScreen: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(NotebookTheme.paperIvory.color)
                 case .ready:
-                    NotebookToolbarHost {
+                    NotebookToolbarHost(extendsCanvasUnderChrome: true) {
                         NotebookCanvas(session: session)
                             .id(session.canvasGeneration)
-                            .ignoresSafeArea(.container)
                     }
                 }
             }

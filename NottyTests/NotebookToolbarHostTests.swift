@@ -395,20 +395,26 @@ final class NotebookToolbarHostTests: XCTestCase {
         let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
         let storage = await probe.storage(notebookID: id)
         let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
         let scene = try NotebookTestFixtures.windowScene()
+        let previousKeyWindow = scene.keyWindow
         let owner = preserveSceneStore(for: scene)
         owner.updateToolbar(.standard)
 
         let window = UIWindow(windowScene: scene)
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-        show(hosting, in: window)
+        let hosting = EdgePaperHostingController(rootView: NotebookScreen(session: session))
+        window.frame = scene.effectiveGeometry.coordinateSpace.bounds
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        hosting.view.layoutIfNeeded()
         defer {
             session.flush()
             close(window)
+            previousKeyWindow?.makeKey()
         }
         try await NotebookTestFixtures.waitUntil(seconds: 10) {
             guard let controller = NotebookTestFixtures.notebookController(in: hosting) else { return false }
-            return controller.isCanvasVisible && controller.canvasView.isFirstResponder && owner.isToolbarAvailable
+            return hosting.hasAppeared && controller.isCanvasVisible && controller.canvasView.isFirstResponder && owner.isToolbarAvailable
         }
         try await settle(hosting.view)
         let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
@@ -427,8 +433,9 @@ final class NotebookToolbarHostTests: XCTestCase {
         let toolbar = toolbarFrame(for: owner.toolbar, in: hostArea)
         XCTAssertGreaterThan(toolbar.minY, bar.maxY)
         try await NotebookTestFixtures.waitUntil {
-            owner.overlayObstruction.top > 0
-                && !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
+            let hit = NotebookTestFixtures.hit(toolbar.center, in: window)
+            return owner.overlayObstruction.top > 0 && hit !== window && hit !== hosting.view
+                && !hit.isDescendant(of: controller.view)
         }
 
         let family: EditorInkFamily = owner.tool.kind == .ink(.marker) ? .pencil : .marker
@@ -550,4 +557,14 @@ private struct LayoutProbe: UIViewRepresentable {
     func makeUIView(context: Context) -> LayoutProbeView { view }
 
     func updateUIView(_ view: LayoutProbeView, context: Context) {}
+}
+
+@MainActor
+private final class EdgePaperHostingController<Content: View>: UIHostingController<Content> {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
+    }
 }
