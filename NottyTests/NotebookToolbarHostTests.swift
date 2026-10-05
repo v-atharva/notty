@@ -410,6 +410,7 @@ final class NotebookToolbarHostTests: XCTestCase {
             guard let controller = NotebookTestFixtures.notebookController(in: hosting) else { return false }
             return controller.isCanvasVisible && controller.canvasView.isFirstResponder && owner.isToolbarAvailable
         }
+        try await settle(hosting.view)
         let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
         XCTAssertTrue(controller.drawingToolStore === owner, "The screen's canvas uses the scene's store.")
 
@@ -426,7 +427,8 @@ final class NotebookToolbarHostTests: XCTestCase {
         let toolbar = toolbarFrame(for: owner.toolbar, in: hostArea)
         XCTAssertGreaterThan(toolbar.minY, bar.maxY)
         try await NotebookTestFixtures.waitUntil {
-            !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
+            owner.overlayObstruction.top > 0
+                && !NotebookTestFixtures.hit(toolbar.center, in: window).isDescendant(of: controller.view)
         }
 
         let family: EditorInkFamily = owner.tool.kind == .ink(.marker) ? .pencil : .marker

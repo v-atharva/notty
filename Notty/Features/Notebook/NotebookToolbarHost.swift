@@ -34,6 +34,7 @@ struct NotebookToolbarHost<Content: View>: View {
                     .accessibilitySortPriority(1)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .coordinateSpace(.named(NotebookToolbarLayer.coordinateSpace))
         .ignoresSafeArea(.keyboard)
         .background {
