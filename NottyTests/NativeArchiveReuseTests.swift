@@ -6,6 +6,68 @@ import XCTest
 
 @MainActor
 final class NativeArchiveReuseTests: XCTestCase {
+    func testEveryEditorInkFamilyRoundTripsWithoutChangingExistingInk() async throws {
+        for (index, family) in EditorInkFamily.allCases.enumerated() {
+            let original = NativeArchiveFixtures.stroke()
+            let codec = InkCodec()
+            let baseline = try await codec.encode(PKDrawing(strokes: [original]))
+            var state = EditorToolState.standard
+            state.select(.ink(family))
+            state.color = EditorInkCatalog.swatches[index % EditorInkCatalog.swatches.count]
+            let tool = try XCTUnwrap(state.nativeTool as? PKInkingTool)
+            XCTAssertEqual(tool.inkType, family.inkType, family.rawValue)
+            var added = NativeArchiveFixtures.stroke(x: 120)
+            added.ink = PKInk(tool.inkType, color: tool.color)
+            let drawing = PKDrawing(strokes: [original, added])
+            let nativeDrawing = try PKDrawing(data: PKDrawing(strokes: [added]).dataRepresentation())
+            let nativeStroke = try XCTUnwrap(nativeDrawing.strokes.first)
+            XCTAssertEqual(added.ink.inkType, family.inkType, family.rawValue)
+            let assets = try await codec.encode(drawing)
+            XCTAssertEqual(assets.map(\.id), [original.id, added.id], family.rawValue)
+            XCTAssertEqual(assets[0], baseline[0], family.rawValue)
+            XCTAssertEqual(assets[0].cachedDigest, baseline[0].cachedDigest, family.rawValue)
+
+            let decoder = InkCodec()
+            let restored = try await decoder.decode(assets)
+            XCTAssertEqual(restored.strokes.map(\.id), [original.id, added.id], family.rawValue)
+            XCTAssertEqual(restored.strokes[0].ink.inkType, .pen, family.rawValue)
+            XCTAssertEqual(restored.strokes[0].ink.color, original.ink.color, family.rawValue)
+            XCTAssertEqual(restored.strokes[1].ink.inkType, nativeStroke.ink.inkType, family.rawValue)
+            XCTAssertEqual(restored.strokes[1].path.id, added.path.id, family.rawValue)
+            XCTAssertEqual(restored.strokes[1].transform, added.transform, family.rawValue)
+            func components(_ color: UIColor) -> [CGFloat] {
+                var red: CGFloat = 0
+                var green: CGFloat = 0
+                var blue: CGFloat = 0
+                var alpha: CGFloat = 0
+                XCTAssertTrue(color.getRed(&red, green: &green, blue: &blue, alpha: &alpha))
+                return [red, green, blue, alpha]
+            }
+            for (actual, expected) in zip(components(restored.strokes[1].ink.color), components(nativeStroke.ink.color)) {
+                XCTAssertEqual(actual, expected, accuracy: 0.002, family.rawValue)
+            }
+            let restoredPath = restored.strokes[1].path
+            XCTAssertEqual(restoredPath.count, nativeStroke.path.count, family.rawValue)
+            for index in 0..<min(restoredPath.count, nativeStroke.path.count) {
+                let actual = restoredPath[index]
+                let expected = nativeStroke.path[index]
+                XCTAssertEqual(actual.location, expected.location, family.rawValue)
+                XCTAssertEqual(actual.timeOffset, expected.timeOffset, family.rawValue)
+                XCTAssertEqual(actual.size, expected.size, family.rawValue)
+                XCTAssertEqual(actual.opacity, expected.opacity, family.rawValue)
+                XCTAssertEqual(actual.force, expected.force, family.rawValue)
+                XCTAssertEqual(actual.azimuth, expected.azimuth, family.rawValue)
+                XCTAssertEqual(actual.altitude, expected.altitude, family.rawValue)
+            }
+            let before = await decoder.workMetrics
+            let reencoded = try await decoder.encode(restored)
+            let after = await decoder.workMetrics
+            XCTAssertEqual(reencoded, assets, family.rawValue)
+            XCTAssertEqual(after.serializedStrokes, before.serializedStrokes, family.rawValue)
+            XCTAssertEqual(after.hashedArchiveBytes, before.hashedArchiveBytes, family.rawValue)
+        }
+    }
+
     func testLiveCanvasDecodeThenAddOneReusesEveryUnchangedArchive() async throws {
         let originals = [
             NativeArchiveFixtures.stroke(),

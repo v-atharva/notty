@@ -23,11 +23,51 @@ final class NotebookTypographyTests: XCTestCase {
         XCTAssertEqual(registered, Self.bundledFaces.map { "\($0).ttf" })
     }
 
-    func testStatusBarTextIsLightOnTheLeatherBand() {
-        // The leather runs under the status bar while the app forces the light appearance,
-        // which would otherwise draw dark status bar text on dark leather.
-        XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool, false)
-        XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "UIStatusBarStyle") as? String, "UIStatusBarStyleLightContent")
+    func testStatusBarTextIsLightOnTheLeatherBand() async throws {
+        XCTAssertNotEqual(Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool, false)
+        let scene = try NotebookTestFixtures.windowScene()
+        NotebookTestFixtures.restoreSceneToolDefaults(for: scene, after: self)
+        let previousKeyWindow = scene.keyWindow
+        let store = NotebookSceneToolStore.owner(for: scene)
+        let originalTool = store.tool
+        let originalToolbar = store.toolbar
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let probe = try NotebookStorageProbe(stored: try await NotebookTestFixtures.stored(id: id), recoveryRoot: root)
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let hosting = StatusBarHostingController(rootView: NotebookScreen(session: session))
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.effectiveGeometry.coordinateSpace.bounds
+        let control = StatusBarHostingController(rootView:
+            Color.white.preferredColorScheme(.light).toolbarColorScheme(.light, for: .statusBar)
+        )
+        window.rootViewController = control
+        window.makeKeyAndVisible()
+        var mounted: NotebookViewController?
+        defer {
+            session.flush()
+            store.update { $0 = originalTool }
+            store.updateToolbar(originalToolbar)
+            mounted?.tearDown()
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        try await NotebookTestFixtures.waitUntil {
+            control.hasAppeared && scene.statusBarManager?.statusBarStyle == .darkContent
+        }
+        window.rootViewController = hosting
+        hosting.view.layoutIfNeeded()
+        try await NotebookTestFixtures.waitUntil {
+            mounted = NotebookTestFixtures.notebookController(in: hosting)
+            return hosting.hasAppeared && mounted?.isCanvasVisible == true
+                && scene.statusBarManager?.statusBarStyle == .lightContent
+        }
+        XCTAssertEqual(scene.statusBarManager?.statusBarStyle, .lightContent)
+        XCTAssertEqual(mounted?.canvasView.traitCollection.userInterfaceStyle, .light)
     }
 
     func testBerkeleyMonoFacesAreRegisteredAtLaunch() {
@@ -96,5 +136,15 @@ final class NotebookTypographyTests: XCTestCase {
     private func weightTrait(of resolved: Font.Resolved) -> CGFloat {
         let traits = CTFontCopyTraits(resolved.ctFont) as NSDictionary
         return (traits[kCTFontWeightTrait] as? NSNumber).map { CGFloat($0.doubleValue) } ?? .nan
+    }
+}
+
+@MainActor
+private final class StatusBarHostingController<Content: View>: UIHostingController<Content> {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
     }
 }
