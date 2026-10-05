@@ -98,6 +98,7 @@ struct NotebookScreen: View {
         }
         .tint(NotebookTheme.paperControlTint.color)
         .preferredColorScheme(.light)
+        .toolbarColorScheme(.dark, for: .statusBar)
         .sheet(isPresented: $showsRecoveryCopies, onDismiss: session.endRecoveryCopiesPresentation) {
             NotebookRecoveryView(session: session)
         }

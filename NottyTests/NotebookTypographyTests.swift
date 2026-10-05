@@ -23,11 +23,36 @@ final class NotebookTypographyTests: XCTestCase {
         XCTAssertEqual(registered, Self.bundledFaces.map { "\($0).ttf" })
     }
 
-    func testStatusBarTextIsLightOnTheLeatherBand() {
-        // The leather runs under the status bar while the app forces the light appearance,
-        // which would otherwise draw dark status bar text on dark leather.
-        XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool, false)
-        XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "UIStatusBarStyle") as? String, "UIStatusBarStyleLightContent")
+    func testStatusBarTextIsLightOnTheLeatherBand() async throws {
+        XCTAssertNotEqual(Bundle.main.object(forInfoDictionaryKey: "UIViewControllerBasedStatusBarAppearance") as? Bool, false)
+        let scene = try NotebookTestFixtures.windowScene()
+        NotebookTestFixtures.restoreSceneToolDefaults(for: scene, after: self)
+        let previousKeyWindow = scene.keyWindow
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let probe = try NotebookStorageProbe(stored: try await NotebookTestFixtures.stored(id: id), recoveryRoot: root)
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.coordinateSpace.bounds
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        var mounted: NotebookViewController?
+        defer {
+            mounted?.tearDown()
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        try await NotebookTestFixtures.waitUntil {
+            mounted = NotebookTestFixtures.notebookController(in: hosting)
+            return mounted?.isCanvasVisible == true && scene.statusBarManager?.statusBarStyle == .lightContent
+        }
+        XCTAssertEqual(scene.statusBarManager?.statusBarStyle, .lightContent)
+        XCTAssertEqual(mounted?.canvasView.traitCollection.userInterfaceStyle, .light)
     }
 
     func testBerkeleyMonoFacesAreRegisteredAtLaunch() {

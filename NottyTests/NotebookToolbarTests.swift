@@ -458,6 +458,12 @@ final class NotebookToolbarTests: XCTestCase {
             actions.addCustomColor(NotebookSwatchShelf.color(from: preset.color.platformColor))
             XCTAssertEqual(store.tool, original, preset.id)
             XCTAssertEqual(store.tool.activePresetID, preset.id)
+            let shelfColor = NotebookSwatchShelf.displayed(custom: store.toolbar.customSwatches)
+                .first { $0.quantized == preset.color.quantized }
+            XCTAssertNotNil(shelfColor, preset.id)
+            let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
+            XCTAssertEqual(marks.color, shelfColor, preset.id)
+            XCTAssertFalse(marks.marksCustomColor, preset.id)
         }
     }
 

@@ -131,10 +131,12 @@ struct NotebookInkMarks: Equatable {
             self = .unlit
             return
         }
-        let onShelf = NotebookSwatchShelf.displayed(custom: custom).contains(tool.color)
+        let shelfColor = NotebookSwatchShelf.displayed(custom: custom).first {
+            $0.quantized == tool.color.quantized
+        }
         self.init(
-            presetID: tool.activePresetID, color: onShelf ? tool.color : nil,
-            marksCustomColor: !onShelf, width: tool.widthStep
+            presetID: tool.activePresetID, color: shelfColor,
+            marksCustomColor: shelfColor == nil, width: tool.widthStep
         )
     }
 
