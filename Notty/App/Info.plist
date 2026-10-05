@@ -12,7 +12,13 @@
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
     <key>UIApplicationSceneManifest</key>
     <dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+    <key>UIAppFonts</key>
+    <array>
+        <string>BerkeleyMono-Medium.ttf</string>
+        <string>BerkeleyMono-SemiBold.ttf</string>
+    </array>
     <key>UILaunchScreen</key><dict/>
+    <key>UIStatusBarStyle</key><string>UIStatusBarStyleLightContent</string>
     <key>UISupportedInterfaceOrientations~ipad</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
@@ -20,5 +26,6 @@
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
+    <key>UIViewControllerBasedStatusBarAppearance</key><false/>
 </dict>
 </plist>

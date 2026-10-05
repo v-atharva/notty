@@ -3,9 +3,15 @@ import UIKit
 
 @MainActor
 class NotebookPaperView: UIView {
-    static let paperColor = UIColor(red: 0.98, green: 0.96, blue: 0.91, alpha: 1)
+    static var paperColor: UIColor { NotebookTheme.paperIvory.uiColor }
 
+    /// Leather around the page. Its pattern is anchored to the window, so it continues the
+    /// leather bands above the canvas without a seam.
+    let leatherLayer = CALayer()
     let contentLayer = CALayer()
+    /// Paper fibres under the dividers and the edge. It repeats a cached tile and moves with
+    /// `contentLayer`, so scrolling and zooming never redraw it.
+    let grainLayer = CALayer()
     let edgeLayer = CALayer()
     private(set) var boundaryLayers: [CALayer] = []
     private(set) var geometryUpdates = 0
@@ -17,22 +23,48 @@ class NotebookPaperView: UIView {
     private var boundaries: [CGFloat] = []
     private var viewportScale: CGFloat = 1
     private var viewportOffset = CGPoint.zero
+    private let accessibility: NotebookMaterialAccessibility
 
-    override init(frame: CGRect) {
+    init(
+        frame: CGRect, materials: NotebookMaterials = .shared,
+        accessibility: NotebookMaterialAccessibility = .system
+    ) {
+        self.accessibility = accessibility
         super.init(frame: frame)
-        backgroundColor = Self.paperColor
+        // Leather is the desk around the page. PencilKit draws finished ink only over the page,
+        // so no stroke rests on the leather. Flat until the tile is ready.
+        backgroundColor = NotebookTheme.leatherMid.uiColor
         isOpaque = true
         isUserInteractionEnabled = false
         isAccessibilityElement = false
         clipsToBounds = true
+        // Core Animation draws pattern colours upside down relative to the tile image.
+        leatherLayer.transform = CATransform3DMakeScale(1, -1, 1)
+        leatherLayer.isHidden = accessibility.prefersPlainMaterials
+        layer.addSublayer(leatherLayer)
         contentLayer.anchorPoint = .zero
         contentLayer.position = .zero
+        contentLayer.backgroundColor = Self.paperColor.cgColor
+        grainLayer.anchorPoint = .zero
+        grainLayer.position = .zero
+        grainLayer.isHidden = accessibility.prefersPlainMaterials
+        contentLayer.addSublayer(grainLayer)
         edgeLayer.anchorPoint = CGPoint(x: 0, y: 0.5)
-        edgeLayer.backgroundColor = UIColor(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.65).cgColor
+        edgeLayer.backgroundColor = NotebookTheme.paperEdge.cgColor
         contentLayer.addSublayer(edgeLayer)
         layer.addSublayer(contentLayer)
         registerForTraitChanges([UITraitDisplayScale.self]) { (view: NotebookPaperView, _: UITraitCollection) in
             view.finishZoom()
+        }
+        // Tiles render off the main thread, so opening a notebook never waits for them; the
+        // textures appear once, when they are ready.
+        materials.whenReady { [weak self] materials in
+            self?.applyMaterials(materials)
+        }
+        for name in NotebookMaterialAccessibility.statusChangeNotifications {
+            accessibility.notificationCenter.addObserver(
+                self, selector: #selector(accessibilityMaterialsChanged), name: name, object: nil
+            )
         }
     }
 
@@ -43,7 +75,13 @@ class NotebookPaperView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        updateLeatherPhase()
         finishZoom()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updateLeatherPhase()
     }
 
     func setGeometry(width: CGFloat, height: CGFloat, boundaries: [CGFloat]) {
@@ -59,11 +97,12 @@ class NotebookPaperView: UIView {
             while boundaryLayers.count < boundaries.count {
                 let divider = CALayer()
                 divider.anchorPoint = CGPoint(x: 0, y: 0.5)
-                divider.backgroundColor = UIColor(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.30).cgColor
+                divider.backgroundColor = NotebookTheme.paperDivider.cgColor
                 contentLayer.addSublayer(divider)
                 boundaryLayers.append(divider)
             }
             contentLayer.bounds = CGRect(x: 0, y: 0, width: width, height: height)
+            grainLayer.bounds = contentLayer.bounds
             for (divider, y) in zip(boundaryLayers, boundaries) {
                 divider.position = CGPoint(x: 0, y: y)
             }
@@ -95,6 +134,36 @@ class NotebookPaperView: UIView {
                 divider.bounds = CGRect(x: 0, y: 0, width: logicalWidth, height: thickness)
             }
             edgeLayer.bounds = CGRect(x: 0, y: 0, width: logicalWidth, height: thickness * 2)
+        }
+    }
+
+    @objc private func accessibilityMaterialsChanged() {
+        let plain = accessibility.prefersPlainMaterials
+        withoutAnimations {
+            grainLayer.isHidden = plain
+            leatherLayer.isHidden = plain
+        }
+    }
+
+    private func applyMaterials(_ materials: NotebookMaterials) {
+        withoutAnimations {
+            grainLayer.backgroundColor = materials.paperFibrePattern
+            leatherLayer.backgroundColor = materials.leatherPattern
+        }
+    }
+
+    /// Shifts the leather so its pattern starts at the window origin. The layer spans whole
+    /// tiles, so flipping it about its centre leaves that phase in place.
+    private func updateLeatherPhase() {
+        let side = NotebookMaterials.tileSide
+        let phase = NotebookMaterials.patternPhase(at: convert(CGPoint.zero, to: nil))
+        let size = CGSize(
+            width: ((bounds.width + phase.x) / side).rounded(.up) * side,
+            height: ((bounds.height + phase.y) / side).rounded(.up) * side
+        )
+        withoutAnimations {
+            leatherLayer.bounds = CGRect(origin: .zero, size: size)
+            leatherLayer.position = CGPoint(x: size.width / 2 - phase.x, y: size.height / 2 - phase.y)
         }
     }
 

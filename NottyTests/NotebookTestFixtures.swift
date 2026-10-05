@@ -1,7 +1,9 @@
 import Foundation
 import NottyCore
 import PencilKit
+import SwiftUI
 import UIKit
+import XCTest
 @testable import Notty
 
 enum NotebookTestFixtures {
@@ -20,6 +22,42 @@ enum NotebookTestFixtures {
         )
         stroke.id = id
         return stroke
+    }
+
+    /// A tool store backed by its own defaults suite, so tests never change the host app's
+    /// settings and never see each other's. The suite is emptied and deleted when the test ends.
+    @MainActor
+    static func toolStore() -> NotebookSceneToolStore {
+        let suite = temporaryDefaultsSuite()
+        return NotebookSceneToolStore(identifier: suite, defaults: UserDefaults(suiteName: suite)!)
+    }
+
+    /// The name of an empty defaults suite, distinct from every other suite handed out in
+    /// the current test, that is emptied and deleted when the test ends.
+    @MainActor
+    static func temporaryDefaultsSuite() -> String {
+        TemporaryDefaultsSuites.shared.next()
+    }
+
+    /// Restores the host app's stored tool and toolbar settings for `scene` when `testCase`
+    /// ends, for tests that must use the scene-owned store.
+    @MainActor
+    static func restoreSceneToolDefaults(for scene: UIWindowScene, after testCase: XCTestCase) {
+        let keys = [
+            "notty.editor.tool." + scene.session.persistentIdentifier,
+            NotebookSceneToolStore.lastToolDefaultsKey,
+            NotebookSceneToolStore.toolbarDefaultsKey
+        ]
+        let saved = keys.map { ($0, UserDefaults.standard.object(forKey: $0)) }
+        testCase.addTeardownBlock {
+            for (key, value) in saved {
+                if let value {
+                    UserDefaults.standard.set(value, forKey: key)
+                } else {
+                    UserDefaults.standard.removeObject(forKey: key)
+                }
+            }
+        }
     }
 
     static func stamp(_ index: Int) -> NotebookEditStamp {
@@ -42,6 +80,214 @@ enum NotebookTestFixtures {
             ),
             savedAt: Date(timeIntervalSince1970: 1_000)
         )
+    }
+}
+
+// MARK: - Windows and waiting
+
+extension NotebookTestFixtures {
+    @MainActor
+    static func windowScene() throws -> UIWindowScene {
+        try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+    }
+
+    /// Polls `ready` on the main actor until it holds, failing the test after `seconds`.
+    @MainActor
+    static func waitUntil(
+        seconds: Int = 5, file: StaticString = #filePath, line: UInt = #line,
+        _ ready: @escaping @MainActor () -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
+        while !ready() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("The condition did not hold within \(seconds) seconds.", file: file, line: line)
+                throw NotebookFixtureFailure.timeout
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @MainActor
+    static func notebookController(in controller: UIViewController) -> NotebookViewController? {
+        if let notebook = controller as? NotebookViewController { return notebook }
+        return controller.children.lazy.compactMap { notebookController(in: $0) }.first
+    }
+
+    @MainActor
+    static func navigationController(in controller: UIViewController) -> UINavigationController? {
+        if let navigation = controller as? UINavigationController { return navigation }
+        return controller.children.lazy.compactMap { navigationController(in: $0) }.first
+    }
+
+    /// The view a touch at `point`, in `view`'s coordinates, reaches in its window.
+    @MainActor
+    static func hit(_ point: CGPoint, in view: UIView) -> UIView {
+        guard let window = view.window else { return view }
+        return window.hitTest(view.convert(point, to: window), with: nil) ?? window
+    }
+
+    /// A notebook canvas inside the toolbar host, shown in its own window and ready for input.
+    @MainActor
+    static func mountToolbarHost(
+        store: NotebookSceneToolStore? = nil, horizontalSizeClass: UserInterfaceSizeClass = .regular,
+        width: CGFloat = 1_024
+    ) async throws -> NotebookToolbarHostFixture {
+        let store = store ?? toolStore()
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let hosting = UIHostingController(
+            rootView: NotebookToolbarHost(store: store) { MountedNotebookController(controller: controller) }
+                .environment(\.horizontalSizeClass, horizontalSizeClass)
+        )
+        hosting.safeAreaRegions = []
+        let window = UIWindow(windowScene: try windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: width, height: 1_366)
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        hosting.view.layoutIfNeeded()
+        let fixture = NotebookToolbarHostFixture(hosting: hosting, window: window, controller: controller, store: store)
+        do {
+            try await waitUntil {
+                controller.isCanvasVisible && store.isToolbarAvailable && controller.canvasView.isFirstResponder
+                    && controller.canvasView.bounds.height > 0
+            }
+        } catch {
+            fixture.close()
+            throw error
+        }
+        return fixture
+    }
+}
+
+enum NotebookFixtureFailure: Error {
+    case timeout
+}
+
+/// Mounts an existing controller so tests can inspect it inside SwiftUI.
+struct MountedNotebookController: UIViewControllerRepresentable {
+    let controller: NotebookViewController
+
+    func makeUIViewController(context: Context) -> NotebookViewController { controller }
+
+    func updateUIViewController(_ controller: NotebookViewController, context: Context) {}
+}
+
+@MainActor
+struct NotebookToolbarHostFixture {
+    let hosting: UIViewController
+    let window: UIWindow
+    let controller: NotebookViewController
+    let store: NotebookSceneToolStore
+
+    var host: UIView { hosting.view }
+
+    /// The view a touch at `point`, in the host's coordinates, reaches.
+    func hit(_ point: CGPoint) -> UIView {
+        NotebookTestFixtures.hit(point, in: host)
+    }
+
+    /// The canvas controller's frame in the host's coordinates.
+    var canvasFrame: CGRect { frame(of: controller.view) }
+
+    /// The toolbar's scrolling strips, top to bottom.
+    var strips: [UIScrollView] {
+        func collect(_ view: UIView) -> [UIScrollView] {
+            if view === controller.view { return [] }
+            let own = (view as? UIScrollView).map { [$0] } ?? []
+            return own + view.subviews.flatMap(collect)
+        }
+        return collect(host).sorted { frame(of: $0).minY < frame(of: $1).minY }
+    }
+
+    func frame(of view: UIView) -> CGRect {
+        view.convert(view.bounds, to: host)
+    }
+
+    func close() {
+        hosting.presentedViewController?.dismiss(animated: false)
+        controller.tearDown()
+        window.isHidden = true
+        window.rootViewController = nil
+    }
+}
+
+// MARK: - Pixels
+
+/// An image redrawn into premultiplied sRGB bytes, so values compare with sRGB theme colours.
+struct RenderedPixels {
+    let width: Int
+    let height: Int
+    let scale: CGFloat
+    let rgba: [UInt8]
+
+    init(_ image: CGImage, scale: CGFloat) throws {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let drawn = bytes.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,
+                bytesPerRow: image.width * 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        XCTAssertTrue(drawn, "The image could not be redrawn into sRGB.")
+        width = image.width
+        height = image.height
+        self.scale = scale
+        rgba = bytes
+    }
+
+    /// Renders a SwiftUI view at twice its point size.
+    @MainActor
+    init<Content: View>(rendering content: Content) throws {
+        let renderer = ImageRenderer(content: content)
+        renderer.scale = 2
+        try self.init(try XCTUnwrap(renderer.cgImage), scale: 2)
+    }
+
+    var size: CGSize { CGSize(width: CGFloat(width) / scale, height: CGFloat(height) / scale) }
+    var alpha: [UInt8] { stride(from: 3, to: rgba.count, by: 4).map { rgba[$0] } }
+
+    /// The pixel under `point`, given in points.
+    func rgba(at point: CGPoint) -> [UInt8] {
+        let offset = (Int(point.y * scale) * width + Int(point.x * scale)) * 4
+        return Array(rgba[offset..<offset + 4])
+    }
+}
+
+/// Hands out defaults suites for one test at a time and deletes them when it finishes.
+/// The preferences system can write an emptied suite back to disk when the process exits,
+/// so names are reused from test to test to keep any such files to a fixed few.
+@MainActor
+private final class TemporaryDefaultsSuites: NSObject, XCTestObservation {
+    static let shared: TemporaryDefaultsSuites = {
+        let suites = TemporaryDefaultsSuites()
+        XCTestObservationCenter.shared.addTestObserver(suites)
+        return suites
+    }()
+
+    private var handedOut = 0
+
+    func next() -> String {
+        let name = "notty.tests.defaults.\(handedOut)"
+        handedOut += 1
+        // A run that stopped early may have left values behind.
+        UserDefaults.standard.removePersistentDomain(forName: name)
+        return name
+    }
+
+    nonisolated func testCaseDidFinish(_ testCase: XCTestCase) {
+        MainActor.assumeIsolated { removeAll() }
+    }
+
+    private func removeAll() {
+        let preferences = URL.libraryDirectory.appending(path: "Preferences", directoryHint: .isDirectory)
+        for index in 0..<handedOut {
+            let name = "notty.tests.defaults.\(index)"
+            UserDefaults.standard.removePersistentDomain(forName: name)
+            try? FileManager.default.removeItem(at: preferences.appending(path: name + ".plist"))
+        }
+        handedOut = 0
     }
 }
 

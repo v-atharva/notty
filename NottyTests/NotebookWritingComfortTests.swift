@@ -150,75 +150,79 @@ final class NotebookWritingComfortTests: XCTestCase {
         let fixture = try await presentController()
         defer { fixture.close() }
         let controller = fixture.controller
-        let picker = try XCTUnwrap(controller.drawingToolPicker)
-        XCTAssertTrue(picker.isVisible)
+        let store = try XCTUnwrap(controller.drawingToolStore)
+        XCTAssertTrue(store.isToolbarAvailable)
         controller.canvasViewDidBeginUsingTool(controller.canvasView)
         controller.setPaletteSuppressed(true)
-        XCTAssertTrue(picker.isVisible)
+        XCTAssertFalse(store.isToolbarAvailable, "tool choices stop as soon as suppression starts")
+        XCTAssertTrue(controller.canvasView.isFirstResponder, "the stroke in progress keeps its responder until it ends")
         controller.canvasViewDidEndUsingTool(controller.canvasView)
-        XCTAssertFalse(picker.isVisible)
+        XCTAssertFalse(store.isToolbarAvailable)
         XCTAssertTrue(controller.canvasView.becomeFirstResponder())
         XCTAssertTrue(controller.canvasView.isFirstResponder)
         controller.setPaletteSuppressed(true)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
-        XCTAssertFalse(picker.isVisible)
+        XCTAssertFalse(store.isToolbarAvailable)
         controller.setInputGate(.failed)
         controller.setPaletteSuppressed(false)
-        XCTAssertFalse(picker.isVisible)
+        XCTAssertFalse(store.isToolbarAvailable)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
         controller.setInputGate(.open)
-        XCTAssertTrue(picker.isVisible)
+        XCTAssertTrue(store.isToolbarAvailable)
         controller.setPaletteSuppressed(true)
         controller.setInputGate(.capacity)
         controller.setInputGate(.open)
-        XCTAssertFalse(picker.isVisible)
+        XCTAssertFalse(store.isToolbarAvailable)
         controller.setPaletteSuppressed(false)
-        XCTAssertTrue(picker.isVisible)
+        XCTAssertTrue(store.isToolbarAvailable)
     }
 
-    func testReadOnlyViewerAndUnmountedCanvasDoNotAllocatePicker() async throws {
-        let before = NotebookSceneToolPicker.creationCount
+    func testReadOnlyViewerAndUnmountedCanvasDoNotAllocateToolStore() async throws {
+        let before = NotebookSceneToolStore.creationCount
         let unmounted = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
         unmounted.loadViewIfNeeded()
-        XCTAssertNil(unmounted.drawingToolPicker)
-        XCTAssertEqual(NotebookSceneToolPicker.creationCount, before)
+        XCTAssertNil(unmounted.drawingToolStore)
+        XCTAssertEqual(NotebookSceneToolStore.creationCount, before)
         unmounted.tearDown()
-        let fixture = try await presentController(injectPicker: false, allowsEditing: false)
+        let fixture = try await presentController(injectStore: false, allowsEditing: false)
         defer { fixture.close() }
-        XCTAssertNil(fixture.controller.drawingToolPicker)
-        XCTAssertEqual(NotebookSceneToolPicker.creationCount, before)
+        XCTAssertNil(fixture.controller.drawingToolStore)
+        XCTAssertEqual(NotebookSceneToolStore.creationCount, before)
         XCTAssertFalse(fixture.controller.canvasView.isFirstResponder)
         fixture.controller.setInputGate(.open)
         XCTAssertEqual(fixture.controller.inputGate, .readOnly)
         XCTAssertFalse(fixture.controller.canvasView.isDrawingEnabled)
     }
 
-    func testSceneOwnedPickerHandoffRetainsSelectionAndRetiresOldOwner() async throws {
-        let first = try await presentController(injectPicker: false)
+    func testSceneOwnedToolStoreHandoffRetainsSelectionAndRetiresOldOwner() async throws {
+        let first = try await presentController(injectStore: false)
         defer { first.close() }
-        let picker = try XCTUnwrap(first.controller.drawingToolPicker)
+        let store = try XCTUnwrap(first.controller.drawingToolStore)
         let scene = try XCTUnwrap(first.window.windowScene)
-        XCTAssertEqual(picker.stateAutosaveName, "notty.palette." + scene.session.persistentIdentifier)
-        XCTAssertFalse(picker.showsDrawingPolicyControls)
-        let eraser = try XCTUnwrap(picker.toolItems.first { $0 is PKToolPickerEraserItem })
-        picker.selectedToolItem = eraser
+        // The scene store and its settings outlive this test, so restore both for the tests that follow.
+        NotebookTestFixtures.restoreSceneToolDefaults(for: scene, after: self)
+        let original = store.tool
+        defer { store.update { $0 = original } }
+        XCTAssertEqual(store.toolDefaultsKey, "notty.editor.tool." + scene.session.persistentIdentifier)
+        store.update { $0.select(.eraser(.vector)) }
         let manager = try XCTUnwrap(first.controller.canvasView.undoManager)
         manager.removeAllActions()
         let target = UndoTarget(manager: manager)
         target.register()
         var detachCount = 0
         first.controller.onDetach = { detachCount += 1 }
-        let second = try await presentController(injectPicker: false)
+        let second = try await presentController(injectStore: false)
         defer { second.close() }
-        XCTAssertTrue(try XCTUnwrap(second.controller.drawingToolPicker) === picker)
-        XCTAssertEqual(picker.selectedToolItemIdentifier, eraser.identifier)
+        XCTAssertTrue(try XCTUnwrap(second.controller.drawingToolStore) === store)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertTrue(second.controller.canvasView.tool is PKEraserTool, "the retained selection reaches the new canvas")
         XCTAssertEqual(detachCount, 1)
         XCTAssertFalse(manager.canUndo)
         XCTAssertFalse(manager.canRedo)
         XCTAssertFalse(first.controller.canvasView.isDrawingEnabled)
         XCTAssertTrue(second.controller.canvasView.isFirstResponder)
         first.controller.tearDown()
-        XCTAssertTrue(picker.isVisible)
+        XCTAssertTrue(store.isToolbarAvailable)
         XCTAssertTrue(second.controller.canvasView.isFirstResponder)
     }
 
@@ -426,7 +430,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         )
     }
 
-    func testClosedFirstAppearanceDefersPickerUntilGenuineOpenAdmission() async throws {
+    func testClosedFirstAppearanceDefersToolStoreUntilGenuineOpenAdmission() async throws {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
@@ -442,12 +446,12 @@ final class NotebookWritingComfortTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
-        try await waitForAppearance(controller, window: window, expectsPalette: false)
-        XCTAssertNil(controller.drawingToolPicker)
+        try await waitForAppearance(controller, window: window, expectsToolbar: false)
+        XCTAssertNil(controller.drawingToolStore)
         XCTAssertFalse(controller.canvasView.isFirstResponder)
         controller.setInputGate(.open)
-        let picker = try XCTUnwrap(controller.drawingToolPicker)
-        XCTAssertTrue(picker.isVisible)
+        let store = try XCTUnwrap(controller.drawingToolStore)
+        XCTAssertTrue(store.isToolbarAvailable)
         XCTAssertTrue(controller.canvasView.isFirstResponder)
     }
 
@@ -532,16 +536,15 @@ final class NotebookWritingComfortTests: XCTestCase {
     }
 
     private func presentController(
-        injectPicker: Bool = true, allowsEditing: Bool = true,
+        injectStore: Bool = true, allowsEditing: Bool = true,
         drawing: PKDrawing = PKDrawing(), paperView: NotebookPaperView? = nil
     ) async throws -> Fixture {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
-        let picker = PKToolPicker()
-        picker.stateAutosaveName = nil
         let controller = NotebookViewController(
-            pageCount: 3, initialDrawing: drawing, toolPicker: injectPicker ? picker : nil,
+            pageCount: 3, initialDrawing: drawing,
+            toolStore: injectStore ? NotebookTestFixtures.toolStore() : nil,
             allowsEditing: allowsEditing, paperView: paperView
         )
         let window = UIWindow(windowScene: scene)
@@ -551,7 +554,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         controller.view.layoutIfNeeded()
         let fixture = Fixture(controller: controller, window: window)
         do {
-            try await waitForAppearance(controller, window: window, expectsPalette: allowsEditing)
+            try await waitForAppearance(controller, window: window, expectsToolbar: allowsEditing)
             return fixture
         } catch {
             fixture.close()
@@ -560,11 +563,11 @@ final class NotebookWritingComfortTests: XCTestCase {
     }
 
     private func waitForAppearance(
-        _ controller: NotebookViewController, window: UIWindow, expectsPalette: Bool
+        _ controller: NotebookViewController, window: UIWindow, expectsToolbar: Bool
     ) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while !controller.isCanvasVisible || controller.view.window !== window
-            || (expectsPalette && (controller.drawingToolPicker?.isVisible != true
+            || (expectsToolbar && (controller.drawingToolStore?.isToolbarAvailable != true
                 || !controller.canvasView.isFirstResponder)) {
             guard ContinuousClock.now < deadline else {
                 XCTFail("The scene-backed canvas did not become visible and ready.")
