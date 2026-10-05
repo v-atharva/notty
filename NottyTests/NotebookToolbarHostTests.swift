@@ -388,6 +388,14 @@ final class NotebookToolbarHostTests: XCTestCase {
     // MARK: - Production wiring
 
     func testNotebookScreenFillsTheWindowWithScrollingPaperBeneathFloatingControls() async throws {
+        try await verifyFullScreenPaper(preloadsNotebook: true)
+    }
+
+    func testOpeningTransitionKeepsTheFullScreenPaperAndFloatingControlsUsable() async throws {
+        try await verifyFullScreenPaper(preloadsNotebook: false)
+    }
+
+    private func verifyFullScreenPaper(preloadsNotebook: Bool) async throws {
         let id = UUID()
         let root = NotebookTestFixtures.root()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -395,7 +403,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let probe = try NotebookStorageProbe(stored: stored, recoveryRoot: root)
         let storage = await probe.storage(notebookID: id)
         let session = NotebookSession(notebookID: id, openStorage: { storage })
-        await session.load()
+        if preloadsNotebook { await session.load() }
         let scene = try NotebookTestFixtures.windowScene()
         let previousKeyWindow = scene.keyWindow
         let owner = preserveSceneStore(for: scene)
@@ -438,6 +446,8 @@ final class NotebookToolbarHostTests: XCTestCase {
                 && !hit.isDescendant(of: controller.view)
         }
 
+        XCTAssertEqual(controller.canvasView.contentOffset.y, 0, accuracy: 0.5,
+            "Publishing overlay scroll space leaves paper beneath the controls.")
         let family: EditorInkFamily = owner.tool.kind == .ink(.marker) ? .pencil : .marker
         NotebookToolbarActions(store: owner).select(.ink(family))
         XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, family.inkType)

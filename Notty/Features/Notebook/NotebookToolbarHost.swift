@@ -12,7 +12,9 @@ struct NotebookToolbarHost<Content: View>: View {
     @State private var sceneStore: NotebookSceneToolStore?
     @State private var canvasFrame = CGRect.zero
 
-    /// - Parameter store: a store to use instead of the window scene's, for tests.
+    /// - Parameters:
+    ///   - store: a store to use instead of the window scene's, for tests.
+    ///   - extendsCanvasUnderChrome: lets paper cover system edges while controls stay in the safe area.
     init(
         store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false,
         @ViewBuilder content: () -> Content
