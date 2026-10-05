@@ -2,9 +2,8 @@ import NottyCore
 import SwiftUI
 import UIKit
 
-/// Places the drawing toolbar around the notebook canvas. Docked, the toolbar sits in a
-/// leather band above the canvas, which gives up that height; floating, it overlays the
-/// canvas at full size. The toolbar never moves with the page.
+/// Overlays the drawing toolbar on the full notebook canvas. Top docks anchor its position
+/// without reserving a band; the page scrolls behind every placement.
 @MainActor
 struct NotebookToolbarHost<Content: View>: View {
     private let injectedStore: NotebookSceneToolStore?
@@ -26,8 +25,7 @@ struct NotebookToolbarHost<Content: View>: View {
                 .onGeometryChange(for: CGRect.self) {
                     $0.frame(in: .named(NotebookToolbarLayer.coordinateSpace))
                 } action: { canvasFrame = $0 }
-                .safeAreaInset(edge: .top, spacing: 0) { band }
-                // The canvas resizes once to its final bounds; only the toolbar animates.
+                // Toolbar movement never animates the canvas viewport.
                 .transaction { $0.animation = nil }
             if let store {
                 NotebookToolbarLayer(store: store, canvasFrame: canvasFrame)
@@ -48,17 +46,6 @@ struct NotebookToolbarHost<Content: View>: View {
         }
     }
 
-    /// Until the scene's store is known the band follows the stored preferences, the same
-    /// ones the store starts from, so a restore never resizes the canvas after its first layout.
-    @ViewBuilder private var band: some View {
-        if let store {
-            NotebookToolbarStoreBand(store: store)
-        } else {
-            NotebookToolbarDockBand(preferences: EditorToolbarPreferences.decode(
-                UserDefaults.standard.data(forKey: NotebookSceneToolStore.toolbarDefaultsKey)
-            ))
-        }
-    }
 }
 
 /// Where a dragged toolbar is drawn and where it comes to rest, fixed at the start of a drag.
@@ -111,13 +98,13 @@ struct NotebookToolbarDragResolver: Equatable {
     }
 }
 
-/// How much of the canvas a floating toolbar takes from the page end it sits against, as
+/// How much of the canvas a toolbar takes from the page end it sits against, as
 /// extra scroll space for that end. A toolbar further from both edges than its own height
 /// leaves room to scroll any covered writing past it, so it reserves nothing; this also
 /// keeps a notebook opening with its first page at the top.
 enum NotebookToolbarObstruction {
-    static func insets(toolbar: CGRect, canvas: CGRect, isFloating: Bool) -> UIEdgeInsets {
-        guard isFloating, toolbar.intersects(canvas) else { return .zero }
+    static func insets(toolbar: CGRect, canvas: CGRect) -> UIEdgeInsets {
+        guard toolbar.intersects(canvas) else { return .zero }
         let topGap = toolbar.minY - canvas.minY
         let bottomGap = canvas.maxY - toolbar.maxY
         if topGap <= bottomGap {
@@ -220,7 +207,7 @@ private struct NotebookToolbarLayer: View {
             }
             .onChange(
                 of: NotebookToolbarObstruction.insets(
-                    toolbar: resting, canvas: canvasFrame, isFloating: composition.isFloating
+                    toolbar: resting, canvas: canvasFrame
                 ),
                 initial: true
             ) { _, insets in
@@ -385,46 +372,6 @@ private struct NotebookDockTargets: View {
             }
             .frame(width: frame.width, height: frame.height)
             .position(x: frame.midX, y: frame.midY)
-    }
-}
-
-/// The band reserved above the canvas for a docked toolbar; empty when the toolbar floats.
-/// A placement chosen during a stroke is drawn at once but resizes the canvas only when the
-/// stroke ends, so the page never shifts under the pen.
-private struct NotebookToolbarStoreBand: View {
-    @ObservedObject var store: NotebookSceneToolStore
-    @ObservedObject private var activity: NotebookToolActivity
-    /// The preferences last seen while no stroke was active.
-    @State private var settled: EditorToolbarPreferences
-
-    init(store: NotebookSceneToolStore) {
-        self.store = store
-        activity = store.activity
-        _settled = State(initialValue: store.toolbar)
-    }
-
-    var body: some View {
-        NotebookToolbarDockBand(preferences: activity.isToolActive ? settled : store.toolbar)
-            .onChange(of: store.toolbar) { _, toolbar in
-                if !activity.isToolActive { settled = toolbar }
-            }
-            .onChange(of: activity.isToolActive) { _, active in
-                if !active { settled = store.toolbar }
-            }
-    }
-}
-
-/// Its height depends only on placement and width class, never on availability, so pausing
-/// writing never resizes the canvas.
-private struct NotebookToolbarDockBand: View {
-    let preferences: EditorToolbarPreferences
-    @Environment(\.horizontalSizeClass) private var sizeClass
-
-    var body: some View {
-        NotebookLeatherSurface()
-            .frame(maxWidth: .infinity)
-            .frame(height: NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass).dockBandHeight)
-            .accessibilityHidden(true)
     }
 }
 

@@ -433,8 +433,7 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertTrue(controller.isCanvasVisible)
         XCTAssertTrue(store.isToolbarAvailable)
         XCTAssertEqual((controller.canvasView.tool as? PKInkingTool)?.inkType, EditorToolState.standard.inkFamily?.inkType)
-        let band = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular).dockBandHeight
-        XCTAssertEqual(fixture.canvasFrame.minY, band, accuracy: 0.5, "the toolbar falls back to the standard dock above the canvas")
+        XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5, "the standard anchor overlays the canvas")
         XCTAssertEqual(fixture.canvasFrame.maxY, fixture.host.bounds.maxY, accuracy: 0.5)
     }
 
@@ -1009,7 +1008,7 @@ final class NotebookControllerTests: XCTestCase {
         unowned.tearDown()
     }
 
-    func testPageRestingAtItsTopStaysThereWhenAFloatingToolbarFirstReservesSpace() async throws {
+    func testOverlayScrollRangeDoesNotPushThePageBelowTheToolbar() async throws {
         let store = NotebookTestFixtures.toolStore()
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
         let window = try await present(controller)
@@ -1022,11 +1021,11 @@ final class NotebookControllerTests: XCTestCase {
 
         store.setOverlayObstruction(UIEdgeInsets(top: 90, left: 0, bottom: 0, right: 0))
         XCTAssertEqual(canvas.contentInset.top, 90)
-        XCTAssertEqual(canvas.contentOffset.y, -90, "the first lines move clear of a toolbar that arrives after opening")
+        XCTAssertEqual(canvas.contentOffset.y, 0, "adding scroll range keeps the paper behind the overlay")
 
         controller.canvasViewDidBeginUsingTool(canvas)
         store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
-        XCTAssertEqual(canvas.contentOffset.y, -90, "the page never moves under a stroke in progress")
+        XCTAssertEqual(canvas.contentOffset.y, 0, "the page never moves under a stroke in progress")
         controller.canvasViewDidEndUsingTool(canvas)
 
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
@@ -1034,29 +1033,27 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(canvas.contentOffset.y, 300, "a page scrolled away from its top stays where it is")
     }
 
-    func testDockingAtTheTopOfThePageKeepsTheFirstLinesInView() async throws {
+    func testMovingTopAnchorsDoesNotPushThePageDown() async throws {
         let fixture = try await NotebookTestFixtures.mountToolbarHost()
         defer { fixture.close() }
         let canvas = fixture.controller.canvasView
         let actions = NotebookToolbarActions(store: fixture.store)
         let host = fixture.host
-        XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top)
+        XCTAssertEqual(canvas.contentOffset.y, 0, accuracy: 0.5)
 
         for placement in [
             EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.6)), .docked(.topLeading),
             .floating(CGPoint(x: 0.5, y: 0)), .docked(.topCenter)
         ] {
             actions.place(placement)
-            let band = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
-                .dockBandHeight
-            try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (host.bounds.height - band)) < 0.5 }
+            try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - host.bounds.height) < 0.5 }
             for _ in 0..<5 {
                 try await Task.sleep(for: .milliseconds(20))
                 host.layoutIfNeeded()
             }
             XCTAssertEqual(
-                canvas.contentOffset.y, -canvas.contentInset.top, accuracy: 0.5,
-                "\(placement): the page stays at the top of its first page"
+                canvas.contentOffset.y, 0, accuracy: 0.5,
+                "\(placement): toolbar movement does not displace the paper"
             )
         }
     }
