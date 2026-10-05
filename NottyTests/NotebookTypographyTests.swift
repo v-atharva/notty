@@ -38,10 +38,10 @@ final class NotebookTypographyTests: XCTestCase {
         let storage = await probe.storage(notebookID: id)
         let session = NotebookSession(notebookID: id, openStorage: { storage })
         await session.load()
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = StatusBarHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
         window.frame = scene.coordinateSpace.bounds
-        let control = UIHostingController(rootView:
+        let control = StatusBarHostingController(rootView:
             Color.white.preferredColorScheme(.light).toolbarColorScheme(.light, for: .statusBar)
         )
         window.rootViewController = control
@@ -56,12 +56,15 @@ final class NotebookTypographyTests: XCTestCase {
             window.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
-        try await NotebookTestFixtures.waitUntil { scene.statusBarManager?.statusBarStyle == .darkContent }
+        try await NotebookTestFixtures.waitUntil {
+            control.hasAppeared && scene.statusBarManager?.statusBarStyle == .darkContent
+        }
         window.rootViewController = hosting
         hosting.view.layoutIfNeeded()
         try await NotebookTestFixtures.waitUntil {
             mounted = NotebookTestFixtures.notebookController(in: hosting)
-            return mounted?.isCanvasVisible == true && scene.statusBarManager?.statusBarStyle == .lightContent
+            return hosting.hasAppeared && mounted?.isCanvasVisible == true
+                && scene.statusBarManager?.statusBarStyle == .lightContent
         }
         XCTAssertEqual(scene.statusBarManager?.statusBarStyle, .lightContent)
         XCTAssertEqual(mounted?.canvasView.traitCollection.userInterfaceStyle, .light)
@@ -133,5 +136,15 @@ final class NotebookTypographyTests: XCTestCase {
     private func weightTrait(of resolved: Font.Resolved) -> CGFloat {
         let traits = CTFontCopyTraits(resolved.ctFont) as NSDictionary
         return (traits[kCTFontWeightTrait] as? NSNumber).map { CGFloat($0.doubleValue) } ?? .nan
+    }
+}
+
+@MainActor
+private final class StatusBarHostingController<Content: View>: UIHostingController<Content> {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
     }
 }
