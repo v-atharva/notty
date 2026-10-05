@@ -30,11 +30,17 @@ final class NativeArchiveReuseTests: XCTestCase {
             XCTAssertEqual(restored.strokes[1].ink.inkType, tool.inkType, family.rawValue)
             XCTAssertEqual(restored.strokes[1].path.id, added.path.id, family.rawValue)
             XCTAssertEqual(restored.strokes[1].transform, added.transform, family.rawValue)
-            var actual = [CGFloat](repeating: 0, count: 4)
-            var expected = [CGFloat](repeating: 0, count: 4)
-            restored.strokes[1].ink.color.getRed(&actual[0], green: &actual[1], blue: &actual[2], alpha: &actual[3])
-            tool.color.getRed(&expected[0], green: &expected[1], blue: &expected[2], alpha: &expected[3])
-            for (lhs, rhs) in zip(actual, expected) { XCTAssertEqual(lhs, rhs, accuracy: 0.002, family.rawValue) }
+            func components(_ color: UIColor) -> [CGFloat] {
+                var red: CGFloat = 0
+                var green: CGFloat = 0
+                var blue: CGFloat = 0
+                var alpha: CGFloat = 0
+                XCTAssertTrue(color.getRed(&red, green: &green, blue: &blue, alpha: &alpha))
+                return [red, green, blue, alpha]
+            }
+            for (actual, expected) in zip(components(restored.strokes[1].ink.color), components(tool.color)) {
+                XCTAssertEqual(actual, expected, accuracy: 0.002, family.rawValue)
+            }
             let before = await decoder.workMetrics
             let reencoded = try await decoder.encode(restored)
             let after = await decoder.workMetrics
