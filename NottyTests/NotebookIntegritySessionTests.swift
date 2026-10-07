@@ -406,12 +406,13 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testIntegrityTransitionsAndTwentySavesKeepCanvasAndScreenStable() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        let hosting = UIHostingController(rootView: NotebookScreen(session: f.session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: f.session))
         let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
         try await NotebookTestFixtures.waitUntil {
             let audits = await f.probe.auditCount
             return f.session.renderDiagnostics.screenBodyCount > 0

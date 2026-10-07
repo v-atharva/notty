@@ -76,6 +76,39 @@ final class NotebookMaterials {
         return context.createCGImage(image.cropped(to: bounds), from: bounds, format: .RGBA8, colorSpace: space)
     }
 
+    private static var shellShadows: [CGFloat: UIImage] = [:]
+
+    /// The shells' drop shadow, baked once per corner radius so a moving shell never blurs
+    /// again. The image is the shell's rounded rectangle at its smallest, `2r + 2` points, with
+    /// the shadow bleeding past it on every side; the shell itself is cleared out. Its cap insets
+    /// leave only a two-point middle to stretch, along the straight sides.
+    static func shellShadow(cornerRadius: CGFloat) -> UIImage {
+        if let cached = shellShadows[cornerRadius] { return cached }
+        let shadow = NotebookTheme.shellShadow
+        let bleed = NotebookTheme.shellShadowBleed
+        let shell = CGRect(x: bleed, y: bleed, width: 2 * cornerRadius + 2, height: 2 * cornerRadius + 2)
+        let side = shell.width + 2 * bleed
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = tileScale
+        format.opaque = false
+        let image = UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: format).image { canvas in
+            let outline = UIBezierPath(roundedRect: shell, cornerRadius: cornerRadius)
+            // The shadow takes its opacity from the shape's, so a faint fill leaves no visible
+            // fringe where clearing the shape meets its anti-aliased edge.
+            canvas.cgContext.setShadow(offset: shadow.offset, blur: shadow.radius, color: shadow.tone.cgColor)
+            shadow.tone.uiColor.withAlphaComponent(shadow.opacity).setFill()
+            outline.fill()
+            canvas.cgContext.setShadow(offset: .zero, blur: 0, color: nil)
+            outline.fill(with: .clear, alpha: 1)
+        }
+        let cap = bleed + cornerRadius
+        let stretchable = image.resizableImage(
+            withCapInsets: UIEdgeInsets(top: cap, left: cap, bottom: cap, right: cap), resizingMode: .stretch
+        )
+        shellShadows[cornerRadius] = stretchable
+        return stretchable
+    }
+
     private static func flatTile(_ color: UIColor) -> UIImage {
         let format = UIGraphicsImageRendererFormat()
         format.scale = tileScale

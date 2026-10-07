@@ -310,12 +310,13 @@ final class NotebookSessionTests: XCTestCase {
         let (session, probe, root) = try await setup()
         defer { try? FileManager.default.removeItem(at: root) }
         await probe.setSaveFailure(nil)
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
         try await NotebookTestFixtures.waitUntil {
             session.renderDiagnostics.screenBodyCount > 0
                 && session.renderDiagnostics.canvasUpdateCount > 0

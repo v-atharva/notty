@@ -212,7 +212,7 @@ class NotebookPaperView: UIView {
     /// Fades `layer` from the shadow tone at `opacity` to transparent of the same tone, which
     /// keeps the fade from passing through gray.
     private static func shade(_ layer: CAGradientLayer, opacity: CGFloat, from start: CGPoint, to end: CGPoint) {
-        let tone = NotebookTheme.toolbarShadowTone.uiColor
+        let tone = NotebookTheme.shadowTone.uiColor
         layer.colors = [tone.withAlphaComponent(opacity).cgColor, tone.withAlphaComponent(0).cgColor]
         layer.startPoint = start
         layer.endPoint = end

@@ -315,7 +315,7 @@ struct NotebookToolbar<Handle: View>: View {
     private var actions: NotebookToolbarActions { NotebookToolbarActions(store: store) }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: NotebookTheme.toolbarCornerRadius, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
         HStack(spacing: 0) {
             handle
             VStack(spacing: 0) {
@@ -339,7 +339,7 @@ struct NotebookToolbar<Handle: View>: View {
                 Button(action: collapse) {
                     NotebookToolGlyph(symbol: "arrow.down.right.and.arrow.up.left", isSelected: false)
                 }
-                .buttonStyle(NotebookToolbarButtonStyle())
+                .buttonStyle(NotebookKeyStyle())
                 .accessibilityLabel("Hide tools")
             }
         }
@@ -518,13 +518,13 @@ private struct NotebookCurrentInkChip: View {
                     .overlay(NotebookSwatchOutline())
                     .frame(width: NotebookTheme.currentInkSwatchDiameter, height: NotebookTheme.currentInkSwatchDiameter)
                 Circle()
-                    .modifier(NotebookToolbarForeground())
+                    .modifier(NotebookKeyForeground())
                     .frame(width: store.tool.widthStep.dotDiameter, height: store.tool.widthStep.dotDiameter)
             }
             .frame(minWidth: NotebookTheme.currentInkChipWidth, minHeight: NotebookTheme.controlSize)
             .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle())
+        .buttonStyle(NotebookKeyStyle())
         .accessibilityLabel("Ink options")
         .accessibilityValue("\(store.tool.color.accessibilityName), \(store.tool.widthStep.title) width")
         .popover(isPresented: $showsOptions) {
@@ -614,11 +614,11 @@ private struct NotebookToolStrip<Content: View>: View {
         } label: {
             Image(systemName: symbol)
                 .font(.system(size: NotebookTheme.chevronSize, weight: .semibold))
-                .modifier(NotebookToolbarForeground())
+                .modifier(NotebookKeyForeground())
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle())
+        .buttonStyle(NotebookKeyStyle())
         .accessibilityLabel(label)
     }
 }
@@ -635,7 +635,7 @@ private struct NotebookToolButton: View {
         Button(action: action) {
             NotebookToolGlyph(symbol: symbol, isSelected: isSelected)
         }
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: isSelected))
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         // Several inks share similar glyphs, so pointer and Pencil hover name them.
         .help(title)
         .accessibilityLabel(title)
@@ -677,7 +677,7 @@ private struct NotebookEraserButton: View {
         // A button-styled menu draws its label through the toolbar's button style, so the
         // eraser presses and focuses like every other control.
         .menuStyle(.button)
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: selectedMode != nil))
+        .buttonStyle(NotebookKeyStyle(isSelected: selectedMode != nil))
         .help("Eraser")
         .accessibilityLabel("Eraser")
         .accessibilityValue(selectedMode.map { $0 == .vector ? "Object" : "Pixel" } ?? "")
@@ -719,18 +719,18 @@ struct NotebookPresetChip: View {
                     .lineLimit(1)
                     .fixedSize()
             }
-            .modifier(NotebookToolbarForeground())
+            .modifier(NotebookKeyForeground())
             .padding(.horizontal, NotebookTheme.presetChipPadding)
             .frame(height: NotebookTheme.presetChipHeight)
             .background {
                 if !isSelected {
-                    Capsule().strokeBorder(NotebookTheme.toolbarLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
+                    Capsule().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
                 }
             }
             .frame(minHeight: NotebookTheme.controlSize)
             .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: isSelected, shape: .capsule))
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected, shape: .capsule))
         .accessibilityLabel("\(preset.name) preset")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -754,7 +754,7 @@ private struct NotebookSwatchButton: View {
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: isSelected))
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel(color.accessibilityName)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -831,7 +831,7 @@ private struct NotebookCustomColorWell: View {
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: isSelected))
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel("Custom color")
         .accessibilityValue(isSelected ? store.tool.color.accessibilityName : "")
         .accessibilityHint("Opens the color picker. The color showing when you close it is added to your swatches.")
@@ -922,7 +922,7 @@ private struct NotebookWidthButton: View {
     var body: some View {
         Button(action: action) {
             Circle()
-                .modifier(NotebookToolbarForeground())
+                .modifier(NotebookKeyForeground())
                 .frame(width: step.dotDiameter, height: step.dotDiameter)
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
                 .overlay(alignment: .bottom) {
@@ -930,14 +930,14 @@ private struct NotebookWidthButton: View {
                 }
                 .contentShape(Rectangle())
         }
-        .buttonStyle(NotebookToolbarButtonStyle(isSelected: isSelected))
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel("\(step.title) width")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
 /// A tool symbol in a 44-point control, with the selection mark when selected. The well
-/// behind it comes from `NotebookToolbarButtonStyle`.
+/// behind it comes from `NotebookKeyStyle`.
 @MainActor
 struct NotebookToolGlyph: View {
     let symbol: String
@@ -946,7 +946,7 @@ struct NotebookToolGlyph: View {
     var body: some View {
         Image(systemName: symbol)
             .font(NotebookTheme.glyphFont)
-            .modifier(NotebookToolbarForeground())
+            .modifier(NotebookKeyForeground())
             .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
             .overlay(alignment: .bottom) {
                 if isSelected { NotebookSelectionMark() }
@@ -955,91 +955,17 @@ struct NotebookToolGlyph: View {
     }
 }
 
-/// The recessed well behind a selected control: a darker fill with an inner shadow.
-struct NotebookSelectedWell<WellShape: Shape>: View {
-    let shape: WellShape
-
-    var body: some View {
-        shape.fill(
-            NotebookTheme.selectedWell.color.shadow(
-                .inner(
-                    color: NotebookTheme.toolbarShadowTone.color.opacity(NotebookTheme.wellShadowOpacity),
-                    radius: NotebookTheme.wellShadowRadius, x: 0, y: NotebookTheme.wellShadowDepth
-                )
-            )
-        )
-    }
-}
-
-/// What a toolbar control draws behind and around itself in each interaction state. Every
-/// state changes shape or depth, never only colour: selection is the inset well (the label
-/// adds a mark or checkmark), a press sinks the control, and keyboard focus draws a ring.
-struct NotebookControlBackground: View {
-    enum Outline {
-        /// The rounded square behind glyphs, swatches and widths.
-        case well
-        /// The capsule behind a preset.
-        case capsule
-    }
-
-    /// As heavy as the selection mark, so focus reads at the same weight as selection.
-    private static let focusRingWidth = NotebookTheme.selectionMarkSize.height
-
-    let shape: Outline
-    let isSelected: Bool
-    let isPressed: Bool
-    let isFocused: Bool
-
-    var body: some View {
-        switch shape {
-        case .well:
-            layers(RoundedRectangle(cornerRadius: NotebookTheme.selectedWellCornerRadius, style: .continuous))
-        case .capsule:
-            layers(Capsule())
-        }
-    }
-
-    private func layers<S: InsettableShape>(_ outline: S) -> some View {
-        ZStack {
-            if isSelected {
-                NotebookSelectedWell(shape: outline)
-                if isPressed {
-                    // A selected control is already sunk, so a press deepens its shadow.
-                    outline.fill(NotebookTheme.toolbarShadowTone.color.opacity(NotebookTheme.wellShadowOpacity))
-                }
-            } else if isPressed {
-                outline.fill(NotebookTheme.selectedWell.color.opacity(NotebookTheme.pressedWellOpacity))
-            }
-            if isFocused {
-                outline.strokeBorder(NotebookTheme.glyph.color, lineWidth: Self.focusRingWidth)
-            }
-        }
-        .accessibilityHidden(true)
-    }
-}
-
-/// The non-colour selection cue under a selected glyph.
-private struct NotebookSelectionMark: View {
-    var body: some View {
-        Capsule()
-            .modifier(NotebookToolbarForeground())
-            .frame(width: NotebookTheme.selectionMarkSize.width, height: NotebookTheme.selectionMarkSize.height)
-            .padding(.bottom, NotebookTheme.selectionMarkInset)
-            .accessibilityHidden(true)
-    }
-}
-
 /// The toolbar's raised ivory shell: a pale fill, a one-point bevel and a shallow shadow.
 struct NotebookToolbarShell: View {
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: NotebookTheme.toolbarCornerRadius, style: .continuous)
-        let shadow = NotebookTheme.toolbarShadow
+        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
+        let shadow = NotebookTheme.shellShadow
         shape
-            .fill(NotebookTheme.toolbarSurface.color)
+            .fill(NotebookTheme.panelSurface.color)
             .overlay {
                 shape.strokeBorder(
                     LinearGradient(
-                        colors: [NotebookTheme.toolbarHighlight.color, NotebookTheme.toolbarLowerEdge.color],
+                        colors: [NotebookTheme.panelHighlight.color, NotebookTheme.panelLowerEdge.color],
                         startPoint: .top, endPoint: .bottom
                     ),
                     lineWidth: NotebookTheme.shellBorderWidth
@@ -1052,7 +978,7 @@ struct NotebookToolbarShell: View {
 /// A hairline around a colour so pale swatches stay visible on the ivory shell.
 private struct NotebookSwatchOutline: View {
     var body: some View {
-        Circle().strokeBorder(NotebookTheme.toolbarLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
+        Circle().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
     }
 }
 
@@ -1071,48 +997,8 @@ private struct NotebookToolbarDivider: View {
                     .padding(.horizontal, NotebookTheme.stripInsets.left)
             }
         }
-        .foregroundStyle(NotebookTheme.toolbarDivider.color)
+        .foregroundStyle(NotebookTheme.divider.color)
         .accessibilityHidden(true)
-    }
-}
-
-/// Draws the selected, pressed and focused states of every toolbar control the same way.
-struct NotebookToolbarButtonStyle: ButtonStyle {
-    var isSelected = false
-    var shape = NotebookControlBackground.Outline.well
-
-    func makeBody(configuration: Configuration) -> some View {
-        NotebookToolbarControl(
-            label: configuration.label, isSelected: isSelected, isPressed: configuration.isPressed, shape: shape
-        )
-    }
-}
-
-private struct NotebookToolbarControl<Label: View>: View {
-    let label: Label
-    let isSelected: Bool
-    let isPressed: Bool
-    let shape: NotebookControlBackground.Outline
-    @Environment(\.isFocused) private var isFocused
-    @Environment(\.isEnabled) private var isEnabled
-
-    var body: some View {
-        label.background {
-            NotebookControlBackground(
-                shape: shape, isSelected: isSelected, isPressed: isPressed && isEnabled, isFocused: isFocused && isEnabled
-            )
-            // A preset's capsule is shorter than its touch area.
-            .frame(maxHeight: shape == .capsule ? NotebookTheme.presetChipHeight : .infinity)
-        }
-    }
-}
-
-/// Glyph and mark colour, turning to the disabled tone while writing is paused.
-private struct NotebookToolbarForeground: ViewModifier {
-    @Environment(\.isEnabled) private var isEnabled
-
-    func body(content: Content) -> some View {
-        content.foregroundStyle((isEnabled ? NotebookTheme.glyph : NotebookTheme.disabledGlyph).color)
     }
 }
 

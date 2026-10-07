@@ -25,6 +25,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let before = Date()
         let restored = await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id)
         XCTAssertTrue(restored)
+        assertPresentationCurrent(session)
         do {
             try await NotebookTestFixtures.waitUntil { await trace.saveEntered }
             let pending = try XCTUnwrap(session.pendingEdits.first)
@@ -239,6 +240,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         ))
         let restored = await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id)
         XCTAssertFalse(restored)
+        assertPresentationCurrent(session)
         XCTAssertEqual(retireCalls, 1)
         XCTAssertNotEqual(session.canvasGeneration, generation)
         XCTAssertNil(session.canvasOwnerID)
@@ -350,6 +352,53 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         XCTAssertNotNil(session.recoveryFailure)
     }
 
+    func testPreservationAndReopenReturnWithTheirPresentationCurrent() async throws {
+        let fixture = try await RestoreFixture()
+        defer { fixture.remove() }
+        let trace = RestoreStorageTrace(base: fixture.storage, saveFailure: .contentLimit, rejectLegacy: true)
+        let session = try await fixture.session(storage: await trace.storage())
+        let seed = session.makeCanvasSeed()
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil })
+        let waiting = PKDrawing(strokes: [NotebookTestFixtures.stroke(x: 700)])
+        session.recordObservation(
+            NotebookCanvasObservation(generation: 1, drawing: waiting,
+                                      capturedAt: Date(timeIntervalSince1970: 110), uptime: 110), ownerID: seed.ownerID
+        )
+        await session.waitUntilSettled()
+        await session.saveRecoveryCopy()
+        assertPresentationCurrent(session)
+        XCTAssertTrue(session.canReopenSaved)
+
+        // Ink delivered as the canvas retires keeps the reopen from replacing the waiting edits, so
+        // the reopen fails after recreating the canvas.
+        let late = PKDrawing(strokes: waiting.strokes + [NotebookTestFixtures.stroke(x: 750)])
+        session.attachCanvas(ownerID: seed.ownerID, observations: { nil }, controls: NotebookCanvasControls(
+            undo: {}, redo: {}, setPaletteSuppressed: { _ in }, applyPageCount: { _ in },
+            retire: {
+                session.recordObservation(
+                    NotebookCanvasObservation(generation: 2, drawing: late,
+                                              capturedAt: Date(timeIntervalSince1970: 120), uptime: 120),
+                    ownerID: seed.ownerID
+                )
+                session.detachCanvas(ownerID: seed.ownerID)
+            }
+        ))
+        let generation = session.canvasGeneration
+        await session.reopenSavedNotebook()
+        assertPresentationCurrent(session)
+        XCTAssertNotEqual(session.canvasGeneration, generation)
+        XCTAssertEqual(session.pendingEdits.count, 2)
+        XCTAssertNotNil(session.recoveryFailure)
+
+        await session.saveRecoveryCopy()
+        assertPresentationCurrent(session)
+        XCTAssertTrue(session.canReopenSaved)
+        await session.reopenSavedNotebook()
+        assertPresentationCurrent(session)
+        XCTAssertTrue(session.pendingEdits.isEmpty)
+        XCTAssertNil(session.recoveryFailure)
+    }
+
     func testDamagedOtherEditStillAllowsAuthenticatedSelectedInspectionAndRestore() async throws {
         let fixture = try await RestoreFixture()
         defer { fixture.remove() }
@@ -433,12 +482,13 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         do {
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
             try await NotebookTestFixtures.waitUntil {
                 guard let controller = self.notebookController(in: hosting) else { return false }
                 return controller.isCanvasVisible && controller.canvasView.window != nil
@@ -490,6 +540,27 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         window.isHidden = true
         window.rootViewController = nil
         await session.waitUntilSettled()
+    }
+
+    /// Asserts that the presentation models already show the session's state. A recovery operation
+    /// can rebuild the canvas, which attaches during a SwiftUI update; presentation left for a later
+    /// turn would be published from inside that update.
+    private func assertPresentationCurrent(
+        _ session: NotebookSession, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertFalse(session.isPerformingRecovery, file: file, line: line)
+        XCTAssertEqual(
+            session.gateModel.state,
+            NotebookCanvasGateModel.State(pageCount: session.pageCount, inputGate: session.inputGate),
+            file: file, line: line
+        )
+        XCTAssertEqual(session.statusModel.state, NotebookSavePresentation(
+            status: session.saveState, inputPaused: session.inputPaused,
+            performingRecovery: session.isPerformingRecovery,
+            canPreserveRecovery: session.canPreserveRecovery, canReopenSaved: session.canReopenSaved,
+            recoveryMessage: session.recoveryMessage, recoveryFailure: session.recoveryFailure,
+            isReady: session.loadState == .ready
+        ), file: file, line: line)
     }
 
     private func notebookController(in controller: UIViewController) -> NotebookViewController? {

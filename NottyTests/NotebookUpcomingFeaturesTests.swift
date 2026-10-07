@@ -164,7 +164,7 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
     func testSoonMarkIsAQuietCaptionThatDimsWithTheToolbar() throws {
         let enabled = try darkestLuminance(of: NotebookUpcomingMark())
         let paused = try darkestLuminance(of: NotebookUpcomingMark().environment(\.isEnabled, false))
-        XCTAssertEqual(enabled, luminance(NotebookTheme.paperControlTint.uiColor), accuracy: 0.03)
+        XCTAssertEqual(enabled, luminance(NotebookTheme.controlTint.uiColor), accuracy: 0.03)
         XCTAssertGreaterThan(enabled, luminance(NotebookTheme.glyph.uiColor) + 0.05, "Lighter than a working tool glyph.")
         XCTAssertEqual(paused, luminance(NotebookTheme.disabledGlyph.uiColor), accuracy: 0.03)
     }
@@ -269,11 +269,12 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         let store = NotebookSceneToolStore.owner(for: scene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: width, height: 1_366)
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         if let horizontalSizeClass { hosting.traitOverrides.horizontalSizeClass = horizontalSizeClass }
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         do {
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
             var controller: NotebookViewController?
             try await NotebookTestFixtures.waitUntil {
                 controller = NotebookTestFixtures.notebookController(in: hosting)

@@ -20,6 +20,9 @@ final class NotebookSceneToolStore: ObservableObject {
     @Published private(set) var isToolbarAvailable = false
     /// Incremented when an Apple Pencil gesture asks for the tools to be shown.
     @Published private(set) var revealRequest: UInt64 = 0
+    /// True while the writing view keeps the tools out of sight. The toolbar keeps its
+    /// placement and preferences; only whether it shows changes.
+    @Published private(set) var areToolsHidden = false
     /// True while the owning canvas has a stroke or other tool use in progress. Not published,
     /// so a pen going down or up never invalidates the toolbar's controls.
     private(set) var isToolActive = false
@@ -135,6 +138,18 @@ final class NotebookSceneToolStore: ObservableObject {
         defaults.set(data, forKey: toolDefaultsKey)
         defaults.set(data, forKey: Self.lastToolDefaultsKey)
         activeController?.applyTool(next)
+    }
+
+    /// Shows or hides the tools. Only a real change is published, so repeated requests from
+    /// scrolling or pen-up never invalidate the toolbar.
+    func setToolsHidden(_ hidden: Bool) {
+        guard areToolsHidden != hidden else { return }
+        areToolsHidden = hidden
+    }
+
+    /// Brings hidden tools back, as a tap on the reveal tab or a Pencil gesture asks.
+    func revealTools() {
+        setToolsHidden(false)
     }
 
     /// Stores settled toolbar preferences. Callers pass final drag results, not every frame.

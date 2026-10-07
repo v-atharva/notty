@@ -97,11 +97,12 @@ enum NativeArchiveFixtures {
 final class NativeArchiveCanvas: NSObject, PKCanvasViewDelegate {
     let window: UIWindow
     let canvas = PKCanvasView()
-    private let controller = UIViewController()
+    private let controller = AppearanceTrackingController()
     private var renderExpectation: XCTestExpectation?
     private var expectedIDs: [UUID] = []
 
-    init(windowScene: UIWindowScene) {
+    /// Shows a canvas in its own window, returning once the window's root has appeared.
+    init(windowScene: UIWindowScene) async throws {
         window = UIWindow(windowScene: windowScene)
         super.init()
         window.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
@@ -113,6 +114,12 @@ final class NativeArchiveCanvas: NSObject, PKCanvasViewDelegate {
         controller.view.addSubview(canvas)
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
+        do {
+            try await NotebookTestFixtures.waitUntilAppeared(controller)
+        } catch {
+            close()
+            throw error
+        }
     }
 
     func assign(_ drawing: PKDrawing) async {

@@ -85,6 +85,7 @@ final class NotebookSaveThroughputTests: XCTestCase {
             if !didTearDown { controller.tearDown() }
             window.isHidden = true
         }
+        try await NotebookTestFixtures.waitUntilAppeared(controller)
         try await NotebookTestFixtures.waitUntil {
             controller.view.window === window && controller.canvasView.isFirstResponder
                 && controller.canvasView.delegate === controller

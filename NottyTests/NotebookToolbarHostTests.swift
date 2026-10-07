@@ -102,12 +102,12 @@ final class NotebookToolbarHostTests: XCTestCase {
         // A closure property, like the toolbar's own, must not make the content compare as changed.
         let content = CountedContent(counter: counter, action: { _ = counter })
             .modifier(NotebookToolbarDragPosition(drag: session, restingFrame: resolver.startFrame))
-        let hosting = UIHostingController(
+        let hosting = AppearanceTrackingHostingController(
             rootView: ZStack(alignment: .topLeading) { content }.frame(width: usable.width, height: usable.height)
         )
         hosting.safeAreaRegions = []
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
-        show(hosting, in: window)
+        try await show(hosting, in: window)
         defer { close(window) }
         try await settle(hosting.view)
         let bodies = counter.bodies
@@ -198,9 +198,9 @@ final class NotebookToolbarHostTests: XCTestCase {
 
         let probe = LayoutProbeView()
         let window = UIWindow(windowScene: scene)
-        let hosting = UIHostingController(rootView: NotebookToolbarHost { LayoutProbe(view: probe) })
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookToolbarHost { LayoutProbe(view: probe) })
         hosting.safeAreaRegions = []
-        show(hosting, in: window)
+        try await show(hosting, in: window)
         defer { close(window) }
 
         let host = hosting.view!
@@ -770,9 +770,9 @@ final class NotebookToolbarHostTests: XCTestCase {
 
     private func showScreen(
         _ session: NotebookSession, in scene: UIWindowScene
-    ) -> (UIWindow, EdgePaperHostingController<NotebookScreen>) {
+    ) -> (UIWindow, AppearanceTrackingHostingController<NotebookScreen>) {
         let window = UIWindow(windowScene: scene)
-        let hosting = EdgePaperHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         window.frame = scene.effectiveGeometry.coordinateSpace.bounds
         window.rootViewController = hosting
         window.makeKeyAndVisible()
@@ -780,11 +780,18 @@ final class NotebookToolbarHostTests: XCTestCase {
         return (window, hosting)
     }
 
-    private func show(_ hosting: UIViewController, in window: UIWindow) {
+    /// Shows `hosting` in `window`, returning once it has appeared and closing the window if it never does.
+    private func show(_ hosting: some AppearanceTracking, in window: UIWindow) async throws {
         window.frame = Self.windowFrame
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         hosting.view.layoutIfNeeded()
+        do {
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        } catch {
+            close(window)
+            throw error
+        }
     }
 
     private func close(_ window: UIWindow) {
@@ -868,14 +875,4 @@ private struct LayoutProbe: UIViewRepresentable {
     func makeUIView(context: Context) -> LayoutProbeView { view }
 
     func updateUIView(_ view: LayoutProbeView, context: Context) {}
-}
-
-@MainActor
-private final class EdgePaperHostingController<Content: View>: UIHostingController<Content> {
-    private(set) var hasAppeared = false
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        hasAppeared = true
-    }
 }

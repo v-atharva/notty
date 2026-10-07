@@ -492,6 +492,9 @@ final class NotebookSession: ObservableObject {
 
     private func finishRecoveryOperation() {
         isPerformingRecovery = false
+        // Refreshed now, not on the next turn: a canvas rebuilt by the operation attaches during a
+        // SwiftUI update, where stale presentation would be published.
+        refreshPresentation()
         let waiters = recoveryWaiters
         recoveryWaiters.removeAll()
         waiters.forEach { $0.resume() }
@@ -859,7 +862,6 @@ final class NotebookSession: ObservableObject {
             if restoreID == operation {
                 restoreID = nil
                 finishRecoveryOperation()
-                refreshPresentation()
             }
         }
         do {

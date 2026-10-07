@@ -78,7 +78,7 @@ final class NativeArchiveReuseTests: XCTestCase {
         let assets = try await encoder.encode(PKDrawing(strokes: originals))
         let codec = InkCodec()
         let drawing = try await codec.decode(assets)
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         await live.assign(drawing)
         XCTAssertNotNil(live.canvas.window)
@@ -121,7 +121,7 @@ final class NativeArchiveReuseTests: XCTestCase {
         XCTAssertEqual(changed.path.count, original.path.count)
         XCTAssertEqual(changed.path.creationDate, original.path.creationDate)
         XCTAssertNotEqual(changed.path.id, original.path.id)
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         let codec = InkCodec()
         for native in [original, changed] {
@@ -154,7 +154,7 @@ final class NativeArchiveReuseTests: XCTestCase {
     func testLiveCanvasEveryPublicPointFieldUsesDistinctNativePathIdentity() async throws {
         let original = NativeArchiveFixtures.stroke()
         let untouched = NativeArchiveFixtures.stroke(x: 120)
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         var pathIDs: Set<UUID> = [original.path.id]
         for field in NativeArchiveFixtures.PointField.allCases {
@@ -207,7 +207,7 @@ final class NativeArchiveReuseTests: XCTestCase {
     }
 
     func testLiveCanvasNativeWorkRemainsBoundedAtOneHundredAndTwoThousand() async throws {
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         var samples: [[String: Int]] = []
         for count in [100, 2_000] {
@@ -279,7 +279,7 @@ final class NativeArchiveReuseTests: XCTestCase {
     func testLiveCanvasFieldChangesSerializeOnlyTheChangedNativeStroke() async throws {
         let native = NativeArchiveFixtures.stroke()
         let untouched = NativeArchiveFixtures.stroke(x: 120)
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         let codec = InkCodec()
         let original = try await codec.encode(PKDrawing(strokes: [native, untouched]))
@@ -345,7 +345,7 @@ final class NativeArchiveReuseTests: XCTestCase {
         let natives = [NativeArchiveFixtures.stroke(), NativeArchiveFixtures.stroke(x: 120)]
         let codec = InkCodec()
         let original = try await codec.encode(PKDrawing(strokes: natives))
-        let live = try NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
+        let live = try await NativeArchiveCanvas(windowScene: NotebookTestFixtures.windowScene())
         defer { live.close() }
         await live.assign(PKDrawing(strokes: [natives[1]]))
         _ = try await codec.encode(live.canvas.drawing)

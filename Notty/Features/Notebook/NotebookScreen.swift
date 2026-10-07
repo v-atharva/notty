@@ -95,7 +95,7 @@ struct NotebookScreen: View {
                 }
             }
         }
-        .tint(NotebookTheme.paperControlTint.color)
+        .tint(NotebookTheme.controlTint.color)
         .preferredColorScheme(.light)
         .toolbarColorScheme(.light, for: .statusBar)
         .sheet(isPresented: $showsRecoveryCopies, onDismiss: session.endRecoveryCopiesPresentation) {

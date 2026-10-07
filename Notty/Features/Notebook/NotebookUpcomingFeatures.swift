@@ -55,7 +55,7 @@ struct NotebookUpcomingToolButton: View {
         Button {} label: {
             NotebookToolGlyph(symbol: feature.symbol, isSelected: false)
         }
-        .buttonStyle(NotebookToolbarButtonStyle())
+        .buttonStyle(NotebookKeyStyle())
         .disabled(true)
         .accessibilityLabel(feature.accessibilityLabel)
         .help(feature.accessibilityLabel)
@@ -76,7 +76,7 @@ struct NotebookUpcomingMark: View {
     var body: some View {
         Text("Soon")
             .font(NotebookTheme.controlLabel.font)
-            .foregroundStyle((isEnabled ? NotebookTheme.paperControlTint : NotebookTheme.disabledGlyph).color)
+            .foregroundStyle((isEnabled ? NotebookTheme.controlTint : NotebookTheme.disabledGlyph).color)
             .lineLimit(1)
             .minimumScaleFactor(0.8)
             .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)

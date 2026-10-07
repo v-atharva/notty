@@ -9,18 +9,22 @@ struct NotebookToolbarHost<Content: View>: View {
     private let injectedStore: NotebookSceneToolStore?
     private let content: Content
     private let extendsCanvasUnderChrome: Bool
+    private let topReservation: CGFloat
     @State private var sceneStore: NotebookSceneToolStore?
     @State private var chrome = NotebookCanvasChrome.none
 
     /// - Parameters:
     ///   - store: a store to use instead of the window scene's, for tests.
     ///   - extendsCanvasUnderChrome: lets paper cover system edges while controls stay in the safe area.
+    ///   - topReservation: room below the top safe area for a header drawn over the canvas. The
+    ///     toolbar lays out below it, and the canvas reserves it as covered chrome.
     init(
-        store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false,
+        store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false, topReservation: CGFloat = 0,
         @ViewBuilder content: () -> Content
     ) {
         injectedStore = store
         self.extendsCanvasUnderChrome = extendsCanvasUnderChrome
+        self.topReservation = topReservation
         self.content = content()
     }
 
@@ -30,8 +34,9 @@ struct NotebookToolbarHost<Content: View>: View {
         ZStack(alignment: .topLeading) {
             content
                 // Every canvas reserves the chrome and the toolbar drawn over it, whether or not
-                // it owns the tools.
-                .environment(\.notebookCanvasChrome, chrome)
+                // it owns the tools. The reservation is applied here rather than measured, so a
+                // new reservation reaches the canvas even when no geometry changes.
+                .environment(\.notebookCanvasChrome, chrome.reserving(top: topReservation))
                 .environment(\.notebookToolbarStore, store)
                 // One measurement gives the canvas and the control area together, so the chrome
                 // never passes through a value mixing an old size with a new one.
@@ -46,6 +51,7 @@ struct NotebookToolbarHost<Content: View>: View {
                 .ignoresSafeArea(extendsCanvasUnderChrome ? .container : .keyboard)
             if let store {
                 NotebookToolbarLayer(store: store)
+                    .padding(.top, topReservation)
                     // The toolbar is read before the canvas, as it sits above it.
                     .accessibilityElement(children: .contain)
                     .accessibilitySortPriority(1)
@@ -141,6 +147,13 @@ extension NotebookCanvasChrome {
             top: max(controlArea.minY, 0), bottom: max(canvasSize.height - controlArea.maxY, 0),
             canvasSize: canvasSize
         )
+    }
+
+    /// The chrome with `reservation` more covered at the top, where the host keeps room for a
+    /// header below the top safe area. An unmeasured canvas stays unmeasured.
+    func reserving(top reservation: CGFloat) -> NotebookCanvasChrome {
+        guard self != .none, reservation > 0 else { return self }
+        return NotebookCanvasChrome(top: top + reservation, bottom: bottom, canvasSize: canvasSize)
     }
 }
 
@@ -421,9 +434,9 @@ private struct NotebookDockTargets: View {
     /// Targets lie over paper, or over the stone backdrop beside a zoomed-out page, so a pale
     /// fill and dark dashes keep them readable on both.
     private func target(_ frame: CGRect, fill: Double) -> some View {
-        let shape = RoundedRectangle(cornerRadius: NotebookTheme.toolbarCornerRadius, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
         return shape
-            .fill(NotebookTheme.toolbarSurface.color.opacity(fill))
+            .fill(NotebookTheme.panelSurface.color.opacity(fill))
             .overlay {
                 shape.strokeBorder(
                     NotebookTheme.glyph.color.opacity(NotebookTheme.dockSlotOutlineOpacity),
@@ -435,15 +448,20 @@ private struct NotebookDockTargets: View {
     }
 }
 
-/// The drag region at the leading end of the toolbar, kept apart from the scrolling strips.
+/// The drag region at the leading end of the toolbar, kept apart from the scrolling strips:
+/// two raised ridges, as on hardware.
 private struct NotebookToolbarGrip: View {
     var body: some View {
-        Capsule()
-            .fill(NotebookTheme.toolbarDivider.color)
-            .frame(width: NotebookTheme.dragHandleSize.height, height: NotebookTheme.dragHandleSize.width)
-            .frame(width: NotebookTheme.dragHandleHitSize.width)
-            .frame(maxHeight: .infinity)
-            .contentShape(Rectangle())
+        HStack(spacing: NotebookTheme.gripRidgeSpacing) {
+            ForEach(0..<2, id: \.self) { _ in
+                Capsule()
+                    .frame(width: NotebookTheme.gripRidgeSize.width, height: NotebookTheme.gripRidgeSize.height)
+            }
+        }
+        .foregroundStyle(NotebookTheme.glyphSecondary.color)
+        .frame(width: NotebookTheme.dragHandleHitSize.width)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
     }
 }
 
@@ -482,14 +500,14 @@ struct NotebookRevealHandleBody<Label: View>: View {
         label
             .frame(width: NotebookTheme.collapsedHandleSize.width, height: NotebookTheme.collapsedHandleSize.height)
             .background {
-                NotebookControlBackground(
+                NotebookKeyStyle.Background(
                     shape: .well, isSelected: false, isPressed: isPressed && isEnabled, isFocused: isFocused && isEnabled
                 )
                 // Inset as controls are in a strip, which keeps the well's corners inside the shell's.
                 .padding(NotebookTheme.stripInsets.top)
             }
             .background { NotebookToolbarShell() }
-            .contentShape(RoundedRectangle(cornerRadius: NotebookTheme.toolbarCornerRadius, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous))
     }
 }
 

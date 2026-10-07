@@ -101,7 +101,7 @@ final class NotebookToolbarTests: XCTestCase {
         defer { store.detach(owner) }
         let probe = EnabledProbe()
         let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
-        let hosting = UIHostingController(
+        let hosting = AppearanceTrackingHostingController(
             rootView: NotebookToolbar(store: store, composition: composition, collapse: {}) {
                 EnabledProbeView(probe: probe)
             }
@@ -115,6 +115,7 @@ final class NotebookToolbarTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
 
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == true }
         store.setToolbarAvailable(false, for: owner)
@@ -598,7 +599,7 @@ final class NotebookToolbarTests: XCTestCase {
     func testControlStatesDrawDistinctShapes() throws {
         func rendered(selected: Bool = false, pressed: Bool = false, focused: Bool = false) throws -> RenderedPixels {
             try RenderedPixels(
-                rendering: NotebookControlBackground(
+                rendering: NotebookKeyStyle.Background(
                     shape: .well, isSelected: selected, isPressed: pressed, isFocused: focused
                 )
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
@@ -801,7 +802,7 @@ final class NotebookToolbarTests: XCTestCase {
         await session.load()
         XCTAssertEqual(session.loadState, .ready)
 
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = hosting
@@ -814,6 +815,7 @@ final class NotebookToolbarTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
         try await NotebookTestFixtures.waitUntil {
             mounted = NotebookTestFixtures.notebookController(in: hosting)
             guard let controller = mounted else { return false }

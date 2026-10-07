@@ -38,10 +38,10 @@ final class NotebookTypographyTests: XCTestCase {
         let storage = await probe.storage(notebookID: id)
         let session = NotebookSession(notebookID: id, openStorage: { storage })
         await session.load()
-        let hosting = StatusBarHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
         window.frame = scene.effectiveGeometry.coordinateSpace.bounds
-        let control = StatusBarHostingController(rootView:
+        let control = AppearanceTrackingHostingController(rootView:
             Color.white.preferredColorScheme(.light).toolbarColorScheme(.dark, for: .statusBar)
         )
         window.rootViewController = control
@@ -136,15 +136,5 @@ final class NotebookTypographyTests: XCTestCase {
     private func weightTrait(of resolved: Font.Resolved) -> CGFloat {
         let traits = CTFontCopyTraits(resolved.ctFont) as NSDictionary
         return (traits[kCTFontWeightTrait] as? NSNumber).map { CGFloat($0.doubleValue) } ?? .nan
-    }
-}
-
-@MainActor
-private final class StatusBarHostingController<Content: View>: UIHostingController<Content> {
-    private(set) var hasAppeared = false
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        hasAppeared = true
     }
 }

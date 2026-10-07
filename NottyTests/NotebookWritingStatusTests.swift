@@ -85,20 +85,27 @@ final class NotebookWritingStatusTests: XCTestCase {
     func testSaveFailureDoesNotResizeCanvasOrMoveViewport() async throws {
         let (session, probe, root) = try await makeSession()
         defer { try? FileManager.default.removeItem(at: root) }
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
         try await NotebookTestFixtures.waitUntil { self.notebookController(in: hosting) != nil }
         hosting.view.layoutIfNeeded()
         let controller = try XCTUnwrap(notebookController(in: hosting))
         // This case controls session observations; native callback fixtures exercise the delegate separately.
         controller.canvasView.delegate = nil
         controller.canvasView.setZoomScale(0.75, animated: false)
-        controller.canvasView.setContentOffset(CGPoint(x: 0, y: 300), animated: false)
+        // Without its delegate the canvas recentres the zoomed page only on its next layout. Lay it
+        // out now and scroll within the recentred range, so the protected viewport starts settled.
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        controller.canvasView.setContentOffset(
+            CGPoint(x: -controller.canvasView.contentInset.left, y: 300), animated: false
+        )
         try await settleLayout(hosting)
         let original = WritingViewport(controller)
         let generation = session.canvasGeneration
@@ -180,13 +187,14 @@ final class NotebookWritingStatusTests: XCTestCase {
                 failure: .storageFull, feedbackDelay: { await clock.wait($0) }
             )
             defer { try? FileManager.default.removeItem(at: root) }
-            let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+            let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
             let window = try NotebookTestFixtures.window(showing: hosting)
             defer {
                 notebookController(in: hosting)?.tearDown()
                 window.isHidden = true
                 window.rootViewController = nil
             }
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
             try await NotebookTestFixtures.waitUntil { self.notebookController(in: hosting) != nil }
             let controller = try XCTUnwrap(notebookController(in: hosting))
             controller.canvasView.delegate = nil

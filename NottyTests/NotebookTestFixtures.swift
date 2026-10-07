@@ -108,6 +108,16 @@ extension NotebookTestFixtures {
         return window
     }
 
+    /// Waits until UIKit has finished showing `controller`. UIKit may end the appearance transition
+    /// on a later turn; hiding the window or replacing the controller before then leaves it
+    /// unbalanced, so a test registers its teardown and then waits here before going on.
+    @MainActor
+    static func waitUntilAppeared(
+        _ controller: some AppearanceTracking, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try await waitUntil(file: file, line: line) { controller.hasAppeared }
+    }
+
     /// Polls `ready` on the main actor until it holds, failing the test after `seconds`.
     @MainActor
     static func waitUntil(
@@ -162,7 +172,7 @@ extension NotebookTestFixtures {
     ) async throws -> NotebookToolbarHostFixture {
         let store = store ?? toolStore()
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
-        let hosting = UIHostingController(
+        let hosting = AppearanceTrackingHostingController(
             rootView: NotebookToolbarHost(store: store) { MountedNotebookController(controller: controller) }
                 .environment(\.horizontalSizeClass, horizontalSizeClass)
         )
@@ -170,6 +180,7 @@ extension NotebookTestFixtures {
         let window = try Self.window(showing: hosting, width: width)
         let fixture = NotebookToolbarHostFixture(hosting: hosting, window: window, controller: controller, store: store)
         do {
+            try await waitUntilAppeared(hosting)
             try await waitUntil {
                 controller.isCanvasVisible && store.isToolbarAvailable && controller.canvasView.isFirstResponder
                     && controller.canvasView.bounds.height > 0
@@ -184,6 +195,36 @@ extension NotebookTestFixtures {
 
 enum NotebookFixtureFailure: Error {
     case timeout
+}
+
+/// A view controller that records when UIKit has finished showing it.
+protocol AppearanceTracking: UIViewController {
+    var hasAppeared: Bool { get }
+}
+
+extension NotebookViewController: AppearanceTracking {
+    /// The canvas becomes visible once UIKit has finished showing the controller.
+    var hasAppeared: Bool { isCanvasVisible }
+}
+
+/// A plain window root for views a test hosts directly.
+final class AppearanceTrackingController: UIViewController, AppearanceTracking {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
+    }
+}
+
+/// A window root for SwiftUI content a test shows directly.
+final class AppearanceTrackingHostingController<Content: View>: UIHostingController<Content>, AppearanceTracking {
+    private(set) var hasAppeared = false
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasAppeared = true
+    }
 }
 
 /// Mounts an existing controller so tests can inspect it inside SwiftUI.

@@ -92,19 +92,21 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.overrideUserInterfaceStyle = .dark
-        let control = UIHostingController(rootView: Color.clear)
+        let control = AppearanceTrackingHostingController(rootView: Color.clear)
         window.rootViewController = control
         window.makeKeyAndVisible()
         defer {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await NotebookTestFixtures.waitUntilAppeared(control)
         // The window must outrank the app's light style, or the checks below prove nothing.
         XCTAssertEqual(control.traitCollection.userInterfaceStyle, .dark)
-        let hosting = UIHostingController(rootView: NotebookLibraryHost(model: model))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookLibraryHost(model: model))
         window.rootViewController = hosting
         hosting.view.layoutIfNeeded()
         do {
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
             try await NotebookTestFixtures.waitUntil { await gate.entered }
             guard case .loading = model.state else { throw FixtureFailure.unexpectedState }
             try await assertLightPaper(hosting)

@@ -21,7 +21,7 @@ final class NotebookLimitsTests: XCTestCase {
         let scene = try XCTUnwrap(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         )
-        let hosting = UIHostingController(rootView: NotebookScreen(session: session))
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = hosting
@@ -31,6 +31,7 @@ final class NotebookLimitsTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
         try await NotebookTestFixtures.waitUntil {
             session.canvasOwnerID != nil && self.notebookController(in: hosting)?.isCanvasVisible == true
         }

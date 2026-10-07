@@ -138,7 +138,7 @@ final class NotebookMaterialsTests: XCTestCase {
         let paper = NotebookPaperView(
             frame: CGRect(x: 0, y: 0, width: 834, height: 700), accessibility: settings.source
         )
-        let window = try hostInWindow(paper)
+        let window = try await hostInWindow(paper)
         defer { window.close() }
         paper.setGeometry(width: 794, height: 2_246, boundaries: [1_123])
         XCTAssertEqual(paper.headMarginLayer.frame, CGRect(x: 0, y: -600, width: 794, height: 600))
@@ -228,11 +228,11 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    func testPageEdgesLieJustOutsideThePaperOneDevicePixelThick() throws {
+    func testPageEdgesLieJustOutsideThePaperOneDevicePixelThick() async throws {
         let paper = NotebookPaperView(
             frame: CGRect(x: 0, y: 0, width: 834, height: 600), accessibility: AccessibilitySettings().source
         )
-        let window = try hostInWindow(paper)
+        let window = try await hostInWindow(paper)
         defer { window.close() }
         let width: CGFloat = 794
         for (pages, scale) in [(1, CGFloat(0.4)), (3, 1), (4, 2.5)] {
@@ -269,7 +269,7 @@ final class NotebookMaterialsTests: XCTestCase {
             XCTAssertEqual(paper.leadingCornerShadowLayer.frame, CGRect(x: -3, y: height, width: 3, height: 6))
             XCTAssertEqual(paper.trailingCornerShadowLayer.frame, CGRect(x: width, y: height, width: 3, height: 6))
         }
-        let tone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.toolbarShadowTone.uiColor))
+        let tone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.shadowTone.uiColor))
         for (shadow, opacity): (CAGradientLayer, CGFloat) in [
             (paper.bottomShadowLayer, 0.18), (paper.leadingShadowLayer, 0.12), (paper.trailingShadowLayer, 0.12),
             (paper.leadingCornerShadowLayer, 0.15), (paper.trailingCornerShadowLayer, 0.15)
@@ -296,14 +296,14 @@ final class NotebookMaterialsTests: XCTestCase {
     /// The bottom and side bands meet outside each lower corner of the paper. The shading must
     /// turn the corner with no step between neighbouring pixels off the hairlines, and must not
     /// spread past the bands' depths.
-    func testShadingTurnsTheLowerCornersWithoutAStep() throws {
+    func testShadingTurnsTheLowerCornersWithoutAStep() async throws {
         let settings = AccessibilitySettings()
         // Flat colours, so every step between neighbouring pixels comes from the shading.
         settings.increasesContrast = true
         let paper = NotebookPaperView(
             frame: CGRect(x: 0, y: 0, width: 200, height: 200), accessibility: settings.source
         )
-        let window = try hostInWindow(paper)
+        let window = try await hostInWindow(paper)
         defer { window.close() }
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
         let zoom: CGFloat = 4
@@ -348,7 +348,7 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    func testWidthFittedPageDrawsNoEdgeAlongTheScreenBorder() throws {
+    func testWidthFittedPageDrawsNoEdgeAlongTheScreenBorder() async throws {
         let settings = AccessibilitySettings()
         // Flat colours, so a single edge pixel in a border column stands out.
         settings.increasesContrast = true
@@ -356,7 +356,7 @@ final class NotebookMaterialsTests: XCTestCase {
             let paper = NotebookPaperView(
                 frame: CGRect(x: 0, y: 0, width: viewWidth, height: 300), accessibility: settings.source
             )
-            let window = try hostInWindow(paper)
+            let window = try await hostInWindow(paper)
             defer { window.close() }
             paper.setGeometry(width: 794, height: 1_123, boundaries: [])
             paper.setViewport(scale: viewWidth / 794, offset: CGPoint(x: 0, y: 200))
@@ -369,13 +369,13 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    func testZoomedOutPaperSitsOnStoneWithEdgesAndShading() throws {
+    func testZoomedOutPaperSitsOnStoneWithEdgesAndShading() async throws {
         let settings = AccessibilitySettings()
         settings.increasesContrast = true
         let paper = NotebookPaperView(
             frame: CGRect(x: 0, y: 0, width: 834, height: 800), accessibility: settings.source
         )
-        let window = try hostInWindow(paper)
+        let window = try await hostInWindow(paper)
         defer { window.close() }
         // Half scale puts the paper edges on whole device pixels: 397 pt wide, 218.5 pt from
         // either side, page 1 from 100 to 661.5 pt down.
@@ -542,7 +542,7 @@ final class NotebookMaterialsTests: XCTestCase {
         let paper = NotebookPaperView(
             frame: CGRect(x: 0, y: 0, width: 400, height: 300), accessibility: AccessibilitySettings().source
         )
-        let window = try hostInWindow(paper)
+        let window = try await hostInWindow(paper)
         defer { window.close() }
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
         paper.setViewport(scale: 1, offset: CGPoint(x: 40, y: 20))
@@ -850,19 +850,22 @@ final class NotebookMaterialsTests: XCTestCase {
         return try SRGBPixels(image)
     }
 
-    private func hostInWindow(_ view: UIView) throws -> HostWindow {
-        let host = UIViewController()
-        let hosted = try hostInWindow(host: host, size: view.bounds.size)
-        host.view.addSubview(view)
-        return hosted
-    }
-
-    private func hostInWindow(host: UIViewController, size: CGSize) throws -> HostWindow {
+    /// Shows `view` in a window of its size, returning once the window's root has appeared.
+    private func hostInWindow(_ view: UIView) async throws -> HostWindow {
+        let host = AppearanceTrackingController()
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
-        window.frame = CGRect(origin: .zero, size: size)
+        window.frame = CGRect(origin: .zero, size: view.bounds.size)
         window.rootViewController = host
         window.makeKeyAndVisible()
-        return HostWindow(window: window)
+        host.view.addSubview(view)
+        let hosted = HostWindow(window: window)
+        do {
+            try await NotebookTestFixtures.waitUntilAppeared(host)
+        } catch {
+            hosted.close()
+            throw error
+        }
+        return hosted
     }
 
     private static var catalogInks: [EditorInkColor] {
