@@ -1062,52 +1062,228 @@ private struct NotebookToolButton: View {
     }
 }
 
-/// Opens the eraser in its last mode on tap; touch and hold chooses object or pixel erasing.
+/// Opens the eraser in its last mode on tap; touch and hold chooses object or pixel erasing. The
+/// key draws like every other, while a UIKit button over it takes the touches: a SwiftUI menu never
+/// reports that it is open, and the writing view must keep the tools in sight beneath it.
 @MainActor
 private struct NotebookEraserButton: View {
     let kind: EditorToolKind
     let actions: NotebookToolbarActions
+    @State private var isPressed = false
+    @State private var isFocused = false
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.notebookKeysHiding) private var isHiding
 
     private var selectedMode: EditorEraserMode? {
         if case let .eraser(mode) = kind { return mode }
         return nil
     }
 
-    private var symbol: String { selectedMode == .bitmap ? "eraser.line.dashed" : "eraser" }
-
     var body: some View {
-        Menu {
-            modeButton("Object eraser", mode: .vector)
-            modeButton("Pixel eraser", mode: .bitmap)
-        } label: {
-            NotebookToolGlyph(symbol: symbol, isSelected: selectedMode != nil)
-        } primaryAction: {
-            actions.selectEraser()
+        let isSelected = selectedMode != nil
+        NotebookKey(
+            label: NotebookToolGlyph(symbol: NotebookEraserMenuButton.symbol(for: selectedMode), isSelected: isSelected),
+            isSelected: isSelected, isPressed: isPressed, shape: .well
+        )
+        .overlay {
+            // A button style rings the key from its own focus; here the UIKit button reports it.
+            if isFocused && isEnabled {
+                NotebookKeyStyle.Background(shape: .well, isSelected: false, isPressed: false, isFocused: true)
+            }
         }
-        .menuIndicator(.hidden)
-        // A button-styled menu draws its label through the toolbar's button style, so the
-        // eraser presses and focuses like every other control.
-        .menuStyle(.button)
-        .buttonStyle(NotebookKeyStyle(isSelected: selectedMode != nil))
-        .help("Eraser")
-        .accessibilityLabel("Eraser")
-        .accessibilityValue(selectedMode.map { $0 == .vector ? "Object" : "Pixel" } ?? "")
-        .accessibilityHint("Touch and hold to choose object or pixel erasing.")
-        .accessibilityAddTraits(selectedMode == nil ? [] : .isSelected)
-        .accessibilityShowsLargeContentViewer {
-            Label("Eraser", systemImage: symbol)
+        .accessibilityHidden(true)
+        .overlay {
+            NotebookEraserKey(
+                selectedMode: selectedMode, actions: actions, isEnabled: isEnabled, isHiding: isHiding,
+                isPressed: $isPressed, isFocused: $isFocused
+            )
+        }
+    }
+}
+
+/// The eraser key's touch target. It draws nothing; the key beneath it shows its press and focus.
+@MainActor
+private struct NotebookEraserKey: UIViewRepresentable {
+    let selectedMode: EditorEraserMode?
+    let actions: NotebookToolbarActions
+    let isEnabled: Bool
+    /// True while the writing view hides the rail.
+    let isHiding: Bool
+    @Binding var isPressed: Bool
+    @Binding var isFocused: Bool
+
+    func makeUIView(context: Context) -> NotebookEraserMenuButton {
+        NotebookEraserMenuButton()
+    }
+
+    func updateUIView(_ button: NotebookEraserMenuButton, context: Context) {
+        let pressed = $isPressed
+        let focused = $isFocused
+        button.update(
+            selectedMode: selectedMode, actions: actions, isEnabled: isEnabled, isHiding: isHiding,
+            reportPress: { pressed.wrappedValue = $0 }, reportFocus: { focused.wrappedValue = $0 }
+        )
+    }
+
+    static func dismantleUIView(_ button: NotebookEraserMenuButton, coordinator: ()) {
+        button.dismantle()
+    }
+}
+
+/// A button without a look of its own: a tap selects the eraser in its last mode, and a touch and
+/// hold opens the menu of eraser modes. While that menu is open the toolbar's store keeps the
+/// writing view's tools and header in sight, as it does for the toolbar's popovers and sheets.
+/// A scroll view never takes back a touch it has handed to a control, so a finger that rests on
+/// the key before dragging leaves an overflowing strip where it is; a quick drag still scrolls it.
+final class NotebookEraserMenuButton: UIButton {
+    static func symbol(for mode: EditorEraserMode?) -> String {
+        mode == .bitmap ? "eraser.line.dashed" : "eraser"
+    }
+
+    /// Identifies the menu to the writing view while it is open.
+    private let presentationID = UUID()
+    private var actions: NotebookToolbarActions?
+    private var builtMode: EditorEraserMode??
+    private var reportPress: @MainActor (Bool) -> Void = { _ in }
+    private var reportFocus: @MainActor (Bool) -> Void = { _ in }
+    /// True while SwiftUI updates the button, when its state must not be reported back at once.
+    private var isUpdating = false
+    private var isShowingFocus = false
+    private var isHidingRail = false
+    private(set) var isMenuPresented = false
+    /// The store told that the menu opened, which is told when it ends.
+    private weak var presentationStore: NotebookSceneToolStore?
+
+    init() {
+        super.init(frame: .zero)
+        showsMenuAsPrimaryAction = false
+        accessibilityLabel = "Eraser"
+        accessibilityHint = "Touch and hold to choose object or pixel erasing."
+        addInteraction(UIToolTipInteraction(defaultToolTip: "Eraser"))
+        // The key beneath draws the toolbar's own focus ring.
+        focusEffect = nil
+        showsLargeContentViewer = true
+        largeContentTitle = "Eraser"
+        scalesLargeContentImage = true
+        addInteraction(UILargeContentViewerInteraction())
+        addAction(UIAction { [weak self] _ in self?.actions?.selectEraser() }, for: .primaryActionTriggered)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("Use init().")
+    }
+
+    override var isHighlighted: Bool {
+        didSet {
+            guard isHighlighted != oldValue else { return }
+            report { $0.reportPress($0.isHighlighted) }
         }
     }
 
-    private func modeButton(_ title: String, mode: EditorEraserMode) -> some View {
-        Button {
-            actions.select(.eraser(mode))
-        } label: {
-            if selectedMode == mode {
-                Label(title, systemImage: "checkmark")
-            } else {
-                Text(title)
-            }
+    override var canBecomeFocused: Bool {
+        super.canBecomeFocused && !isHidingRail
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        let focused = context.nextFocusedView === self
+        guard isShowingFocus != focused else { return }
+        isShowingFocus = focused
+        report { $0.reportFocus($0.isShowingFocus) }
+    }
+
+    /// - Parameter isHiding: true while the writing view hides the rail, from the moment the hide
+    ///   begins. SwiftUI's hit testing and accessibility hiding never reach inside a UIKit view, so
+    ///   the button itself gives up its touches, keyboard focus and place among assistive
+    ///   technology's elements, whether or not the rail is disabled by then.
+    func update(
+        selectedMode: EditorEraserMode?, actions: NotebookToolbarActions, isEnabled: Bool, isHiding: Bool,
+        reportPress: @escaping @MainActor (Bool) -> Void, reportFocus: @escaping @MainActor (Bool) -> Void
+    ) {
+        isUpdating = true
+        defer { isUpdating = false }
+        self.actions = actions
+        self.reportPress = reportPress
+        self.reportFocus = reportFocus
+        self.isEnabled = isEnabled
+        // A disabled key leaves its touches to what lies beneath: a paused rail's shell, which keeps
+        // them, or a hidden rail's page.
+        isUserInteractionEnabled = isEnabled && !isHiding
+        isAccessibilityElement = !isHiding
+        if isHidingRail != isHiding {
+            isHidingRail = isHiding
+            setNeedsFocusUpdate()
+        }
+        isSelected = selectedMode != nil
+        var traits: UIAccessibilityTraits = isSelected ? [.button, .selected] : .button
+        if !isEnabled { traits.insert(.notEnabled) }
+        accessibilityTraits = traits
+        accessibilityValue = selectedMode.map { $0 == .vector ? "Object" : "Pixel" }
+        guard builtMode != .some(selectedMode) else { return }
+        builtMode = .some(selectedMode)
+        largeContentImage = UIImage(systemName: Self.symbol(for: selectedMode))
+        menu = UIMenu(children: [
+            modeAction("Object eraser", mode: .vector, selectedMode: selectedMode),
+            modeAction("Pixel eraser", mode: .bitmap, selectedMode: selectedMode),
+        ])
+    }
+
+    /// SwiftUI is removing the button, possibly with its menu open, and with it the key it reports to.
+    func dismantle() {
+        reportPress = { _ in }
+        reportFocus = { _ in }
+        contextMenuInteraction?.dismissMenu()
+        setMenuPresented(false)
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration,
+        animator: (any UIContextMenuInteractionAnimating)?
+    ) {
+        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+        setMenuPresented(true)
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction, willEndFor configuration: UIContextMenuConfiguration,
+        animator: (any UIContextMenuInteractionAnimating)?
+    ) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        setMenuPresented(false)
+    }
+
+    private func modeAction(_ title: String, mode: EditorEraserMode, selectedMode: EditorEraserMode?) -> UIAction {
+        UIAction(title: title, image: selectedMode == mode ? UIImage(systemName: "checkmark") : nil) { [weak self] _ in
+            self?.actions?.select(.eraser(mode))
+        }
+    }
+
+    /// The menu opens only at the user's touch, so its pin applies at once. It also ends as the
+    /// button leaves its window, which can happen inside a SwiftUI update, so the end is reported
+    /// a turn later, unless the menu has opened again by then.
+    private func setMenuPresented(_ presented: Bool) {
+        guard isMenuPresented != presented else { return }
+        isMenuPresented = presented
+        let id = presentationID
+        guard !presented else {
+            presentationStore = actions?.store
+            presentationStore?.setToolbarPresentation(id, isPresented: true)
+            return
+        }
+        let store = presentationStore
+        Task { [weak self] in
+            if self?.isMenuPresented == true { return }
+            store?.setToolbarPresentation(id, isPresented: false)
+        }
+    }
+
+    /// Hands a change of the button's state to the key beneath, a turn later if SwiftUI is updating
+    /// the button, as its state must not change during that update.
+    private func report(_ change: @escaping @MainActor (NotebookEraserMenuButton) -> Void) {
+        guard isUpdating else { return change(self) }
+        Task { [weak self] in
+            guard let self else { return }
+            change(self)
         }
     }
 }

@@ -460,6 +460,9 @@ private struct NotebookToolbarLayer: View {
                             hiddenAmount: hidden ? 1 : 0, offset: transition.hiddenOffset, isHidden: hidden
                         ))
                     }
+                    // Applied outside the animation's body too, where SwiftUI does not refresh a
+                    // changed `disabled`, so the hidden keys leave keyboard focus in the app as well.
+                    .disabled(hidden)
                     .allowsHitTesting(!hidden)
                     .accessibilityHidden(hidden)
                 if !composition.showsRevealHandle {

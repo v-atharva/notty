@@ -1,5 +1,6 @@
 import NottyCore
 import SwiftUI
+import UIKit
 
 extension EditorChromeMode {
     var title: String {
@@ -119,14 +120,19 @@ struct NotebookMenu: View {
     let openRecoveryCopies: () -> Void
     @State private var showsComingLater = false
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.legibilityWeight) private var legibilityWeight
 
     var body: some View {
+        let width = Self.width(for: typeSize, hostWidth: hostWidth)
+        let rowLayout = NotebookWritingViewRow.Layout(
+            rowWidth: width - 2 * NotebookTheme.popoverPadding, typeSize: typeSize, isBold: legibilityWeight == .bold
+        )
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 section("Writing view") {
                     VStack(spacing: NotebookTheme.itemSpacing) {
                         ForEach(EditorChromeMode.allCases, id: \.self) { mode in
-                            writingViewRow(mode)
+                            writingViewRow(mode, layout: rowLayout)
                         }
                     }
                 }
@@ -151,18 +157,24 @@ struct NotebookMenu: View {
             .padding(NotebookTheme.popoverPadding)
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(width: Self.width(for: typeSize, hostWidth: hostWidth))
+        .frame(width: width)
         .tint(NotebookTheme.controlTint.color)
         .presentationBackground(NotebookTheme.panelSurface.color)
         .presentationCompactAdaptation(.popover)
     }
 
+    /// UIKit keeps a popover at least this far inside the window, narrowing one that would come closer.
+    static let systemPopoverMargin: CGFloat = 10
+
     /// The standard popover width, widened at accessibility text sizes as far as the window allows,
-    /// so the writing views keep their names whole.
+    /// so the writing views keep their names whole. A window too narrow for the standard width, as
+    /// in Slide Over, gets the widest popover UIKit will show, so the menu lays out at the width
+    /// it is drawn.
     static func width(for typeSize: DynamicTypeSize, hostWidth: CGFloat) -> CGFloat {
-        guard typeSize.isAccessibilitySize else { return NotebookTheme.popoverWidth }
+        let widest = hostWidth - 2 * systemPopoverMargin
+        guard typeSize.isAccessibilitySize else { return min(NotebookTheme.popoverWidth, widest) }
         let room = hostWidth - 2 * NotebookTheme.popoverWindowMargin
-        return max(NotebookTheme.popoverWidth, min(NotebookTheme.accessibilityPopoverWidth, room))
+        return min(max(NotebookTheme.popoverWidth, min(NotebookTheme.accessibilityPopoverWidth, room)), widest)
     }
 
     /// A page can be added only while writing is open and the notebook is below its page limit.
@@ -171,8 +183,12 @@ struct NotebookMenu: View {
     }
 
     /// The row that chooses and stores `mode` as the writing view.
-    func writingViewRow(_ mode: EditorChromeMode) -> NotebookWritingViewRow {
-        NotebookWritingViewRow(mode: mode, isSelected: chrome.mode == mode) { chrome.setMode(mode) }
+    func writingViewRow(
+        _ mode: EditorChromeMode, layout: NotebookWritingViewRow.Layout = .init()
+    ) -> NotebookWritingViewRow {
+        NotebookWritingViewRow(mode: mode, isSelected: chrome.mode == mode, layout: layout) {
+            chrome.setMode(mode)
+        }
     }
 
     /// Adds a page at the end of the notebook and closes the menu over it.
@@ -199,8 +215,48 @@ struct NotebookMenu: View {
 /// One writing view. The selected row sinks into a well with a mark at its leading edge, and all
 /// its text darkens so it keeps its contrast on the well.
 struct NotebookWritingViewRow: View {
+    /// How the rows set their glyphs, names and descriptions in the menu's width. The menu decides
+    /// once for all three rows, so their glyphs and names line up.
+    struct Layout: Equatable {
+        /// The glyph sits above the name, scaled with it, so the name and description take the
+        /// row's whole width.
+        var stacksGlyph = false
+        /// Where a word of some name is too wide for even the row's whole width, as "Always-on"
+        /// is at the largest text size in Slide Over, hyphenated words break at their hyphens;
+        /// otherwise every hyphenated word stays whole.
+        var breaksAtHyphens = false
+        /// False where the menu is narrower than its standard width, as in Slide Over, where the
+        /// descriptions wrap at every text size rather than shrink.
+        var isStandardWidth = true
+
+        /// The standard popover's layout.
+        init() {}
+
+        /// The glyph moves above the name where a word of some writing view's name would not fit
+        /// beside it, as at the largest text sizes in a narrow window, so names still wrap only
+        /// between their words; where even the whole row is too narrow, a hyphenated word breaks
+        /// at its hyphen.
+        init(rowWidth: CGFloat, typeSize: DynamicTypeSize, isBold: Bool) {
+            isStandardWidth = rowWidth >= NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding
+            guard typeSize.isAccessibilitySize else { return }
+            let widest = NotebookWritingViewRow.longestNameWord(typeSize: typeSize, isBold: isBold)
+            stacksGlyph = widest > Self.nameColumn(rowWidth: rowWidth, stacksGlyph: false)
+            breaksAtHyphens = widest > Self.nameColumn(rowWidth: rowWidth, stacksGlyph: stacksGlyph)
+        }
+
+        /// The width the name and description wrap in: beside the glyph, less its inset and column,
+        /// the gap after it and the least gap before the trailing inset, or below it, less an inset
+        /// at each side. At accessibility sizes, where these apply, the shortcut hint is hidden.
+        static func nameColumn(rowWidth: CGFloat, stacksGlyph: Bool) -> CGFloat {
+            guard !stacksGlyph else { return rowWidth - 2 * NotebookTheme.menuRowInset }
+            return rowWidth - NotebookTheme.menuGlyphInset - NotebookTheme.menuGlyphColumnWidth
+                - 2 * NotebookTheme.menuRowInset - NotebookTheme.menuShortcutGap
+        }
+    }
+
     let mode: EditorChromeMode
     let isSelected: Bool
+    var layout = Layout()
     let choose: () -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -210,39 +266,61 @@ struct NotebookWritingViewRow: View {
         !typeSize.isAccessibilitySize
     }
 
+    /// The widest word of any writing view's name in the name's face at `typeSize`, set in bold
+    /// under Bold Text.
+    nonisolated static func longestNameWord(typeSize: DynamicTypeSize, isBold: Bool) -> CGFloat {
+        let font = nameFont(typeSize: typeSize, isBold: isBold)
+        let words = EditorChromeMode.allCases.flatMap { $0.title.split(separator: " ") }
+        return words.map { (String($0) as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+    }
+
+    /// The name's face at `typeSize`, set in bold under Bold Text.
+    nonisolated static func nameFont(typeSize: DynamicTypeSize, isBold: Bool) -> UIFont {
+        let body = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits(typeSize))
+        return UIFont.systemFont(ofSize: body.pointSize, weight: isBold ? .bold : .medium)
+    }
+
+    /// The point size of `mode`'s glyph: its own beside the name, and scaled as the name is when
+    /// set above it, so it keeps its size relative to the name.
+    nonisolated static func glyphSize(of mode: EditorChromeMode, typeSize: DynamicTypeSize, stacked: Bool) -> CGFloat {
+        guard stacked else { return mode.symbolSize }
+        return UIFontMetrics(forTextStyle: .body).scaledValue(for: mode.symbolSize, compatibleWith: traits(typeSize))
+    }
+
+    nonisolated private static func traits(_ typeSize: DynamicTypeSize) -> UITraitCollection {
+        UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(typeSize))
+    }
+
     var body: some View {
-        let secondary = (isSelected ? NotebookTheme.glyph : NotebookTheme.glyphSecondary).color
         Button(action: choose) {
-            HStack(spacing: 0) {
-                Image(systemName: mode.symbol)
-                    .font(.system(size: mode.symbolSize, weight: .regular))
-                    .frame(width: NotebookTheme.menuGlyphColumnWidth)
+            Group {
+                if layout.stacksGlyph {
+                    VStack(alignment: .leading, spacing: NotebookTheme.menuRowTextPadding) {
+                        glyph
+                        text
+                    }
+                    .padding(.vertical, NotebookTheme.menuRowTextPadding)
+                    // The mark sits in the row's leading inset, clear of the glyph and text alike.
+                    .padding(.horizontal, NotebookTheme.menuRowInset)
+                } else {
+                    HStack(spacing: 0) {
+                        glyph
+                            .padding(.trailing, NotebookTheme.menuRowInset)
+                        text
+                            .padding(.vertical, NotebookTheme.menuRowTextPadding)
+                        Spacer(minLength: NotebookTheme.menuShortcutGap)
+                        if Self.showsShortcutHint(at: typeSize) {
+                            Text(mode.shortcutHint)
+                                .font(.footnote)
+                                .foregroundStyle(secondaryTone)
+                                .fixedSize()
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .padding(.leading, NotebookTheme.menuGlyphInset)
                     .padding(.trailing, NotebookTheme.menuRowInset)
-                // Larger text wraps rather than being cut off. At the standard size the longest
-                // description shrinks slightly to keep to one line beside the hint.
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(mode.title)
-                        .font(.body.weight(.medium))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(mode.summary)
-                        .font(.footnote)
-                        .foregroundStyle(secondary)
-                        .lineLimit(typeSize > .large ? nil : 1)
-                        .minimumScaleFactor(NotebookTheme.menuDescriptionMinimumScale)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.vertical, NotebookTheme.menuRowTextPadding)
-                Spacer(minLength: NotebookTheme.menuShortcutGap)
-                if Self.showsShortcutHint(at: typeSize) {
-                    Text(mode.shortcutHint)
-                        .font(.footnote)
-                        .foregroundStyle(secondary)
-                        .fixedSize()
-                        .accessibilityHidden(true)
                 }
             }
-            .padding(.leading, NotebookTheme.menuGlyphInset)
-            .padding(.trailing, NotebookTheme.menuRowInset)
             .frame(maxWidth: .infinity, minHeight: NotebookTheme.writingViewRowHeight, alignment: .leading)
             .overlay(alignment: .leading) {
                 if isSelected {
@@ -258,6 +336,40 @@ struct NotebookWritingViewRow: View {
         .accessibilityLabel(mode.title)
         .accessibilityHint(mode.summary)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var secondaryTone: Color {
+        (isSelected ? NotebookTheme.glyph : NotebookTheme.glyphSecondary).color
+    }
+
+    /// Beside the name the glyph keeps its column; above it, it sets its own width.
+    private var glyph: some View {
+        let size = Self.glyphSize(of: mode, typeSize: typeSize, stacked: layout.stacksGlyph)
+        return Image(systemName: mode.symbol)
+            .font(.system(size: size, weight: .regular))
+            .frame(width: layout.stacksGlyph ? nil : NotebookTheme.menuGlyphColumnWidth)
+    }
+
+    /// Larger text wraps rather than being cut off. At the standard size and width the longest
+    /// description shrinks slightly to keep to one line beside the hint.
+    private var text: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name)
+                .font(.body.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            Text(mode.summary)
+                .font(.footnote)
+                .foregroundStyle(secondaryTone)
+                .lineLimit(typeSize > .large || !layout.isStandardWidth ? nil : 1)
+                .minimumScaleFactor(NotebookTheme.menuDescriptionMinimumScale)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Line breaking would rather split "Always-on" at its hyphen than leave "tools" alone on a
+    /// line, so a non-breaking hyphen keeps every word whole wherever the word fits.
+    private var name: String {
+        layout.breaksAtHyphens ? mode.title : mode.title.replacingOccurrences(of: "-", with: "\u{2011}")
     }
 }
 

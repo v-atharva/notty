@@ -146,6 +146,19 @@ final class NotebookToolbarTests: XCTestCase {
         }
     }
 
+    /// In the mounted toolbar a hidden rail's keys are disabled too, so keyboard focus cannot reach
+    /// keys nobody can see, and they come back with the tools.
+    func testAHiddenRailInTheHostDisablesItsKeys() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        defer { fixture.close() }
+        let key = try eraserKey(in: fixture.host)
+        XCTAssertTrue(key.isEnabled)
+        fixture.store.setToolsHidden(true)
+        try await NotebookTestFixtures.waitUntil { !key.isEnabled }
+        fixture.store.setToolsHidden(false)
+        try await NotebookTestFixtures.waitUntil { key.isEnabled }
+    }
+
     /// Disabled as the hide begins, the keys still fade out as they were: no key is drawn again in
     /// the disabled tone or without its selection, so the fade does no work beyond its opacity.
     func testAHidingRailsKeysFadeOutUnchanged() throws {
@@ -174,6 +187,65 @@ final class NotebookToolbarTests: XCTestCase {
                 .modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: isHidden)))
         }
         XCTAssertTrue(try paused(isHidden: true).rgba == paused(isHidden: false).rgba)
+    }
+
+    /// The whole rail looks at the moment its hide begins exactly as it did shown: the swatches,
+    /// width dots, eraser key, colour well, current-ink chip and chevrons as much as the keys
+    /// above, whether writing is open or paused. Disabled for any other reason, the same rail
+    /// changes its look, so the comparison would notice.
+    func testAWholeRailLooksTheSameAsItsHideBegins() async throws {
+        struct Case {
+            let name: String
+            let sizeClass: UserInterfaceSizeClass
+            let width: CGFloat
+            let isAvailable: Bool
+            let tool: EditorToolKind
+            var customColors = 0
+        }
+        let cases = [
+            Case(name: "regular", sizeClass: .regular, width: 1_024, isAvailable: true, tool: .eraser(.vector)),
+            Case(
+                name: "regular with a scrolling ink row", sizeClass: .regular, width: 834, isAvailable: true,
+                tool: .ink(.pen), customColors: 6
+            ),
+            Case(name: "compact", sizeClass: .compact, width: 420, isAvailable: true, tool: .eraser(.bitmap)),
+            Case(name: "paused", sizeClass: .regular, width: 1_024, isAvailable: false, tool: .eraser(.vector)),
+        ]
+        for test in cases {
+            let (store, owner) = availableStore()
+            defer { store.detach(owner) }
+            store.update { $0.select(test.tool) }
+            store.updateToolbar(toolbar(customColors: test.customColors))
+            if !test.isAvailable { store.setToolbarAvailable(false, for: owner) }
+            let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: test.sizeClass)
+            let rail = composition.rail(forHostWidth: test.width)
+            if let inkRow = rail.inkRow {
+                XCTAssertTrue(inkRow.slots.contains { if case .swatch = $0.item { true } else { false } }, test.name)
+                XCTAssertTrue(rail.toolRow.slots.contains { $0.item == .width(.medium) }, "\(test.name): width dots")
+            } else {
+                XCTAssertTrue(composition.foldsInkOptions, "\(test.name): the current-ink chip stands in for the ink row")
+            }
+            if test.width < 1_000 {
+                XCTAssertTrue(rail.toolRowOverflows || rail.inkRowOverflows, "\(test.name): a strip scrolls, with its chevron")
+            }
+
+            func render(hiding: Bool = false, disabled: Bool = false) async throws -> RenderedPixels {
+                let shown = try await showRail(
+                    store: store, sizeClass: test.sizeClass, width: test.width, hiding: hiding, disabled: disabled
+                )
+                defer { shown.close() }
+                return try await shown.settledRender()
+            }
+            let shown = try await render()
+            let unchanged = differingPoints(shown, try await render())
+            XCTAssertTrue(unchanged.isEmpty, "\(test.name): \(unchanged.count) points differ between two renders")
+            let hiding = differingPoints(shown, try await render(hiding: true))
+            XCTAssertTrue(hiding.isEmpty, "\(test.name): \(hiding.count) points change as the hide begins")
+            if test.isAvailable {
+                let disabled = differingPoints(shown, try await render(disabled: true))
+                XCTAssertFalse(disabled.isEmpty, "\(test.name): disabled for another reason, the rail changes its look")
+            }
+        }
     }
 
     func testUnavailableInkPanelDrawsEveryControlDisabled() throws {
@@ -833,11 +905,9 @@ final class NotebookToolbarTests: XCTestCase {
 
     func testControlStatesDrawDistinctShapes() throws {
         func rendered(selected: Bool = false, pressed: Bool = false, focused: Bool = false) throws -> RenderedPixels {
-            try RenderedPixels(
-                rendering: NotebookKeyStyle.Background(
-                    shape: .well, isSelected: selected, isPressed: pressed, isFocused: focused
-                )
-                .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+            try renderedAlone(
+                NotebookKeyStyle.Background(shape: .well, isSelected: selected, isPressed: pressed, isFocused: focused)
+                    .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
             )
         }
         let rest = try rendered()
@@ -1377,6 +1447,167 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertEqual((canvas.tool as? PKInkingTool)?.inkType, .marker)
     }
 
+    // MARK: - Eraser key
+
+    /// A tap selects the eraser in the mode used last and a second tap keeps it; a touch and hold
+    /// offers both modes with the one in use checked. The key reads as before to assistive
+    /// technology, and a paused toolbar's key takes no tap.
+    func testTheEraserKeyTapsToItsLastModeAndHoldsForTheModeMenu() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        defer { fixture.close() }
+        let store = fixture.store
+        let canvas = fixture.controller.canvasView
+        let actions = NotebookToolbarActions(store: store)
+        let key = try eraserKey(in: fixture.host)
+        XCTAssertFalse(key.showsMenuAsPrimaryAction, "A tap selects; only a touch and hold opens the menu.")
+        XCTAssertTrue(key.isEnabled)
+        XCTAssertEqual(key.accessibilityLabel, "Eraser")
+        XCTAssertEqual(key.accessibilityHint, "Touch and hold to choose object or pixel erasing.")
+        XCTAssertNil(key.accessibilityValue)
+        XCTAssertTrue(key.isAccessibilityElement)
+        XCTAssertEqual(key.accessibilityTraits, .button)
+        XCTAssertEqual(key.interactions.compactMap { ($0 as? UIToolTipInteraction)?.defaultToolTip }, ["Eraser"])
+        XCTAssertTrue(key.showsLargeContentViewer)
+        XCTAssertEqual(key.largeContentTitle, "Eraser")
+        XCTAssertTrue(key.interactions.contains { $0 is UILargeContentViewerInteraction })
+        XCTAssertEqual(try checkedModes(of: key), ["Object eraser": false, "Pixel eraser": false])
+
+        actions.select(.eraser(.bitmap))
+        actions.select(.ink(.pen))
+        key.sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(store.tool.kind, .eraser(.bitmap), "A tap returns to the eraser mode used last.")
+        XCTAssertEqual((canvas.tool as? PKEraserTool)?.eraserType, .bitmap)
+        key.sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(store.tool.kind, .eraser(.bitmap), "A second tap keeps the eraser.")
+        try await NotebookTestFixtures.waitUntil { key.accessibilityValue == "Pixel" }
+        XCTAssertEqual(key.accessibilityTraits, [.button, .selected])
+        XCTAssertEqual(try checkedModes(of: key), ["Object eraser": false, "Pixel eraser": true])
+
+        try modeAction("Object eraser", of: key).performWithSender(nil, target: nil)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertEqual((canvas.tool as? PKEraserTool)?.eraserType, .vector)
+        try await NotebookTestFixtures.waitUntil { key.accessibilityValue == "Object" }
+        XCTAssertEqual(try checkedModes(of: key), ["Object eraser": true, "Pixel eraser": false])
+
+        actions.select(.ink(.pen))
+        fixture.controller.setInputGate(.failed)
+        try await NotebookTestFixtures.waitUntil { !key.isEnabled }
+        XCTAssertEqual(key.accessibilityTraits, [.button, .notEnabled])
+        XCTAssertTrue(key.isAccessibilityElement, "A paused rail stays in sight, dimmed.")
+        let centre = fixture.host.convert(CGPoint(x: key.bounds.midX, y: key.bounds.midY), from: key)
+        XCTAssertFalse(fixture.hit(centre).isDescendant(of: fixture.controller.view), "Its touches stay off the page.")
+        key.sendActions(for: .primaryActionTriggered)
+        try modeAction("Pixel eraser", of: key).performWithSender(nil, target: nil)
+        XCTAssertEqual(store.tool.kind, .ink(.pen), "A paused toolbar's eraser changes nothing.")
+        fixture.controller.setInputGate(.open)
+        try await NotebookTestFixtures.waitUntil { key.isEnabled }
+
+        // A hidden rail's key gives up its touches, keyboard focus and place among assistive
+        // technology's elements itself, as SwiftUI's hit testing does not reach inside a UIKit view.
+        store.setToolsHidden(true)
+        try await NotebookTestFixtures.waitUntil { !key.isUserInteractionEnabled }
+        XCTAssertFalse(key.isAccessibilityElement)
+        XCTAssertFalse(key.canBecomeFocused)
+        XCTAssertFalse(fixture.hit(centre).isDescendant(of: key))
+        store.setToolsHidden(false)
+        try await NotebookTestFixtures.waitUntil { key.isUserInteractionEnabled && fixture.hit(centre) === key }
+        XCTAssertTrue(key.isAccessibilityElement)
+    }
+
+    /// While the eraser's mode menu is open, neither a brief reveal running out, the keyboard
+    /// shortcut nor a stroke ending hides the tools behind it; what they asked for takes effect
+    /// once it ends. The menu opening again before its end is reported keeps the tools in sight.
+    func testTheEraserMenuKeepsTheToolsInSightWhileOpen() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        defer { fixture.close() }
+        let clock = NotebookTestClock()
+        let rig = try await NotebookChromeRig(store: fixture.store, delay: { await clock.wait($0) })
+        do {
+            let key = try eraserKey(in: fixture.host)
+            rig.chrome.toolBegan()
+            rig.chrome.toolEnded()
+            XCTAssertTrue(rig.store.areToolsHidden)
+            // An Apple Pencil tool switch shows the tools briefly; the menu opens before that runs out.
+            rig.chrome.reveal(.transient)
+            XCTAssertFalse(rig.store.areToolsHidden)
+            let expiry = try await NotebookTestFixtures.waitForValue {
+                await clock.requests(for: EditorChromeState.transientRevealDuration).first
+            }
+
+            try openMenu(of: key)
+            XCTAssertTrue(key.isMenuPresented)
+            XCTAssertTrue(rig.chrome.isPresenting, "The menu holds the tools from the moment it opens.")
+            XCTAssertTrue(rig.chrome.state.pins.contains(.presentation))
+            await clock.release(expiry)
+            await NotebookTestFixtures.drainMainQueue()
+            XCTAssertFalse(rig.store.areToolsHidden, "The brief reveal never runs out under the menu.")
+            rig.chrome.reveal(.sticky)
+            rig.chrome.toggle()
+            XCTAssertFalse(rig.store.areToolsHidden, "The keyboard shortcut never hides the tools under the menu.")
+            rig.chrome.toolBegan()
+            rig.chrome.toolEnded()
+            XCTAssertFalse(rig.store.areToolsHidden, "Nor does a stroke ending.")
+
+            try closeMenu(of: key)
+            try openMenu(of: key)
+            await NotebookTestFixtures.drainMainQueue()
+            XCTAssertTrue(rig.chrome.isPresenting, "An end reported late never clears a menu opened again.")
+            try closeMenu(of: key)
+            XCTAssertFalse(key.isMenuPresented)
+            try await NotebookTestFixtures.waitUntil { !rig.chrome.isPresenting }
+            XCTAssertTrue(rig.store.areToolsHidden, "The hide takes effect once the menu ends.")
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
+        }
+    }
+
+    /// A key removed with its menu open, as when the toolbar leaves the screen, stops holding the
+    /// tools in sight.
+    func testAnEraserKeyRemovedWithItsMenuOpenStopsHoldingTheTools() async throws {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let rig = try await NotebookChromeRig(store: store)
+        let presence = ToolbarPresence()
+        let hosting = AppearanceTrackingHostingController(rootView: RemovableToolbar(presence: presence, store: store))
+        let window = try NotebookTestFixtures.window(showing: hosting, width: 1_024)
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        let key = try eraserKey(in: hosting.view)
+        try openMenu(of: key)
+        XCTAssertTrue(rig.chrome.isPresenting)
+        presence.showsToolbar = false
+        try await NotebookTestFixtures.waitUntil { key.window == nil }
+        try await NotebookTestFixtures.waitUntil { !rig.chrome.isPresenting }
+    }
+
+    /// The button's press reaches the key beneath, which sinks as every key does; nothing else in
+    /// the rail changes, and the key comes back up once released.
+    func testPressingTheEraserSinksItsKeyAlone() async throws {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let shown = try await showRail(store: store, sizeClass: .regular, width: 1_024)
+        defer { shown.close() }
+        let key = try eraserKey(in: shown.hosting.view)
+        let frame = key.convert(key.bounds, to: shown.hosting.view)
+        let rest = try await shown.settledRender()
+        key.isHighlighted = true
+        var pressed = rest
+        try await NotebookTestFixtures.waitUntil {
+            pressed = (try? shown.render()) ?? rest
+            return pressed.rgba != rest.rgba
+        }
+        let changed = differingPoints(rest, pressed)
+        XCTAssertFalse(changed.isEmpty)
+        XCTAssertTrue(changed.allSatisfy { frame.insetBy(dx: -0.5, dy: -0.5).contains($0) }, "Only the eraser key sinks.")
+        key.isHighlighted = false
+        try await NotebookTestFixtures.waitUntil { (try? shown.render())?.rgba == rest.rgba }
+    }
+
     // MARK: - Fixtures
 
     /// A strip's scroll state at `offset`, as the strip reports it: its content padded with the
@@ -1425,6 +1656,106 @@ final class NotebookToolbarTests: XCTestCase {
     private func inkStripWidth(_ rail: NotebookToolbarRail) -> CGFloat {
         rail.size.width - NotebookTheme.controlSize - NotebookToolbarComposition.inkCapWidth
             - (rail.inkRowOverflows ? NotebookTheme.controlSize : 0)
+    }
+
+    private func eraserKey(in view: UIView) throws -> NotebookEraserMenuButton {
+        func find(_ view: UIView) -> NotebookEraserMenuButton? {
+            (view as? NotebookEraserMenuButton) ?? view.subviews.lazy.compactMap(find).first
+        }
+        return try XCTUnwrap(find(view), "The tool strip holds the eraser key.")
+    }
+
+    /// Each eraser mode the key's menu offers, and whether it is checked as the one in use.
+    private func checkedModes(of key: NotebookEraserMenuButton) throws -> [String: Bool] {
+        let actions = try XCTUnwrap(key.menu?.children as? [UIAction])
+        return Dictionary(uniqueKeysWithValues: actions.map { ($0.title, $0.image != nil) })
+    }
+
+    /// The menu's entry for an eraser mode, as UIKit performs it when chosen.
+    private func modeAction(_ title: String, of key: NotebookEraserMenuButton) throws -> any UIMenuLeaf {
+        try XCTUnwrap((key.menu?.children as? [UIAction])?.first { $0.title == title })
+    }
+
+    /// What UIKit tells the key as a touch and hold opens its menu, with the configuration the key
+    /// itself provides, and as the menu ends.
+    private func openMenu(of key: NotebookEraserMenuButton) throws {
+        let (interaction, configuration) = try menuConfiguration(of: key)
+        key.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+    }
+
+    private func closeMenu(of key: NotebookEraserMenuButton) throws {
+        let (interaction, configuration) = try menuConfiguration(of: key)
+        key.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+    }
+
+    private func menuConfiguration(
+        of key: NotebookEraserMenuButton
+    ) throws -> (UIContextMenuInteraction, UIContextMenuConfiguration) {
+        let interaction = try XCTUnwrap(key.contextMenuInteraction, "The key's menu opens through UIKit's own interaction.")
+        let centre = CGPoint(x: key.bounds.midX, y: key.bounds.midY)
+        let configuration = try XCTUnwrap(key.contextMenuInteraction(interaction, configurationForMenuAtLocation: centre))
+        return (interaction, configuration)
+    }
+
+    /// The rail alone in a window as wide as `width`, optionally at the moment the writing view
+    /// begins to hide it, or disabled for some other reason.
+    private func showRail(
+        store: NotebookSceneToolStore, sizeClass: UserInterfaceSizeClass, width: CGFloat, hiding: Bool = false,
+        disabled: Bool = false
+    ) async throws -> ShownRail {
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: sizeClass)
+        let rail = composition.rail(forHostWidth: width)
+        let content = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
+            .frame(width: rail.size.width, height: rail.size.height)
+            .modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: hiding))
+            .disabled(disabled)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .ignoresSafeArea()
+        let hosting = AppearanceTrackingHostingController(rootView: content)
+        hosting.safeAreaRegions = []
+        hosting.traitOverrides.horizontalSizeClass = sizeClass == .compact ? .compact : .regular
+        let window = try NotebookTestFixtures.window(showing: hosting, width: width)
+        window.frame = CGRect(x: 0, y: 0, width: width, height: rail.size.height + 40)
+        let shown = ShownRail(hosting: hosting, window: window, composition: composition, rail: rail)
+        do {
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            // The strips measure themselves once laid out, which shows their chevrons.
+            try await Task.sleep(for: .milliseconds(400))
+        } catch {
+            shown.close()
+            throw error
+        }
+        return shown
+    }
+
+    /// Renders `content` at twice its point size into a cleared bitmap of its own. ImageRenderer's
+    /// own image of a view that draws nothing can hold the last render of the same size.
+    private func renderedAlone<Content: View>(_ content: Content) throws -> RenderedPixels {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        var image: CGImage?
+        ImageRenderer(content: content).render(rasterizationScale: 2) { size, render in
+            let width = Int((size.width * 2).rounded(.up))
+            let height = Int((size.height * 2).rounded(.up))
+            guard let context = CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+            context.scaleBy(x: 2, y: 2)
+            render(context)
+            image = context.makeImage()
+        }
+        return try RenderedPixels(try XCTUnwrap(image), scale: 2)
+    }
+
+    /// Points, in points, where two renders of the same size differ.
+    private func differingPoints(_ first: RenderedPixels, _ second: RenderedPixels) -> [CGPoint] {
+        guard first.rgba.count == second.rgba.count else { return [CGPoint(x: -1, y: -1)] }
+        return stride(from: 0, to: first.rgba.count, by: 4).compactMap { index in
+            guard first.rgba[index..<index + 4] != second.rgba[index..<index + 4] else { return nil }
+            let pixel = index / 4
+            return CGPoint(x: CGFloat(pixel % first.width) / first.scale, y: CGFloat(pixel / first.width) / first.scale)
+        }
     }
 
     /// A store that admits toolbar actions without mounting a canvas.
@@ -1504,6 +1835,67 @@ final class NotebookToolbarTests: XCTestCase {
 private final class EmissionCounter {
     var count = 0
     var subscription: AnyCancellable?
+}
+
+/// The rail shown alone in its own window.
+@MainActor
+private struct ShownRail {
+    let hosting: UIViewController
+    let window: UIWindow
+    let composition: NotebookToolbarComposition
+    let rail: NotebookToolbarRail
+
+    /// The render once two taken a moment apart agree, so no transition still under way is caught.
+    func settledRender() async throws -> RenderedPixels {
+        var previous = try render()
+        return try await NotebookTestFixtures.waitForValue {
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let current = try? render() else { return nil }
+            defer { previous = current }
+            return current.rgba == previous.rgba ? current : nil
+        }
+    }
+
+    /// The window's content as drawn on screen, UIKit views included, at twice its point size.
+    func render() throws -> RenderedPixels {
+        let view = try XCTUnwrap(hosting.view)
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 2
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        return try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 2)
+    }
+
+    func close() {
+        window.isHidden = true
+        window.rootViewController = nil
+    }
+}
+
+@MainActor
+private final class ToolbarPresence: ObservableObject {
+    @Published var showsToolbar = true
+}
+
+/// The rail, until the test takes it away.
+private struct RemovableToolbar: View {
+    @ObservedObject var presence: ToolbarPresence
+    let store: NotebookSceneToolStore
+
+    var body: some View {
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let rail = composition.rail(forHostWidth: 1_024)
+        ZStack(alignment: .topLeading) {
+            Color.clear
+            if presence.showsToolbar {
+                NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
+                    .frame(width: rail.size.width, height: rail.size.height)
+            }
+        }
+        .ignoresSafeArea()
+    }
 }
 
 /// Records the enabled state the toolbar passes down to the controls it contains.

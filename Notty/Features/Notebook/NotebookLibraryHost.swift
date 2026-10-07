@@ -221,8 +221,8 @@ struct NotebookLibraryHost: View {
     }
 
     /// The notice that a new notebook could not be selected. It lies over the bottom of the open
-    /// notebook, clear of the header and above the room kept below the last page for its "Add
-    /// page" tab, and can be dismissed to uncover the page beneath it.
+    /// notebook, clear of the header and just above the home indicator, and can be dismissed to
+    /// uncover the page beneath it.
     private func selectionFailureBanner(_ failure: NotebookSaveFailure) -> some View {
         HStack(spacing: 0) {
             Text("The new notebook could not be selected. \(failure.message)")
@@ -246,7 +246,7 @@ struct NotebookLibraryHost: View {
         .background { NotebookPanelShell(cornerRadius: NotebookTheme.compactPanelCornerRadius) }
         .frame(maxWidth: NotebookTheme.statusCardMaxWidth)
         .padding(.horizontal, NotebookTheme.sectionSpacing)
-        .padding(.bottom, NotebookTheme.endScrollMinimum + NotebookTheme.sectionSpacing)
+        .padding(.bottom, NotebookTheme.sectionSpacing)
     }
 
     /// Separate statements of a card's message, one per line.

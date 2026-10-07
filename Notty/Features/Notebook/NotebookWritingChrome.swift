@@ -298,7 +298,7 @@ final class NotebookWritingChrome: ObservableObject {
     }
 
     /// Keyboard focus appears only when someone navigates the controls with a keyboard. Focus on
-    /// the page, such as its end-of-paper key, leaves the writing view free to hide.
+    /// the page, such as its end-of-notebook card, leaves the writing view free to hide.
     private func refreshKeyboardFocus() {
         let item = header.flatMap { UIFocusSystem.focusSystem(for: $0)?.focusedItem }
         let focused = item.map { !Self.isOnPage($0) } ?? false
@@ -453,15 +453,20 @@ final class NotebookWritingChrome: ObservableObject {
         let moved = state.showsHeader ? state.headerTravel : travel + max(delta, 0)
         let clamped = min(max(moved, 0), Self.fullTravel)
         guard clamped != travel else { return }
+        // A header the count has moved further than the page, as when a stroke cut short leaves it
+        // where the pen held it, or the page reaches its top after layout moved it, eases there
+        // rather than jumping ahead of the finger.
+        let outpacesPage = abs(clamped - travel) > abs(delta) + 0.5
         travel = clamped
-        move(.follow)
+        move(outpacesPage ? .settle : .follow)
     }
 
     // MARK: Presentation
 
-    /// Brings the tools and the header in line with the state. During a stroke only a pin shows
-    /// anything; everything else waits for the pen to lift. A shown header stays as far up as the
-    /// page has taken it, so a reveal of the tools alone mid-scroll leaves it where it is.
+    /// Brings the tools and the header in line with the state, whose count of the page's travel
+    /// always decides where a shown header sits. During a stroke only a pin shows anything;
+    /// everything else waits for the pen to lift. A shown header stays as far up as the page has
+    /// taken it, so a reveal of the tools alone mid-scroll leaves it where it is.
     private func apply(_ motion: HeaderMotion? = nil) {
         let forced = !state.pins.isEmpty
         guard !isToolActive || forced else { return }

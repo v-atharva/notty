@@ -70,9 +70,9 @@ final class NotebookViewController: UIViewController {
     var barrierPointComparisons: Int { observationWork.comparedPoints }
     var barrierSignatureChecks: Int { observationWork.signatureChecks }
     private(set) var inputGate = NotebookInputGate.open {
-        didSet { updateEndOfPaperTab() }
+        didSet { updateEndOfNotebookCard() }
     }
-    private var pageCount: Int
+    private(set) var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
     private var observesToolStore = false
@@ -83,18 +83,52 @@ final class NotebookViewController: UIViewController {
     private var resizeCapture: ResizeCapture?
     /// Paper behind the status bar, between the canvas and the chrome drawn over it.
     private(set) lazy var statusVeil = NotebookStatusVeil(accessibility: paperView.accessibility)
-    /// The "Add page" tab on the stone below the last page.
-    let endOfPaperTab = NotebookEndOfPaperTab()
+    /// The card a pull past the last page reveals beneath it.
+    let endOfNotebookCard = NotebookEndOfNotebookCard()
+    /// The frost that clears down a page added where the user can see it; nil for a viewer, which
+    /// never adds pages.
+    let pageUnfold: NotebookPageUnfold?
     /// Hears the last finger leave the page, which ends a scroll the user stopped with a tap.
     let fingerLiftObserver = NotebookFingerLiftObserver()
-    /// Adds a page at the end of the notebook. Only a canvas given this shows the end-of-paper
-    /// tab and keeps room below the last page for it.
+    /// Adds a page at the end of the notebook. Only a canvas given this offers the end of
+    /// notebook card.
     var onAddPage: (() -> Void)? {
         didSet {
             guard isViewLoaded else { return }
-            updateInsets()
-            updateEndOfPaperTab()
+            updateEndOfNotebookAccess()
         }
+    }
+    /// Whether the card shows beneath the lifted page, with room kept below the last page for it.
+    private(set) var isEndCardRevealed = false
+    /// The room kept below the last page for the revealed card. It never shrinks while the card
+    /// shows, as that would pull the lifted page back down.
+    private var endCardRoom: CGFloat = 0
+    /// A drag that began with the page resting at its end, which may pull the card into view.
+    private var endPull: EndPull?
+    /// Whether the drag under way began above the end of the scroll range, so a fling it starts
+    /// stops at the end.
+    private var dragBeganAboveEnd = false
+    /// A fling the controller aimed at the end, which stops there should UIKit carry it on.
+    private var isStoppingFlingAtEnd = false
+
+    /// How far past the end of the paper a pull must be when released to reveal the card. Under
+    /// UIKit's rubber band that takes roughly 140 points of finger travel on a 1,366-point canvas,
+    /// well past the overshoot a stray nudge leaves, while the card still shows most of itself
+    /// before the release.
+    static let endRevealPull: CGFloat = 72
+    /// How fast, in points per millisecond, a pull may still be heading back toward the page when
+    /// released and reveal the card. A finger held at its depth lifts with a little drift either
+    /// way; one already pushing the page back has taken the pull back.
+    static let endPullReturnSpeed: CGFloat = 0.1
+    /// How close to its end the page must rest for a drag to count as a pull past it.
+    static let endRestTolerance: CGFloat = 1
+    static let endCardActionName = "End of notebook options"
+
+    /// A pull past the end of the paper, from the drag that began it until the page settles.
+    private struct EndPull {
+        /// Prepared as the drag begins, so the tick plays on time when the card is revealed.
+        let feedback: UIImpactFeedbackGenerator
+        var isReleased = false
     }
 
     /// Whether the page rested at its revealed top when a resize began. It is taken at the first
@@ -114,13 +148,16 @@ final class NotebookViewController: UIViewController {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
     }
 
+    /// - Parameter pageUnfold: the frost for added pages; an editing canvas makes its own when
+    ///   given none, and its shaders compile in the background.
     init(
         pageCount: Int, initialDrawing: PKDrawing, toolStore: NotebookSceneToolStore? = nil,
-        allowsEditing: Bool = true, paperView: NotebookPaperView? = nil
+        allowsEditing: Bool = true, paperView: NotebookPaperView? = nil, pageUnfold: NotebookPageUnfold? = nil
     ) {
         self.injectedToolStore = toolStore
         self.allowsEditing = allowsEditing
         self.paperView = paperView ?? NotebookPaperView(frame: .zero)
+        self.pageUnfold = allowsEditing ? pageUnfold ?? NotebookPageUnfold() : nil
         self.initialDrawing = initialDrawing
         self.lastDeliveredSignature = try? InkDrawingSignature(initialDrawing)
         self.pageCount = min(max(pageCount, 1), Self.maximumPageCount)
@@ -183,16 +220,19 @@ final class NotebookViewController: UIViewController {
         canvas.addGestureRecognizer(fingerLiftObserver)
         view.addSubview(paperView)
         view.addSubview(canvas)
-        endOfPaperTab.addTarget(self, action: #selector(addPage), for: .touchUpInside)
-        view.addSubview(endOfPaperTab)
+        endOfNotebookCard.onAddPage = { [weak self] in self?.addPageFromEndCard() }
+        addChild(endOfNotebookCard.host)
+        view.addSubview(endOfNotebookCard)
+        endOfNotebookCard.host.didMove(toParent: self)
         view.addSubview(statusVeil)
         registerForTraitChanges(
             [UITraitPreferredContentSizeCategory.self]
         ) { (controller: NotebookViewController, _: UITraitCollection) in
-            controller.updateEndOfPaperTab()
+            controller.updateEndOfNotebookCard()
         }
         updatePaperGeometry()
         updateContentExtent()
+        updateEndOfNotebookAccess()
         refreshUndoManager()
     }
 
@@ -208,6 +248,7 @@ final class NotebookViewController: UIViewController {
         guard newSize != previousViewportSize else {
             updateInsets()
             updatePaperViewport()
+            releaseEndCardOnceLeftView()
             return
         }
 
@@ -258,6 +299,7 @@ final class NotebookViewController: UIViewController {
         }
         finishResizeIfSettled()
         updatePaperViewport()
+        releaseEndCardOnceLeftView()
         paperView.finishZoom()
     }
 
@@ -482,10 +524,15 @@ final class NotebookViewController: UIViewController {
         return lastObservation
     }
 
+    /// Grows the paper; every way of adding a page ends here. The page stays where it is, a card
+    /// shown beneath the old last page gives way to the new one, and a single page added where
+    /// the user can see it clears in with the frost.
     func setPageCount(_ requestedCount: Int) {
         let boundedCount = min(max(requestedCount, 1), Self.maximumPageCount)
         // Reducing the paper extent could hide existing ink.
         guard boundedCount > pageCount else { return }
+        let previousHeight = logicalHeight
+        let added = boundedCount - pageCount
         pageCount = boundedCount
         guard isViewLoaded else { return }
         let offset = canvas.contentOffset
@@ -494,7 +541,25 @@ final class NotebookViewController: UIViewController {
             updateContentExtent()
             canvas.setContentOffset(offset, animated: false)
         }
+        // The new page lies where the card was, so giving up the card's room moves nothing, even
+        // where the whole notebook still fits on screen and the card would otherwise stay.
+        dismissEndCard()
         updatePaperViewport()
+        if added == 1 { unfoldPage(below: previousHeight) }
+    }
+
+    /// Plays the frost over the page added below `top`, in page points, if the user can see
+    /// where it lands; elsewhere it is simply there.
+    private func unfoldPage(below top: CGFloat) {
+        guard let pageUnfold, !isTornDown, isAppearing || isCanvasVisible, view.window != nil else { return }
+        let page = CGRect(x: 0, y: top, width: logicalWidth, height: logicalHeight - top)
+        guard NotebookPageUnfold.isVisible(page: page, in: canvas) else { return }
+        let source = pageUnfold.needsSource
+            ? paperView.blankPageImage(page, screenPixelsPerPoint: traitCollection.displayScale * canvas.zoomScale)
+            : nil
+        // Inside the paper's content, over the grain and under the lines, so the frost scrolls and
+        // zooms with the page and the canvas above keeps its ink and its touches.
+        pageUnfold.play(page: page, source: source, in: paperView.contentLayer, above: paperView.grainLayer) {}
     }
 
     func tearDown() {
@@ -528,6 +593,12 @@ final class NotebookViewController: UIViewController {
         observesToolStore = false
         overlayStore?.uncover(self)
         overlayStore = nil
+        pageUnfold?.finish()
+        endPull = nil
+        isStoppingFlingAtEnd = false
+        endOfNotebookCard.onAddPage = nil
+        canvas.accessibilityCustomActions = nil
+        withoutAnimations { endOfNotebookCard.isHidden = true }
         if let pencilInteraction {
             pencilInteraction.delegate = nil
             canvas.removeInteraction(pencilInteraction)
@@ -570,49 +641,152 @@ final class NotebookViewController: UIViewController {
             width: view.bounds.width, safeTop: view.safeAreaInsets.top,
             isOverPaper: canvas.zoomScale >= view.bounds.width / logicalWidth * 0.999
         )
-        updateEndOfPaperTab()
+        updateEndOfNotebookCard()
     }
 
-    private var showsEndOfPaperTab: Bool { allowsEditing && onAddPage != nil }
+    // MARK: - End of notebook
 
-    /// Places the end-of-paper tab centred on the page, its top `endTabGap` below the last page
-    /// on screen. It only moves as the paper scrolls; its content changes with the gate, the
-    /// page limit and the text size.
-    private func updateEndOfPaperTab() {
+    private var offersEndCard: Bool { allowsEditing && onAddPage != nil && !isTornDown }
+
+    /// The offset that rests the last page at the end of the scroll range as it stands, the
+    /// card's room included.
+    private var endOffsetY: CGFloat {
+        max(-canvas.contentInset.top, canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom)
+    }
+
+    /// The offset that rests the last page at its end above the bottom chrome, without the card.
+    private var restingEndOffsetY: CGFloat {
+        max(-canvas.contentInset.top, canvas.contentSize.height - canvas.bounds.height + chromeBottomInset)
+    }
+
+    /// Offers the card's VoiceOver action to a canvas that can add pages: it reveals the card for
+    /// anyone who cannot pull the page past its end.
+    private func updateEndOfNotebookAccess() {
+        canvas.accessibilityCustomActions = offersEndCard
+            ? [UIAccessibilityCustomAction(name: Self.endCardActionName) { [weak self] _ in
+                self?.revealEndCardForAssistiveTechnology() ?? false
+            }]
+            : nil
+        updateEndOfNotebookCard()
+    }
+
+    /// Places the card centred under the visible part of the last page, its top `endCardGap`
+    /// below it on screen, while it is revealed or a pull from the end is lifting the page. It
+    /// only moves as the paper scrolls; its content changes with the gate, the page limit, the
+    /// width and the text size.
+    private func updateEndOfNotebookCard() {
         guard isViewLoaded else { return }
-        let tab = endOfPaperTab
-        guard showsEndOfPaperTab else {
-            if !tab.isHidden { tab.isHidden = true }
+        let card = endOfNotebookCard
+        guard offersEndCard, isEndCardRevealed || endPull != nil else {
+            if !card.isHidden { withoutAnimations { card.isHidden = true } }
             return
         }
-        let mode: NotebookEndOfPaperTab.Mode = pageCount >= Self.maximumPageCount
-            ? .limitReached : inputGate.allowsMutation ? .available : .paused
-        // The tab keeps the same margin from the window's sides as from the page above it.
-        tab.configure(
-            mode: mode, contentSize: traitCollection.preferredContentSizeCategory,
-            maximumWidth: view.bounds.width - 2 * NotebookTheme.endTabGap
-        )
-        let scale = canvas.zoomScale
-        let size = tab.bounds.size
-        let pageBottom = logicalHeight * scale - canvas.contentOffset.y
+        configureEndCard()
+        let size = card.bounds.size
+        let offsetX = canvas.contentOffset.x
+        let pageLeft = max(-offsetX, 0)
+        let pageRight = min(logicalWidth * canvas.zoomScale - offsetX, view.bounds.width)
         let pixel = 1 / max(traitCollection.displayScale, 1)
-        // Whole device pixels keep the label sharp at any zoom.
+        // Whole device pixels keep the labels sharp at any zoom.
         let origin = CGPoint(
-            x: ((logicalWidth * scale - size.width) / 2 - canvas.contentOffset.x) / pixel,
-            y: (pageBottom + NotebookTheme.endTabGap) / pixel
+            x: (((pageLeft + pageRight) - size.width) / 2 / pixel).rounded() * pixel,
+            y: (endCardTop / pixel).rounded() * pixel
         )
-        let frame = CGRect(
-            origin: CGPoint(x: origin.x.rounded() * pixel, y: origin.y.rounded() * pixel), size: size
-        )
+        let frame = CGRect(origin: origin, size: size)
         let hidden = frame.minY >= view.bounds.height || frame.maxY <= 0
-        UIView.performWithoutAnimation {
-            if tab.frame != frame { tab.frame = frame }
-            if tab.isHidden != hidden { tab.isHidden = hidden }
+        withoutAnimations {
+            if card.frame != frame { card.frame = frame }
+            if card.isHidden != hidden { card.isHidden = hidden }
         }
     }
 
-    @objc private func addPage() {
-        guard endOfPaperTab.mode == .available else { return }
+    private func configureEndCard() {
+        let addPage: NotebookEndOfNotebookCard.AddPage = pageCount >= Self.maximumPageCount
+            ? .limitReached : inputGate.allowsMutation ? .available : .paused
+        // The card keeps the same margin from the window's sides as from the page above it.
+        endOfNotebookCard.configure(
+            addPage: addPage, contentSize: traitCollection.preferredContentSizeCategory,
+            maximumWidth: view.bounds.width - 2 * NotebookTheme.endCardGap
+        )
+        // A taller card at a larger text size needs more room at once; a shorter one keeps the
+        // room it has until the card is dismissed, so the lifted page never drops.
+        if isEndCardRevealed, endCardRoomNeeded > endCardRoom {
+            endCardRoom = endCardRoomNeeded
+            updateInsets()
+        }
+    }
+
+    /// The card with its gap above and below.
+    private var endCardRoomNeeded: CGFloat {
+        endOfNotebookCard.bounds.height + 2 * NotebookTheme.endCardGap
+    }
+
+    /// Where the card's top lies in the canvas's frame: `endCardGap` below the last page.
+    private var endCardTop: CGFloat {
+        logicalHeight * canvas.zoomScale - canvas.contentOffset.y + NotebookTheme.endCardGap
+    }
+
+    /// Keeps room below the last page for the card and shows it there.
+    @discardableResult
+    private func revealEndCard() -> Bool {
+        guard offersEndCard else { return false }
+        isEndCardRevealed = true
+        configureEndCard()
+        endCardRoom = max(endCardRoom, endCardRoomNeeded)
+        updateInsets()
+        updateEndOfNotebookCard()
+        return true
+    }
+
+    /// The VoiceOver action: brings the page to its end, lifted, with the card below it, and
+    /// moves VoiceOver to the card.
+    private func revealEndCardForAssistiveTechnology() -> Bool {
+        guard revealEndCard() else { return false }
+        adjustingLayout {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: false)
+        }
+        updatePaperViewport()
+        UIAccessibility.post(notification: .layoutChanged, argument: endOfNotebookCard)
+        return true
+    }
+
+    /// Dismisses the card once scrolling or zooming has taken it below the part of the window the
+    /// bottom chrome leaves clear. Where the whole notebook fits on screen the page cannot leave
+    /// its resting end, so the card stays while it is in view.
+    private func releaseEndCardOnceLeftView() {
+        guard isEndCardRevealed, endCardTop >= view.bounds.height - chromeBottomInset - 0.5 else { return }
+        dismissEndCard()
+    }
+
+    /// Dismisses the card and gives up its room once the page rests no lower than it would
+    /// without that room, so the release only ever clamps; a stroke in progress keeps the room
+    /// until it ends.
+    private func dismissEndCard() {
+        guard isEndCardRevealed, canvas.contentOffset.y <= restingEndOffsetY + 0.5 else { return }
+        isEndCardRevealed = false
+        endCardRoom = 0
+        endPull = nil
+        updateInsets()
+        updateEndOfNotebookCard()
+    }
+
+    /// The pull from the end has run its course: the card stays if it was revealed and leaves
+    /// with the page otherwise.
+    private func settleEndPull() {
+        guard let endPull, endPull.isReleased else { return }
+        self.endPull = nil
+        // A release with no speed left can leave the lifted page short of its new end. Animated, it
+        // eases there; its frames are neither a drag nor a deceleration, so the writing view does
+        // not count them as the user's scrolling.
+        if isEndCardRevealed, canvas.contentOffset.y < endOffsetY - 0.5, !canvas.isDecelerating {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: true)
+        }
+        updateEndOfNotebookCard()
+    }
+
+    /// The card's Add page key, which the card offers only while a page can be added.
+    private func addPageFromEndCard() {
+        guard isEndCardRevealed else { return }
         onAddPage?()
     }
 
@@ -696,20 +870,23 @@ final class NotebookViewController: UIViewController {
         updateInsets()
     }
 
+    /// The room below the last page for the home indicator and a toolbar at the bottom, so the
+    /// page rests at its end above them.
+    private var chromeBottomInset: CGFloat {
+        max(chrome.bottom, 0) + max(toolbarObstruction.bottom, 0)
+    }
+
     /// Edge insets add scroll range to reveal covered writing. Reserving range never moves the
     /// page; releasing it only pulls a page scrolled past the new end back to that end, and
     /// waits until a stroke in progress ends. The one exception is a confirmed resize: a page
     /// that rested at its revealed top when the resize began stays there instead of ending up
-    /// under the header or toolbar. Horizontally the page stays centred.
+    /// under the header or toolbar. Horizontally the page stays centred. A revealed end of
+    /// notebook card adds its room below the last page.
     private func updateInsets(followingResize: Bool = false) {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
         let obstruction = toolbarObstruction
         var top = max(max(chrome.top, 0) + max(obstruction.top, 0), chrome.coveredTop)
-        // The end-of-paper tab needs room below the last page, clear of the home indicator.
-        let chromeBottom = showsEndOfPaperTab
-            ? max(chrome.bottom, view.safeAreaInsets.bottom, 0) + NotebookTheme.endScrollMinimum
-            : max(chrome.bottom, 0)
-        var bottom = chromeBottom + max(obstruction.bottom, 0)
+        var bottom = chromeBottomInset + (isEndCardRevealed ? endCardRoom : 0)
         if canvas.hasActiveTool {
             // A smaller inset pulls an offset beyond it back into range, which would move the
             // page under the stroke; the space is released when the stroke ends.
@@ -820,28 +997,90 @@ extension NotebookViewController: PKCanvasViewDelegate {
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard !isAdjustingLayout else { return }
+        if isStoppingFlingAtEnd, canvas.contentOffset.y > endOffsetY {
+            stopFlingAtEnd()
+        }
         updatePaperViewport()
         writingChrome?.userScrollMoved(in: scrollView)
+        releaseEndCardOnceLeftView()
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         // The user moving the page ends any claim that it rested at its top when a resize began.
         resizeCapture = nil
+        isStoppingFlingAtEnd = false
+        let offset = canvas.contentOffset.y
+        let end = endOffsetY
+        dragBeganAboveEnd = offset < end - Self.endRestTolerance
+        // Only a new drag from a page resting at its end pulls past it; a fling arriving there,
+        // or a drag carried on past it, never does.
+        if offersEndCard, !isEndCardRevealed, abs(offset - end) <= Self.endRestTolerance {
+            let feedback = UIImpactFeedbackGenerator(style: .light, view: canvas)
+            feedback.prepare()
+            endPull = EndPull(feedback: feedback)
+        } else {
+            endPull = nil
+        }
         writingChrome?.userScrollBegan(in: scrollView)
+        updateEndOfNotebookCard()
+    }
+
+    /// Stops a fling at the end of the paper, and reveals the card for a pull from the end
+    /// released far enough past it and not already heading back. Native scrolling is otherwise
+    /// untouched.
+    func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        let offset = canvas.contentOffset.y
+        let end = endOffsetY
+        if endPull != nil {
+            endPull?.isReleased = true
+            // UIKit holds the offset to whole device pixels, so the threshold allows one.
+            let pixel = 1 / max(traitCollection.displayScale, 1)
+            guard offset - end >= Self.endRevealPull - pixel, velocity.y >= -Self.endPullReturnSpeed,
+                  let feedback = endPull?.feedback, revealEndCard() else { return }
+            targetContentOffset.pointee.y = endOffsetY
+            feedback.impactOccurred(at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.maxY))
+            return
+        }
+        // A drag carried past the end by the finger springs back on its own.
+        guard dragBeganAboveEnd, offset <= end + 0.5, targetContentOffset.pointee.y >= end - 0.5 else { return }
+        targetContentOffset.pointee.y = end
+        isStoppingFlingAtEnd = true
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if !decelerate { writingChrome?.userScrollEnded() }
+        guard !decelerate else { return }
+        writingChrome?.userScrollEnded()
+        settleEndPull()
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        isStoppingFlingAtEnd = false
         writingChrome?.userScrollEnded()
+        settleEndPull()
     }
 
-    /// A drag still under way, or the deceleration it started, reports its own end.
+    /// Halts a fling aimed at the end of the paper that UIKit would carry past it to bounce.
+    private func stopFlingAtEnd() {
+        isStoppingFlingAtEnd = false
+        adjustingLayout {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: false)
+        }
+    }
+
+    /// A drag still under way, or the deceleration it started, reports its own end. A tap that
+    /// stops a fling short of the end reports neither, so the fling's stop ends here too.
     private func fingersLifted() {
         guard !canvas.isDragging, !canvas.isDecelerating else { return }
+        isStoppingFlingAtEnd = false
         writingChrome?.fingersLifted()
+        settleEndPull()
+    }
+
+    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        // A pinch takes over from any fling, so its bounce at the foot of the paper is its own.
+        isStoppingFlingAtEnd = false
     }
 
     func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
@@ -855,6 +1094,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
             updateInsets()
         }
         updatePaperViewport()
+        releaseEndCardOnceLeftView()
     }
 }
 

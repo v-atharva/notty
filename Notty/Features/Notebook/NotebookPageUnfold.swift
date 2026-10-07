@@ -16,7 +16,8 @@ import UIKit
 /// To add a page with the frost:
 /// 1. Grow the paper to include the new page.
 /// 2. Unless `isVisible(page:in:)`, stop there: a page the user cannot see is simply there.
-/// 3. Take `snapshot(of:rect:screenPixelsPerPoint:)` of the new page from the paper's content layer.
+/// 3. When `needsSource`, take a picture of the new page as it will look, such as
+///    `snapshot(of:rect:screenPixelsPerPoint:)` of the paper's content layer.
 /// 4. In the same run-loop turn, call `play(page:source:in:above:completion:)`, so the frost
 ///    appears in the frame that shows the page.
 ///
@@ -77,6 +78,9 @@ final class NotebookPageUnfold {
     var isPlaying: Bool { playback != nil }
     /// Whether the shaders are ready to draw the frost; until they are, a page simply appears.
     var isReady: Bool { pipeline != nil }
+    /// Whether a `play` now would draw the frost over its source. Reduce Motion's fade, and a
+    /// play that shows nothing, need none, so the caller can skip drawing one.
+    var needsSource: Bool { device != nil && isReady && !prefersReducedMotion() }
 
     /// - Parameters:
     ///   - device: the GPU to draw with; nil where there is no Metal, and then nothing ever plays.
@@ -116,11 +120,11 @@ final class NotebookPageUnfold {
     /// A play while another runs finishes that one first. `completion` runs once, whenever the
     /// frost ends, `finish()` included.
     ///
-    /// - Returns: false when nothing plays: without Metal, before the shaders are ready or for an
-    ///   empty page. `completion` has then already run.
+    /// - Returns: false when nothing plays: without Metal, before the shaders are ready, without a
+    ///   source for the frost or for an empty page. `completion` has then already run.
     @discardableResult
     func play(
-        page: CGRect, source: CGImage, in host: CALayer, above sibling: CALayer? = nil,
+        page: CGRect, source: CGImage?, in host: CALayer, above sibling: CALayer? = nil,
         completion: @escaping @MainActor () -> Void
     ) -> Bool {
         finish()
@@ -138,7 +142,7 @@ final class NotebookPageUnfold {
             startDisplayLink()
             return true
         }
-        guard pipeline != nil, let commands = queue.makeCommandBuffer(),
+        guard pipeline != nil, let source, let commands = queue.makeCommandBuffer(),
               let texture = makeTexture(source, commands: commands) else {
             completion()
             return false

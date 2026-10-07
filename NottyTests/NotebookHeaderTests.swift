@@ -1169,6 +1169,143 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertEqual(rig.header.transform, .identity)
     }
 
+    /// A stroke that begins while the header follows the page holds it there and restarts the
+    /// count. If the stroke is cut short and the page moves before the pen's requests are carried
+    /// out, the header eases into line with the count rather than jumping, then follows on.
+    func testAStrokeCutShortMidScrollEasesTheHeaderBackIntoLine() async throws {
+        let rig = try await NotebookChromeRig()
+        rig.chrome.userScrollBegan(in: rig.scrollView)
+        rig.scroll(by: 15)
+        XCTAssertEqual(rig.header.transform.ty, -15, accuracy: 0.01)
+        rig.chrome.toolBegan()
+        rig.scroll(by: 8)
+        XCTAssertEqual(rig.header.transform.ty, -15, accuracy: 0.01, "The header holds still under the pen.")
+        rig.chrome.toolCancelled()
+
+        rig.header.layer.removeAllAnimations()
+        rig.scroll(by: 2)
+        XCTAssertEqual(rig.header.transform.ty, -2, accuracy: 0.01, "The count restarted as the stroke began.")
+        XCTAssertNotNil(rig.header.layer.animation(forKey: "transform"), "It eases the 13 pt the page never moved.")
+        rig.header.layer.removeAllAnimations()
+        rig.scroll(by: 1)
+        XCTAssertEqual(rig.header.transform.ty, -3, accuracy: 0.01)
+        XCTAssertNil(rig.header.layer.animation(forKey: "transform"), "Back in line, it moves with the finger.")
+        await NotebookTestFixtures.drainMainQueue()
+        XCTAssertEqual(rig.header.transform.ty, -rig.chrome.state.headerTravel, accuracy: 0.01)
+        rig.chrome.userScrollEnded()
+    }
+
+    /// Layout can carry the page to just below its top mid-scroll without the jump counting as
+    /// travel. Arriving at the top then shows the header, which eases back into place from where
+    /// the page left it.
+    func testArrivingAtTheTopAfterALayoutJumpEasesTheHeaderIntoPlace() async throws {
+        let rig = try await NotebookChromeRig()
+        let top = -rig.scrollView.contentInset.top
+        rig.chrome.userScrollBegan(in: rig.scrollView)
+        rig.scroll(by: 20)
+        XCTAssertEqual(rig.header.transform.ty, -20, accuracy: 0.01)
+        rig.scrollView.contentOffset.y = top + 1
+        rig.chrome.layoutMovedPage(in: rig.scrollView)
+        rig.header.layer.removeAllAnimations()
+        rig.move(to: top)
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        XCTAssertEqual(rig.header.transform, .identity)
+        XCTAssertNotNil(rig.header.layer.animation(forKey: "transform"), "The header eases the 20 pt home.")
+        rig.chrome.userScrollEnded()
+    }
+
+    /// Whatever interleaves with scrolling, a shown header sits where the count puts it whenever
+    /// nothing holds it, and no step of the page moves the header further than the page moved
+    /// unless it eases there.
+    func testTheHeaderNeverJumpsAheadOfThePageWhateverInterleaves() async throws {
+        let rig = try await NotebookChromeRig()
+        var random = SeededGenerator(seed: 0x5EED)
+        let top = -rig.scrollView.contentInset.top
+        let end: CGFloat = 4_100
+        var isScrolling = false
+        var isDrawing = false
+        // A stroke cut short carries out its requests on the next turn.
+        var awaitsTurn = false
+        var presentations: [UUID] = []
+        var eased = 0
+        for step in 0..<6_000 {
+            switch Int.random(in: 0..<200, using: &random) {
+            case 0..<110:
+                if !isScrolling {
+                    rig.chrome.userScrollBegan(in: rig.scrollView)
+                    isScrolling = true
+                }
+                let from = rig.scrollView.contentOffset.y
+                let to = min(max(from + CGFloat(Int.random(in: -9...12, using: &random)), top - 40), end)
+                let before = rig.chrome.travel
+                rig.header.layer.removeAllAnimations()
+                rig.move(to: to)
+                guard abs(rig.chrome.travel - before) > abs(to - from) + 0.5 else { break }
+                XCTAssertNotNil(rig.header.layer.animation(forKey: "transform"), "\(step): the header jumped ahead of the page")
+                eased += 1
+            case 110..<120:
+                rig.chrome.userScrollEnded()
+                isScrolling = false
+            case 120..<124:
+                rig.chrome.fingersLifted()
+                isScrolling = false
+            case 124..<132:
+                let jump = CGFloat(Int.random(in: -300...300, using: &random))
+                rig.scrollView.contentOffset.y = min(max(rig.scrollView.contentOffset.y + jump, top), end)
+                rig.chrome.layoutMovedPage(in: rig.scrollView)
+            case 132..<135:
+                rig.scrollView.contentOffset.y = top + CGFloat(Int.random(in: 1...6, using: &random))
+                rig.chrome.layoutMovedPage(in: rig.scrollView)
+            case 135..<138:
+                let open = UUID()
+                presentations.append(open)
+                rig.chrome.setPresentation(open, isPresented: true)
+            case 138..<146:
+                guard let open = presentations.popLast() else { break }
+                rig.chrome.setPresentation(open, isPresented: false)
+            case 146..<148:
+                rig.chrome.setToolbarDragging(true)
+            case 148..<154:
+                rig.chrome.setToolbarDragging(false)
+            case 154..<162:
+                guard !isDrawing else { break }
+                rig.chrome.toolBegan()
+                isDrawing = true
+            case 162..<169:
+                guard isDrawing else { break }
+                rig.chrome.toolEnded()
+                isDrawing = false
+            case 169..<174:
+                guard isDrawing else { break }
+                rig.chrome.toolCancelled()
+                isDrawing = false
+                awaitsTurn = true
+            case 174..<180:
+                await NotebookTestFixtures.drainMainQueue()
+                awaitsTurn = false
+            case 180..<190:
+                rig.chrome.reveal(Bool.random(using: &random) ? .sticky : .transient)
+            case 190..<194:
+                rig.chrome.toggle()
+            case 194..<197:
+                rig.chrome.setMode(EditorChromeMode.allCases.randomElement(using: &random) ?? .focus)
+            default:
+                rig.scrollView.contentOffset.y = top
+                rig.chrome.scrolledToTop()
+                isScrolling = false
+            }
+            let state = rig.chrome.state
+            if state.showsHeader && !isDrawing && !awaitsTurn {
+                XCTAssertEqual(rig.header.transform.ty, -state.headerTravel, accuracy: 0.01, "\(step): out of line")
+            }
+        }
+        XCTAssertGreaterThan(eased, 0, "The sequence reaches a header out of line with the count.")
+        for open in presentations { rig.chrome.setPresentation(open, isPresented: false) }
+        rig.chrome.setToolbarDragging(false)
+        if isDrawing { rig.chrome.toolEnded() }
+        await NotebookTestFixtures.drainMainQueue()
+    }
+
     /// The stored writing view reaches the chrome a turn after it changes. A newer choice made in
     /// between is never undone by the older value arriving late.
     func testALateStoredModeNeverUndoesANewerChoice() async throws {
@@ -1211,6 +1348,42 @@ final class NotebookHeaderTests: XCTestCase {
 
     // MARK: - Notebook menu
 
+
+    /// The menu lays out at the width its popover is drawn. In a window too narrow for the standard
+    /// width, as Slide Over is, UIKit narrows the popover, and the menu asks for no more than that.
+    func testTheMenuLaysOutAtTheWidthItsPopoverIsDrawn() async throws {
+        let rig = try await NotebookChromeRig()
+        let session = NotebookSession()
+        let settings: [(hostWidth: CGFloat, size: DynamicTypeSize)] = [
+            (320, .large), (320, .accessibility5), (420, .accessibility5), (834, .accessibility1), (1_024, .large),
+        ]
+        for setting in settings {
+            let menu = NotebookMenu(
+                session: session, chrome: rig.chrome, gate: rig.gate, commands: session.commandModel,
+                hostWidth: setting.hostWidth, sizeClass: setting.hostWidth < 500 ? .compact : .regular, offersRedo: false,
+                close: {}, openRecoveryCopies: {}
+            )
+            let hosting = AppearanceTrackingHostingController(rootView: MenuPresenter(menu: menu, size: setting.size))
+            let window = try NotebookTestFixtures.window(showing: hosting, width: setting.hostWidth)
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            let presented = try await NotebookTestFixtures.waitForValue {
+                hosting.presentedViewController.flatMap { $0.view.window == nil ? nil : $0 }
+            }
+            let expected = NotebookMenu.width(for: setting.size, hostWidth: setting.hostWidth)
+            try await NotebookTestFixtures.waitUntil { abs(presented.view.bounds.width - expected) < 0.5 }
+            XCTAssertLessThanOrEqual(
+                presented.view.convert(presented.view.bounds, to: nil).maxX, setting.hostWidth,
+                "In \(setting.hostWidth) at \(setting.size) the whole menu is in the window"
+            )
+            presented.dismiss(animated: false)
+            try await NotebookTestFixtures.waitUntil { hosting.presentedViewController == nil }
+        }
+    }
+
     /// At the popover's width every description keeps to one line, so each row is 52 pt tall.
     func testWritingViewRowsKeepTheirDescriptionsToOneLine() throws {
         let width = NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding
@@ -1225,30 +1398,191 @@ final class NotebookHeaderTests: XCTestCase {
     }
 
     /// At accessibility text sizes the menu widens as far as the window allows and the shortcut hint
-    /// gives way, so a writing view's name wraps between its words rather than being cut off.
-    func testWritingViewNamesStayWholeAtAccessibilitySizes() {
+    /// gives way; a window too narrow for the standard width, as Slide Over is, gets the widest
+    /// popover UIKit shows. Where a word of a name would not fit beside the glyph, the glyph moves
+    /// above the name; where it would not fit even then, as "Always-on" in Slide Over at the
+    /// largest size, it breaks at its hyphen. Either way every name and description wraps between
+    /// its words rather than inside one, Bold Text included.
+    func testWritingViewNamesStayWholeAtEveryTextSize() {
         XCTAssertEqual(NotebookMenu.width(for: .large, hostWidth: 834), NotebookTheme.popoverWidth)
         XCTAssertEqual(NotebookMenu.width(for: .xxxLarge, hostWidth: 1_024), NotebookTheme.popoverWidth)
         XCTAssertEqual(NotebookMenu.width(for: .accessibility1, hostWidth: 834), NotebookTheme.accessibilityPopoverWidth)
         XCTAssertEqual(NotebookMenu.width(for: .accessibility5, hostWidth: 420), 380, "Split View")
-        XCTAssertEqual(NotebookMenu.width(for: .accessibility5, hostWidth: 320), NotebookTheme.popoverWidth, "Slide Over")
+        XCTAssertEqual(NotebookMenu.width(for: .accessibility5, hostWidth: 320), 300, "Slide Over")
+        XCTAssertEqual(NotebookMenu.width(for: .large, hostWidth: 320), 300, "Slide Over")
         XCTAssertTrue(NotebookWritingViewRow.showsShortcutHint(at: .xxxLarge))
         XCTAssertFalse(NotebookWritingViewRow.showsShortcutHint(at: .accessibility1))
 
-        for size in DynamicTypeSize.allCases where size.isAccessibilitySize {
+        let standard = NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding
+        XCTAssertEqual(NotebookWritingViewRow.Layout(rowWidth: standard, typeSize: .large, isBold: false), .init())
+        let slideOver = NotebookMenu.width(for: .accessibility5, hostWidth: 320) - 2 * NotebookTheme.popoverPadding
+        XCTAssertFalse(NotebookWritingViewRow.Layout(rowWidth: slideOver, typeSize: .large, isBold: false).isStandardWidth)
+        for size in DynamicTypeSize.allCases where !size.isAccessibilitySize {
+            let layout = NotebookWritingViewRow.Layout(rowWidth: slideOver, typeSize: size, isBold: true)
+            XCTAssertFalse(layout.stacksGlyph || layout.breaksAtHyphens, "\(size)")
+        }
+        let accessibility3 = NotebookWritingViewRow.Layout(rowWidth: slideOver, typeSize: .accessibility3, isBold: false)
+        XCTAssertFalse(accessibility3.stacksGlyph)
+        let accessibility4 = NotebookWritingViewRow.Layout(rowWidth: slideOver, typeSize: .accessibility4, isBold: true)
+        XCTAssertTrue(accessibility4.stacksGlyph)
+        XCTAssertFalse(accessibility4.breaksAtHyphens)
+        let accessibility5 = NotebookWritingViewRow.Layout(rowWidth: slideOver, typeSize: .accessibility5, isBold: false)
+        XCTAssertTrue(accessibility5.stacksGlyph)
+        XCTAssertTrue(accessibility5.breaksAtHyphens)
+
+        func width(_ word: Substring, in font: UIFont) -> CGFloat {
+            (String(word) as NSString).size(withAttributes: [.font: font]).width
+        }
+        /// A word's pieces as line breaking may set them: the word, or, where it may break at its
+        /// hyphens, each part with the hyphen that ends it.
+        func pieces(_ word: Substring, breaksAtHyphens: Bool) -> [Substring] {
+            guard breaksAtHyphens else { return [word] }
+            var parts = word.split(separator: "-", omittingEmptySubsequences: false).map { $0 + "-" }
+            parts[parts.count - 1].removeLast()
+            return parts.map { Substring($0) }
+        }
+        for size in DynamicTypeSize.allCases {
             let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
-            let body = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
-            let font = UIFont.systemFont(ofSize: body.pointSize, weight: .medium)
-            for hostWidth in [1_024, 834, 420] as [CGFloat] {
-                let row = NotebookMenu.width(for: size, hostWidth: hostWidth) - 2 * NotebookTheme.popoverPadding
-                // The glyph column and its insets, and the least gap before the trailing inset.
-                let column = row - NotebookTheme.menuGlyphInset - NotebookTheme.menuGlyphColumnWidth
-                    - 2 * NotebookTheme.menuRowInset - NotebookTheme.menuShortcutGap
-                for mode in EditorChromeMode.allCases {
-                    for word in mode.title.split(separator: " ") {
-                        let width = (String(word) as NSString).size(withAttributes: [.font: font]).width
-                        XCTAssertLessThanOrEqual(width, column, "\(word) of \(mode.title) at \(size) in \(hostWidth)")
+            let footnote = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits)
+            for isBold in [false, true] {
+                let name = NotebookWritingViewRow.nameFont(typeSize: size, isBold: isBold)
+                for hostWidth in [1_024, 834, 420, 320] as [CGFloat] {
+                    let row = NotebookMenu.width(for: size, hostWidth: hostWidth) - 2 * NotebookTheme.popoverPadding
+                    let layout = NotebookWritingViewRow.Layout(rowWidth: row, typeSize: size, isBold: isBold)
+                    var column = NotebookWritingViewRow.Layout.nameColumn(rowWidth: row, stacksGlyph: layout.stacksGlyph)
+                    if NotebookWritingViewRow.showsShortcutHint(at: size) {
+                        let hints = EditorChromeMode.allCases.map { width(Substring($0.shortcutHint), in: footnote) }
+                        column -= hints.max() ?? 0
                     }
+                    let setting = "at \(size)\(isBold ? " in bold" : "") in \(hostWidth)"
+                    XCTAssertEqual(layout.isStandardWidth, hostWidth > 320, setting)
+                    var widest: CGFloat = 0
+                    for mode in EditorChromeMode.allCases {
+                        for word in mode.title.split(separator: " ") {
+                            widest = max(widest, width(word, in: name))
+                            for piece in pieces(word, breaksAtHyphens: layout.breaksAtHyphens) {
+                                XCTAssertLessThanOrEqual(width(piece, in: name), column, "\(piece) of \(mode.title) \(setting)")
+                            }
+                        }
+                        for word in mode.summary.split(separator: " ") {
+                            XCTAssertLessThanOrEqual(width(word, in: footnote), column, "\(word) of \(mode.summary) \(setting)")
+                        }
+                    }
+                    guard size.isAccessibilitySize else { continue }
+                    let beside = NotebookWritingViewRow.Layout.nameColumn(rowWidth: row, stacksGlyph: false)
+                    XCTAssertEqual(layout.stacksGlyph, widest > beside, "The glyph moves above the name only where it must \(setting)")
+                    XCTAssertEqual(layout.breaksAtHyphens, widest > column, "A name breaks at its hyphen only where it must \(setting)")
+                }
+            }
+        }
+    }
+
+    /// In Slide Over at the two largest text sizes, plain or in bold, the stacked row draws its
+    /// glyph first, scaled as the name is and starting where the name does. "Always-on" is set
+    /// whole on the name's first line where it fits, and otherwise breaks only at its hyphen.
+    func testAStackedWritingViewRowSetsEachWordOfItsNameWhole() throws {
+        let row = NotebookMenu.width(for: .accessibility5, hostWidth: 320) - 2 * NotebookTheme.popoverPadding
+        let unstacked = try RenderedPixels(rendering:
+            NotebookWritingViewRow(mode: .overlay, isSelected: false) {}
+                .frame(width: NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding)
+        )
+        let unstackedGlyph = try XCTUnwrap(Self.inkedRows(unstacked, columns: 0..<(
+            NotebookTheme.menuGlyphInset + NotebookTheme.menuGlyphColumnWidth
+        )))
+        for size in [DynamicTypeSize.accessibility4, .accessibility5] {
+            for weight in [LegibilityWeight.regular, .bold] {
+                let setting = "\(size)\(weight == .bold ? " in bold" : "")"
+                let layout = NotebookWritingViewRow.Layout(rowWidth: row, typeSize: size, isBold: weight == .bold)
+                XCTAssertTrue(layout.stacksGlyph, setting)
+                XCTAssertEqual(layout.breaksAtHyphens, size == .accessibility5, setting)
+                let pixels = try RenderedPixels(rendering:
+                    NotebookWritingViewRow(mode: .overlay, isSelected: false, layout: layout) {}
+                        .frame(width: row)
+                        .dynamicTypeSize(size)
+                        .environment(\.legibilityWeight, weight)
+                )
+                let firstWord = layout.breaksAtHyphens ? "Always-" : "Always\u{2011}on"
+                let word = try RenderedPixels(rendering:
+                    Text(firstWord)
+                        .font(.body.weight(.medium))
+                        .fixedSize()
+                        .dynamicTypeSize(size)
+                        .environment(\.legibilityWeight, weight)
+                )
+                let lines = Self.inkedLines(pixels)
+                XCTAssertGreaterThanOrEqual(lines.count, 4, "\(setting): glyph, two lines of name, then the description")
+                guard lines.count >= 4, let glyph = Self.inkedSpan(pixels, rows: lines[0]),
+                      let firstLine = Self.inkedSpan(pixels, rows: lines[1]),
+                      let alone = Self.inkedSpan(word, rows: 0..<word.size.height) else { continue }
+                // The glyph grows about as much as the name's text style does, so it keeps its size
+                // relative to the name.
+                func body(_ category: UIContentSizeCategory) -> CGFloat {
+                    UIFont.preferredFont(
+                        forTextStyle: .body, compatibleWith: UITraitCollection(preferredContentSizeCategory: category)
+                    ).pointSize
+                }
+                let scale = body(UIContentSizeCategory(size)) / body(.large)
+                let glyphHeight = lines[0].upperBound - lines[0].lowerBound
+                let restingHeight = unstackedGlyph.upperBound - unstackedGlyph.lowerBound
+                XCTAssertEqual(glyphHeight / restingHeight, scale, accuracy: 0.2 * scale, "\(setting): the glyph scales with the name")
+                XCTAssertEqual(glyph.lowerBound, firstLine.lowerBound, accuracy: 4, "\(setting): the glyph starts where the name does")
+                XCTAssertGreaterThanOrEqual(glyph.lowerBound, NotebookTheme.menuRowInset - 0.5, "\(setting): clear of the mark")
+                XCTAssertGreaterThanOrEqual(firstLine.lowerBound, NotebookTheme.menuRowInset - 0.5, setting)
+                XCTAssertEqual(
+                    firstLine.upperBound - firstLine.lowerBound, alone.upperBound - alone.lowerBound, accuracy: 1,
+                    "\(setting): the first line holds \(firstWord) whole"
+                )
+                XCTAssertLessThanOrEqual(firstLine.upperBound, row - NotebookTheme.menuRowInset + 0.5, setting)
+            }
+        }
+    }
+
+    /// Side by side, the name and description take all the room the row leaves them and wrap
+    /// exactly as they would set alone in that column: at the third accessibility size in a
+    /// full-width window, and in Slide Over, where even the standard size wraps rather than shrink.
+    /// A line that ends short of the column, as "Tools stay; the title" does, ends there by the
+    /// text system's own choice of break, not for want of room.
+    func testAWritingViewRowGivesItsTextTheWholeColumn() throws {
+        let settings: [(hostWidth: CGFloat, size: DynamicTypeSize)] = [(834, .accessibility3), (320, .large), (320, .xxxLarge)]
+        for setting in settings {
+            let row = NotebookMenu.width(for: setting.size, hostWidth: setting.hostWidth) - 2 * NotebookTheme.popoverPadding
+            let layout = NotebookWritingViewRow.Layout(rowWidth: row, typeSize: setting.size, isBold: false)
+            XCTAssertFalse(layout.stacksGlyph)
+            let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(setting.size))
+            let footnote = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits)
+            for mode in EditorChromeMode.allCases {
+                var column = NotebookWritingViewRow.Layout.nameColumn(rowWidth: row, stacksGlyph: false)
+                if NotebookWritingViewRow.showsShortcutHint(at: setting.size) {
+                    column -= (mode.shortcutHint as NSString).size(withAttributes: [.font: footnote]).width
+                }
+                let pixels = try RenderedPixels(rendering:
+                    NotebookWritingViewRow(mode: mode, isSelected: false, layout: layout) {}
+                        .frame(width: row)
+                        .dynamicTypeSize(setting.size)
+                )
+                let alone = try RenderedPixels(rendering:
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(mode.title.replacingOccurrences(of: "-", with: "\u{2011}"))
+                            .font(.body.weight(.medium))
+                        Text(mode.summary)
+                            .font(.footnote)
+                    }
+                    .frame(width: column, alignment: .leading)
+                    .dynamicTypeSize(setting.size)
+                )
+                let textStart = NotebookTheme.menuGlyphInset + NotebookTheme.menuGlyphColumnWidth + NotebookTheme.menuRowInset
+                let text = textStart..<(textStart + column)
+                let lines = Self.inkedLines(pixels, columns: text)
+                let aloneLines = Self.inkedLines(alone)
+                let name = "\(mode) at \(setting.size) in \(setting.hostWidth)"
+                XCTAssertEqual(lines.count, aloneLines.count, "\(name): as many lines as set alone")
+                for (line, aloneLine) in zip(lines, aloneLines) {
+                    let width = try XCTUnwrap(Self.inkedSpan(pixels, rows: line, columns: text))
+                    let aloneWidth = try XCTUnwrap(Self.inkedSpan(alone, rows: aloneLine))
+                    XCTAssertEqual(
+                        width.upperBound - width.lowerBound, aloneWidth.upperBound - aloneWidth.lowerBound, accuracy: 1,
+                        "\(name): each line holds what it would set alone"
+                    )
                 }
             }
         }
@@ -1599,6 +1933,53 @@ final class NotebookHeaderTests: XCTestCase {
         }
     }
 
+    /// The vertical spans, in points, of the lines of ink in a render, or in its `columns`,
+    /// separated by clear rows.
+    private static func inkedLines(_ pixels: RenderedPixels, columns: Range<CGFloat>? = nil) -> [Range<CGFloat>] {
+        let columns = columns ?? 0..<pixels.size.width
+        var lines: [Range<CGFloat>] = []
+        var start: CGFloat?
+        for y in stride(from: 0, to: pixels.size.height, by: 0.5) {
+            let inked = stride(from: columns.lowerBound, to: min(columns.upperBound, pixels.size.width), by: 0.5)
+                .contains { pixels.rgba(at: CGPoint(x: $0, y: y))[3] > 128 }
+            if inked, start == nil { start = y }
+            if !inked, let top = start {
+                lines.append(top..<y)
+                start = nil
+            }
+        }
+        if let top = start { lines.append(top..<pixels.size.height) }
+        return lines
+    }
+
+    /// The vertical span, in points, of the ink within `columns`.
+    private static func inkedRows(_ pixels: RenderedPixels, columns: Range<CGFloat>) -> ClosedRange<CGFloat>? {
+        var ys: [CGFloat] = []
+        for x in stride(from: columns.lowerBound, to: min(columns.upperBound, pixels.size.width), by: 0.5) {
+            for y in stride(from: 0, to: pixels.size.height, by: 0.5) where pixels.rgba(at: CGPoint(x: x, y: y))[3] > 128 {
+                ys.append(y)
+            }
+        }
+        guard let minY = ys.min(), let maxY = ys.max() else { return nil }
+        return minY...(maxY + 0.5)
+    }
+
+    /// The horizontal span, in points, of the ink within `rows`, and within `columns` if given.
+    private static func inkedSpan(
+        _ pixels: RenderedPixels, rows: Range<CGFloat>, columns: Range<CGFloat>? = nil
+    ) -> ClosedRange<CGFloat>? {
+        let columns = columns ?? 0..<pixels.size.width
+        var xs: [CGFloat] = []
+        for y in stride(from: rows.lowerBound, to: rows.upperBound, by: 0.5) {
+            for x in stride(from: columns.lowerBound, to: min(columns.upperBound, pixels.size.width), by: 0.5)
+            where pixels.rgba(at: CGPoint(x: x, y: y))[3] > 128 {
+                xs.append(x)
+            }
+        }
+        guard let minX = xs.min(), let maxX = xs.max() else { return nil }
+        return minX...(maxX + 0.5)
+    }
+
     /// The writing view's pending wait for `duration`, once it has started one.
     private func waitForDelay(_ clock: NotebookTestClock, _ duration: Duration) async throws -> UUID {
         try await NotebookTestFixtures.waitForValue { await clock.requests(for: duration).first }
@@ -1753,6 +2134,23 @@ struct NotebookChromeRig {
     }
 }
 
+/// A fixed sequence of numbers, so a long interleaving of events replays exactly.
+private struct SeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
 @MainActor
 private final class PresentationModel: ObservableObject {
     @Published var isPresented = false
@@ -1771,5 +2169,21 @@ private struct PresentingView: View {
                 .frame(width: 44, height: 44)
                 .notebookToolbarPresentation(model.isPresented, store: store)
         }
+    }
+}
+
+/// Opens a notebook menu in a popover from a key at the window's top, as the header does.
+private struct MenuPresenter: View {
+    let menu: NotebookMenu
+    let size: DynamicTypeSize
+    @State private var showsMenu = false
+
+    var body: some View {
+        VStack {
+            Button("Notebook menu") { showsMenu = true }
+                .popover(isPresented: $showsMenu) { menu.dynamicTypeSize(size) }
+            Spacer()
+        }
+        .onAppear { showsMenu = true }
     }
 }

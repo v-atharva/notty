@@ -365,6 +365,29 @@ final class NotebookPageUnfoldTests: XCTestCase {
         XCTAssertNil(host.sublayers)
     }
 
+    /// The caller draws a source only when the frost would draw over it; without one the frost
+    /// shows nothing, while Reduce Motion's fade needs none.
+    func testOnlyTheFrostNeedsASource() async throws {
+        let unfold = try await readyUnfold()
+        XCTAssertTrue(unfold.needsSource)
+        let host = CALayer()
+        let completions = Counter()
+        let page = CGRect(origin: .zero, size: Self.pageSize)
+        XCTAssertFalse(unfold.play(page: page, source: nil, in: host) { completions.count += 1 })
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertNil(host.sublayers)
+
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let reduced = NotebookPageUnfold(device: device, prefersReducedMotion: { true })
+        _ = await reduced.ready()
+        XCTAssertFalse(reduced.needsSource, "The fade needs no picture of the page.")
+        XCTAssertTrue(reduced.play(page: page, source: nil, in: host) {})
+        XCTAssertEqual(reduced.layer?.backgroundColor, NotebookTheme.backdropStone.cgColor)
+        reduced.finish()
+        XCTAssertFalse(NotebookPageUnfold(device: nil).needsSource)
+        XCTAssertFalse(NotebookPageUnfold(device: device).needsSource, "Not before the shaders are ready.")
+    }
+
     // MARK: - Placement
 
     func testOnlyAPageThatShowsIsWorthTheFrost() {
@@ -415,7 +438,103 @@ final class NotebookPageUnfoldTests: XCTestCase {
         XCTAssertNil(NotebookPageUnfold.snapshot(of: fixture.paper.contentLayer, rect: .zero, screenPixelsPerPoint: 2))
     }
 
+    /// The blank page the controller gives the frost is the paper as the screen shows it, its
+    /// fibres in the same phase, so the hand-off to the live page shows no change of grain.
+    func testBlankPageMatchesThePaperOnScreen() async throws {
+        await ready(NotebookMaterials.shared)
+        let host = AppearanceTrackingController()
+        let window = try NotebookTestFixtures.window(showing: host, width: 794)
+        addTeardownBlock { @MainActor in
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(host)
+        let height = Self.pageSize.height
+        let paper = NotebookPaperView(frame: CGRect(x: 0, y: 0, width: 794, height: 1_366))
+        host.view.addSubview(paper)
+        // The third page, whose top is neither a whole point nor a whole repeat of the fibres.
+        paper.setGeometry(width: 794, height: height * 3, boundaries: [height, height * 2])
+        let page = CGRect(x: 0, y: height * 2, width: 794, height: height)
+        paper.setViewport(scale: 1, offset: CGPoint(x: 0, y: page.minY))
+        let scale = window.traitCollection.displayScale
+        XCTAssertEqual(scale, 2, "The comparison assumes the frost's own two pixels per point.")
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+        let screen = try XCTUnwrap(UIGraphicsImageRenderer(bounds: paper.bounds, format: format).image { _ in
+            paper.drawHierarchy(in: paper.bounds, afterScreenUpdates: true)
+        }.cgImage)
+        let shown = Pixels(screen)
+        let blank = Pixels(try XCTUnwrap(paper.blankPageImage(page, screenPixelsPerPoint: scale)))
+        XCTAssertEqual(blank.width, 1_588)
+        XCTAssertEqual(blank.height, Int((height * 2).rounded()))
+
+        // Below the divider at the page's top and above its foot, across the whole width.
+        let rows = 6..<(blank.height - 6)
+        func difference(shift: Int) -> Double {
+            var total = 0.0
+            var count = 0
+            for y in stride(from: rows.lowerBound, to: rows.upperBound, by: 3) {
+                for x in stride(from: 0, to: blank.width - 64, by: 3) {
+                    total += abs(blank.luminance(x: x + shift, y: y) - shown.luminance(x: x, y: y))
+                    count += 1
+                }
+            }
+            return total / Double(count)
+        }
+        let aligned = difference(shift: 0)
+        let shifted = difference(shift: 37)
+        XCTAssertLessThan(aligned, 1.5 / 255, "The paper as the screen shows it.")
+        XCTAssertLessThan(aligned * 3, shifted, "The fibres lie in the screen's phase, not merely look alike.")
+        let fibres = blank.statistics(rows: rows, columns: 0..<blank.width)
+        XCTAssertGreaterThan(fibres.variance.squareRoot(), 0.005, "The fibres are drawn, not flat paper.")
+
+        paper.grainLayer.isHidden = true
+        let plain = Pixels(try XCTUnwrap(paper.blankPageImage(page, screenPixelsPerPoint: scale)))
+        let flat = plain.statistics(rows: 0..<plain.height, columns: 0..<plain.width)
+        XCTAssertLessThan(flat.variance, 1e-6, "Plain materials leave flat paper.")
+        for channel in 0..<3 {
+            XCTAssertEqual(flat.mean[channel], Self.ivory[channel], accuracy: 0.5 / 255)
+        }
+        XCTAssertNil(paper.blankPageImage(.zero, screenPixelsPerPoint: scale))
+    }
+
     // MARK: - Report
+
+    /// Times the blank page against a snapshot of the paper's layers, on the main thread where the
+    /// controller takes it, and records both with the upload.
+    func testBlankPageCostsLessThanASnapshotOfThePaper() async throws {
+        await ready(NotebookMaterials.shared)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let unfold = try await readyUnfold()
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let height = Self.pageSize.height
+        let paper = NotebookPaperView(frame: CGRect(x: 0, y: 0, width: 794, height: 1_000))
+        paper.setGeometry(width: 794, height: height * 2, boundaries: [height])
+        let page = CGRect(x: 0, y: height, width: 794, height: height)
+
+        let firstStart = CACurrentMediaTime()
+        _ = paper.blankPageImage(page, screenPixelsPerPoint: 2)
+        let first = CACurrentMediaTime() - firstStart
+        var blanks: [Double] = []
+        var snapshots: [Double] = []
+        var uploads: [Double] = []
+        for _ in 0..<7 {
+            let blankStart = CACurrentMediaTime()
+            let blank = try XCTUnwrap(paper.blankPageImage(page, screenPixelsPerPoint: 2))
+            blanks.append(CACurrentMediaTime() - blankStart)
+            let snapshotStart = CACurrentMediaTime()
+            _ = try XCTUnwrap(NotebookPageUnfold.snapshot(of: paper.contentLayer, rect: page, screenPixelsPerPoint: 2))
+            snapshots.append(CACurrentMediaTime() - snapshotStart)
+            uploads.append(try upload(blank, with: unfold, queue: queue).encode)
+        }
+        let blank = Self.median(blanks)
+        let snapshot = Self.median(snapshots)
+        try record([
+            "firstBlankPageSeconds": first, "blankPageMedianSeconds": blank, "snapshotMedianSeconds": snapshot,
+            "uploadEncodeMedianSeconds": Self.median(uploads)
+        ], name: "unfold-source-timing")
+        XCTAssertLessThan(blank, snapshot, "Tiling the fibres costs less than rendering the layers.")
+    }
 
     func testFrameTimingSmoke() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())

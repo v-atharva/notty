@@ -34,7 +34,7 @@ jobs:
   native-checks:
     name: Core and iPad tests, unsigned builds
     runs-on: xcode-27
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     defaults:
@@ -108,6 +108,19 @@ jobs:
               printf '\n'
             done
           done
+
+      - name: Install Metal Toolchain
+        timeout-minutes: 6
+        run: |
+          # The page-unfold shader is compiled with Xcode's separately downloaded Metal Toolchain.
+          if ! xcodebuild -showComponent MetalToolchain 2>/dev/null | grep -q 'Status: installed'; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcodebuild -showComponent MetalToolchain
+          xcrun --sdk iphoneos27.0 metal --version || {
+            printf 'The Metal Toolchain is required to compile NotebookPageUnfold.metal.\n' >&2
+            exit 1
+          }
 
       - name: Prepare iPad test simulator
         timeout-minutes: 2

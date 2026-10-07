@@ -161,12 +161,17 @@ enum NotebookTheme {
     static let statusVeilOpacity: CGFloat = 0.94
     /// Length of the veil's fade below the top safe area.
     static let statusVeilFade: CGFloat = 10
-    /// The "Add page" tab on the backdrop below the last page.
-    static let endTabHeight: CGFloat = 44
-    static let endTabCornerRadius: CGFloat = 14
-    static let endTabGap: CGFloat = 20
-    /// Least scroll room below the last page: the tab plus its gaps, above the home indicator.
-    static let endScrollMinimum: CGFloat = 104
+
+    // MARK: - End of notebook
+
+    /// The card a pull past the last page reveals on the stone beneath it. Its two keys sit side
+    /// by side at this width; a narrower window or a large text size stacks them.
+    static let endCardWidth: CGFloat = 440
+    /// Space between the last page and the card, and between the card and the bottom chrome.
+    static let endCardGap: CGFloat = 20
+    /// Space between the card's two keys, and between a key and the note beneath it.
+    static let endCardKeySpacing: CGFloat = 12
+    static let endCardNoteSpacing: CGFloat = 6
 
     // MARK: - Panels
 
@@ -500,8 +505,6 @@ enum NotebookTheme {
     static let controlLabel = Typeface(postScriptName: nil, pointSize: 13, style: .footnote, weight: .medium)
     /// Labels of action keys in popovers and cards.
     static let keyLabel = Typeface(postScriptName: nil, pointSize: 15, style: .subheadline, weight: .semibold)
-    /// Label of the end-of-paper tab, quieter than an action key because it sits on the backdrop.
-    static let tabLabel = Typeface(postScriptName: nil, pointSize: 15, style: .subheadline, weight: .medium)
     /// Font that sizes tool glyphs.
     static var glyphFont: Font { .system(size: glyphSize, weight: .regular) }
     /// Font that sizes header glyphs.

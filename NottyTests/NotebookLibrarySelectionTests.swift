@@ -191,10 +191,10 @@ final class NotebookLibrarySelectionTests: XCTestCase {
     }
 
     /// The banner shown when a new notebook could not be selected is a light card centred at the
-    /// bottom of the screen, 12 points above the room kept for the end-of-paper tab, whatever the
-    /// window's appearance. Over the notebook opened again it touches neither the header nor the
-    /// "Add page" tab, and its dismiss key clears the notice and leaves the open notebook as it was.
-    func testSelectionFailureBannerIsALightCardClearOfTheHeaderAndTheEndOfPaperTab() async throws {
+    /// bottom of the screen, 12 points above the home indicator, whatever the window's appearance.
+    /// Over the notebook opened again it stays clear of the header and the home indicator, and its
+    /// dismiss key clears the notice and leaves the open notebook as it was.
+    func testSelectionFailureBannerIsALightCardClearOfTheHeaderAndTheHomeIndicator() async throws {
         let fixture = try LibraryFixture(selectionFailure: true)
         defer { fixture.remove() }
         let oldID = NotebookSession.defaultNotebookID
@@ -229,7 +229,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { view.traitCollection.userInterfaceStyle == .light }
         let pixels = try render(view)
         let paper = components(of: NotebookTheme.paperIvory.uiColor).map { Int(($0 * 255).rounded()) }
-        let lift = NotebookTheme.endScrollMinimum + NotebookTheme.sectionSpacing
+        let lift = NotebookTheme.sectionSpacing
         // Up the middle of the banner, from the safe area through the banner.
         let bottom = view.bounds.height - view.safeAreaInsets.bottom
         let rows = (1...Int(lift) + 80).map {
@@ -238,7 +238,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         // Paper up to the shadow the card casts; the card's lower edge is darker than that shadow.
         let shadow = try XCTUnwrap(rows.firstIndex { zip($0, paper).contains { abs($0 - $1) > 4 } }, "A card lies at the bottom.")
         let inset = try XCTUnwrap((shadow..<min(shadow + 20, rows.count)).min { luminance(rows[$0]) < luminance(rows[$1]) })
-        XCTAssertEqual(CGFloat(inset), lift, accuracy: 3, "The banner sits 12 points above the end-of-paper room.")
+        XCTAssertEqual(CGFloat(inset), lift, accuracy: 3, "The banner sits 12 points above the home indicator.")
         let light = rows[inset...].prefix(30).filter { luminance($0) > 0.7 }
         XCTAssertGreaterThan(light.count, 20, "The banner is light: \(rows[inset])")
 
@@ -258,7 +258,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         }
         XCTAssertGreaterThan(glyph.filter { luminance($0) < 0.3 }.count, 5, "The banner has a dismiss key.")
 
-        // Opened again, the notebook shows its header and, at the end of the paper, its tab.
+        // Opened again, the notebook shows its header, here scrolled to the end of the paper.
         try intact.write(to: head)
         await session.load()
         var controller: NotebookViewController?
@@ -272,11 +272,9 @@ final class NotebookLibrarySelectionTests: XCTestCase {
                 && header?.headerView.bounds.width ?? 0 > 0
         }
         let canvas = try XCTUnwrap(controller).canvasView
-        let tab = try XCTUnwrap(controller).endOfPaperTab
         let end = canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end), animated: false)
         view.layoutIfNeeded()
-        XCTAssertFalse(tab.isHidden, "The tab shows below the last page.")
         XCTAssertNotNil(model.creationFailure, "The banner stays over the notebook opened again.")
         let covered = try render(view)
         model.dismissCreationFailure()
@@ -298,7 +296,9 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         XCTAssertEqual(banner.midX, view.bounds.midX, accuracy: 3, "The banner is centred.")
         let headerFrame = try XCTUnwrap(header).view.convert(try XCTUnwrap(header).view.bounds, to: view)
         XCTAssertGreaterThan(banner.minY, headerFrame.maxY, "The banner is clear of the header.")
-        XCTAssertLessThan(banner.maxY, tab.convert(tab.bounds, to: view).minY, "The banner is clear of the tab.")
+        XCTAssertLessThan(
+            banner.maxY, view.bounds.height - view.safeAreaInsets.bottom, "The banner is clear of the home indicator."
+        )
     }
 
     func testExistingLegacyNoteIsOpenedWithoutCreatingAnotherNotebook() async throws {

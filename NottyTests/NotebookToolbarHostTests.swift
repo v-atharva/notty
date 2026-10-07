@@ -1266,8 +1266,8 @@ final class NotebookToolbarHostTests: XCTestCase {
                 + "obstruction: \(owner.overlayObstruction)")
         XCTAssertEqual(canvas.contentInset.top - owner.overlayObstruction.top, bar.maxY, accuracy: 0.5)
         XCTAssertEqual(
-            canvas.contentInset.bottom, window.safeAreaInsets.bottom + NotebookTheme.endScrollMinimum, accuracy: 0.5,
-            "The end-of-paper tab keeps room above the home indicator."
+            canvas.contentInset.bottom, window.safeAreaInsets.bottom, accuracy: 0.5,
+            "The last page rests at its end above the home indicator."
         )
         XCTAssertEqual(canvas.contentOffset.y, 0, accuracy: 0.5, "The page opens beneath the header and toolbar.")
 
@@ -1367,8 +1367,8 @@ final class NotebookToolbarHostTests: XCTestCase {
                 + "toolbar: \(toolbar), obstruction: \(owner.overlayObstruction)")
         XCTAssertEqual(canvas.contentInset.top - owner.overlayObstruction.top, bar.maxY, accuracy: 0.5)
         XCTAssertEqual(
-            canvas.contentInset.bottom, window.safeAreaInsets.bottom + NotebookTheme.endScrollMinimum, accuracy: 0.5,
-            "The end-of-paper tab keeps room above the home indicator."
+            canvas.contentInset.bottom, window.safeAreaInsets.bottom, accuracy: 0.5,
+            "The last page rests at its end above the home indicator."
         )
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
         try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= toolbar.maxY - 0.5 }

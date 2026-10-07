@@ -1,3 +1,4 @@
+import NottyCore
 import QuartzCore
 import UIKit
 
@@ -41,6 +42,7 @@ class NotebookPaperView: UIView {
     private var boundaries: [CGFloat] = []
     private var viewportScale: CGFloat = 1
     private var viewportOffset = CGPoint.zero
+    private var cachedTile: (pattern: CGColor, image: CGImage)?
     /// Reduce Transparency and Increase Contrast as the paper reads them; the status veil
     /// shares the same source.
     let accessibility: NotebookMaterialAccessibility
@@ -232,6 +234,71 @@ class NotebookPaperView: UIView {
         withoutAnimations {
             grainLayer.backgroundColor = materials.paperFibrePattern
         }
+    }
+
+    /// The blank paper within `rect`, in page points, as the page frost clears onto: the paper
+    /// colour and, unless plain materials replace it, the fibres in the phase the grain layer
+    /// shows them. The lines are left out, as the frost lies beneath them. It is tiled from one
+    /// repeat of the fibre pattern rather than rendered from the layer tree, which costs several
+    /// times as much on the main thread.
+    ///
+    /// - Parameter screenPixelsPerPoint: the display scale times the canvas's zoom scale; the
+    ///   image has `PageUnfoldTimeline.pixelsPerPoint`'s pixels per point.
+    func blankPageImage(_ rect: CGRect, screenPixelsPerPoint: CGFloat) -> CGImage? {
+        guard !rect.isEmpty, !rect.isInfinite else { return nil }
+        let scale = CGFloat(PageUnfoldTimeline.pixelsPerPoint(
+            width: Double(rect.width), height: Double(rect.height), screenPixelsPerPoint: Double(screenPixelsPerPoint)
+        ))
+        let width = max(Int((rect.width * scale).rounded()), 1)
+        let height = max(Int((rect.height * scale).rounded()), 1)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        guard !grainLayer.isHidden, let tile = fibreTile() else {
+            context.setFillColor(Self.paperColor.cgColor)
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            return context.makeImage()
+        }
+        // Core Graphics counts up from the bottom; the grain repeats down from its layer's top.
+        let scaleX = CGFloat(width) / rect.width
+        let scaleY = CGFloat(height) / rect.height
+        let side = NotebookMaterials.tileSide
+        let grain = grainLayer.frame
+        let anchor = CGRect(
+            x: ((grain.minX - rect.minX) * scaleX).rounded(),
+            y: (CGFloat(height) - (grain.minY + side - rect.minY) * scaleY).rounded(),
+            width: (side * scaleX).rounded(), height: (side * scaleY).rounded()
+        )
+        // The opaque fibres cover every pixel. At the tile's own scale each pixel is copied as it
+        // is; zoomed out, the tile is resampled.
+        let isNative = anchor.width == CGFloat(tile.width) && anchor.height == CGFloat(tile.height)
+        context.interpolationQuality = isNative ? .none : .medium
+        context.draw(tile, in: anchor, byTiling: true)
+        return context.makeImage()
+    }
+
+    /// One repeat of the fibre pattern at the tile's own pixels per point, drawn once per pattern.
+    private func fibreTile() -> CGImage? {
+        guard let pattern = grainLayer.backgroundColor else { return nil }
+        if let cachedTile, cachedTile.pattern === pattern { return cachedTile.image }
+        let side = NotebookMaterials.tileSide
+        let pixels = Int(side * NotebookMaterials.tileScale)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return nil }
+        let repeatLayer = CALayer()
+        repeatLayer.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+        repeatLayer.backgroundColor = pattern
+        context.translateBy(x: 0, y: CGFloat(pixels))
+        context.scaleBy(x: NotebookMaterials.tileScale, y: -NotebookMaterials.tileScale)
+        repeatLayer.render(in: context)
+        guard let image = context.makeImage() else { return nil }
+        cachedTile = (pattern, image)
+        return image
     }
 
     /// Fades `layer` from the shadow tone at `opacity` to transparent of the same tone, which
