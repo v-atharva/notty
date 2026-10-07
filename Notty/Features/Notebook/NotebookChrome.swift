@@ -301,7 +301,8 @@ struct NotebookActionKeyStyle: ButtonStyle {
     }
 }
 
-private struct NotebookActionKey<Label: View>: View {
+/// The body of `NotebookActionKeyStyle`, given the button's press state.
+struct NotebookActionKey<Label: View>: View {
     let label: Label
     let kind: NotebookActionKeyStyle.Kind
     let isPressed: Bool

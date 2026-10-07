@@ -102,7 +102,9 @@ final class NotebookToolbarTests: XCTestCase {
         let probe = EnabledProbe()
         let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
         let hosting = AppearanceTrackingHostingController(
-            rootView: NotebookToolbar(store: store, composition: composition, collapse: {}) {
+            rootView: NotebookToolbar(
+                store: store, composition: composition, rail: composition.rail(forHostWidth: 800), collapse: {}
+            ) {
                 EnabledProbeView(probe: probe)
             }
         )
@@ -120,14 +122,36 @@ final class NotebookToolbarTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == true }
         store.setToolbarAvailable(false, for: owner)
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == false }
+        // A gate does not reopen within the frame that closed it, and SwiftUI treats change
+        // handlers that run twice in one frame as an update loop.
+        await DisplayFrames.next()
         store.setToolbarAvailable(true, for: owner)
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == true }
+    }
+
+    /// A hiding rail's keys stay live while it fades, so they never redraw in the disabled tone
+    /// mid-fade, and leave keyboard focus once it has gone.
+    func testRailKeysLeaveKeyboardFocusOnlyOnceTheRailHasFadedOut() async throws {
+        for (hiddenAmount, isEnabled) in [(0.0, true), (0.5, true), (0.999, true), (1.0, false)] {
+            let probe = EnabledProbe()
+            let hosting = AppearanceTrackingHostingController(
+                rootView: EnabledProbeView(probe: probe).modifier(NotebookRailFade(hiddenAmount: hiddenAmount, offset: -8))
+            )
+            let window = try NotebookTestFixtures.window(showing: hosting, width: 200)
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            try await NotebookTestFixtures.waitUntil { probe.isEnabled != nil }
+            XCTAssertEqual(probe.isEnabled, isEnabled, "\(hiddenAmount) of the way hidden")
+        }
     }
 
     func testUnavailableInkPanelDrawsEveryControlDisabled() throws {
         let (store, owner) = availableStore()
         defer { store.detach(owner) }
-        let panel = NotebookInkControls(store: store, layout: .panel)
+        let panel = NotebookInkControls(store: store)
         let available = try RenderedPixels(rendering: panel)
         XCTAssertTrue(try RenderedPixels(rendering: panel).rgba == available.rgba, "The panel renders deterministically.")
         store.setToolbarAvailable(false, for: owner)
@@ -259,6 +283,27 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Collapse and reveal
 
+    func testFloatingRailHoldsItsCollapseKeyInTheGripColumn() {
+        let floating = EditorToolbarPreferences(
+            placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: false, customSwatches: []
+        )
+        for width in [834.0, 1_024, 1_366] as [CGFloat] {
+            let docked = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
+            let composition = NotebookToolbarComposition(preferences: floating, horizontalSizeClass: .regular)
+            XCTAssertTrue(composition.showsCollapseControl)
+            XCTAssertEqual(composition.toolCapWidth, docked.toolCapWidth, "The key sits under the grip, not after the rows.")
+            XCTAssertEqual(composition.rail(forHostWidth: width), docked.rail(forHostWidth: width), "\(width)")
+        }
+        XCTAssertEqual(NotebookToolbarComposition.gripColumnWidth, NotebookTheme.controlSize)
+        let compact = NotebookToolbarComposition(preferences: floating, horizontalSizeClass: .compact)
+        let compactDocked = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .compact)
+        XCTAssertTrue(compact.showsCollapseControl)
+        XCTAssertEqual(
+            compact.toolCapWidth, compactDocked.toolCapWidth + NotebookTheme.itemSpacing + NotebookTheme.controlSize,
+            "The single compact row keeps its collapse key after the current-ink chip."
+        )
+    }
+
     func testRestoredFloatingCollapsedToolbarShowsTheRevealControl() throws {
         let floating = EditorToolbarPreferences(
             placement: .floating(CGPoint(x: 0.3, y: 0.7)), isCollapsed: true, customSwatches: []
@@ -291,6 +336,66 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertTrue(available.toolbar.isCollapsed)
         actions.place(.docked(.topCenter))
         XCTAssertFalse(available.toolbar.isCollapsed, "Docking expands a collapsed toolbar.")
+    }
+
+    /// The reveal tab, the handle a hidden floating rail leaves and the user's collapsed handle all
+    /// perform this one action.
+    func testEveryStandInTapShowsTheWholeRail() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+
+        XCTAssertTrue(actions.place(.docked(.topTrailing)))
+        store.setToolsHidden(true)
+        actions.showTools()
+        XCTAssertFalse(store.areToolsHidden, "The reveal tab asks for the tools back.")
+        XCTAssertEqual(store.toolbar.placement, .docked(.topTrailing))
+
+        let floating = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.5))
+        XCTAssertTrue(actions.place(floating))
+        store.setToolsHidden(true)
+        actions.showTools()
+        XCTAssertFalse(store.areToolsHidden, "So does the handle a hidden floating rail leaves.")
+        XCTAssertFalse(store.toolbar.isCollapsed)
+        XCTAssertEqual(store.toolbar.placement, floating)
+
+        actions.setCollapsed(true)
+        store.setToolsHidden(true)
+        XCTAssertTrue(store.toolbar.isCollapsed, "Hiding the tools leaves the user's own collapse alone.")
+        actions.showTools()
+        XCTAssertFalse(store.areToolsHidden)
+        XCTAssertFalse(store.toolbar.isCollapsed, "One tap on a collapsed handle shows the whole rail.")
+
+        actions.setCollapsed(true)
+        actions.showTools()
+        XCTAssertFalse(store.areToolsHidden)
+        XCTAssertFalse(store.toolbar.isCollapsed, "Without hidden tools the tap only expands.")
+
+        actions.setCollapsed(true)
+        store.setToolsHidden(true)
+        store.setToolbarAvailable(false, for: owner)
+        actions.showTools()
+        XCTAssertFalse(store.areToolsHidden, "The tools come back even while writing is paused.")
+        XCTAssertTrue(store.toolbar.isCollapsed, "A paused toolbar keeps its preferences.")
+    }
+
+    func testStandInsOfferTheToolsFirstThenTheWritingViewsChoices() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        var chosen: [String] = []
+        let choices = ["Focus", "Pinned", "Always-on tools"].map { name in
+            NotebookToolsRevealAction(name: name) { chosen.append(name) }
+        }
+        let offered = NotebookToolsRevealAction.standInActions(for: store, animation: nil, adding: choices)
+        XCTAssertEqual(offered.map(\.name), ["Show tools and title", "Focus", "Pinned", "Always-on tools"])
+
+        store.setToolsHidden(true)
+        offered[0].perform()
+        XCTAssertFalse(store.areToolsHidden, "The first action is the one every stand-in's tap performs.")
+        XCTAssertEqual(NotebookToolsRevealAction.showTools(from: store, animation: nil).name, offered[0].name)
+        offered[2].perform()
+        offered[1].perform()
+        XCTAssertEqual(chosen, ["Pinned", "Focus"], "Each choice performs its own action.")
     }
 
     func testPencilRevealRequestExpandsTheMountedCollapsedToolbar() async throws {
@@ -330,41 +435,56 @@ final class NotebookToolbarTests: XCTestCase {
         }
     }
 
-    func testPencilRevealBringsTheColoursIntoViewOnTheInkStrip() async throws {
-        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+    func testPencilRevealBringsTheColoursJustClearOfTheLeadingChevron() async throws {
+        // A full shelf makes the ink row much wider than an 11-inch iPad in portrait.
+        let store = NotebookTestFixtures.toolStore()
+        var preferences = store.toolbar
+        for index in 0..<EditorToolbarPreferences.maximumCustomSwatches {
+            preferences.addCustomSwatch(EditorInkColor(red: 0.1, green: Double(index) / 10, blue: 0.6))
+        }
+        store.updateToolbar(preferences)
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(store: store, width: 834)
         defer { fixture.close() }
         let strips = fixture.strips
         XCTAssertEqual(strips.count, 2, "The regular toolbar shows the tool strip and the ink strip.")
         let ink = try XCTUnwrap(strips.last)
-        XCTAssertGreaterThan(ink.contentSize.width, ink.bounds.width, "The ink strip scrolls at the default width.")
+        XCTAssertGreaterThan(ink.contentSize.width, ink.bounds.width, "The ink strip scrolls with custom colours.")
         XCTAssertEqual(ink.contentOffset.x, 0, accuracy: 0.5)
 
+        let row = try XCTUnwrap(rail(for: store.toolbar, hostWidth: 834).inkRow)
+        let firstSwatch = try XCTUnwrap(row.slots.first { if case .swatch = $0.item { true } else { false } })
+        let target = firstSwatch.minX - NotebookStripRow.leadingClearance
+        XCTAssertLessThan(target, row.maximumOffset(containerWidth: ink.bounds.width))
         fixture.store.handlePencil(.showColorPalette, from: fixture.controller)
-        try await NotebookTestFixtures.waitUntil { ink.contentOffset.x > 1 }
+        // Paging ends exactly on its target; a flick's snapping never applies to it.
+        try await NotebookTestFixtures.waitUntil { abs(ink.contentOffset.x - target) < 0.01 }
+        XCTAssertEqual(
+            firstSwatch.minX - ink.contentOffset.x, NotebookStripRow.leadingClearance, accuracy: 0.5,
+            "The first colour lands just clear of the leading chevron."
+        )
         XCTAssertTrue(fixture.store.isToolbarAvailable)
         XCTAssertNil(fixture.hosting.presentedViewController, "A regular toolbar answers in place.")
     }
 
-    /// SwiftUI frames are not readable from a hosted test, so the colour group's position, to
-    /// which a Pencil reveal scrolls, measures what is laid out before it.
-    func testInkRowShowsEveryWidthBeforeTheColoursAndAnyPaging() async throws {
-        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+    func testInkRowLeadsWithThePresetsSoTheyShowAtRest() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(width: 1_024)
         defer { fixture.close() }
-        let actions = NotebookToolbarActions(store: fixture.store)
-        // A full shelf makes the colour group as long as it gets.
-        for index in 0..<EditorToolbarPreferences.maximumCustomSwatches {
-            actions.addCustomColor(EditorInkColor(red: 0.1, green: Double(index) / 10, blue: 0.6))
-        }
         let ink = try XCTUnwrap(fixture.strips.last)
-        try await NotebookTestFixtures.waitUntil { ink.contentSize.width > ink.bounds.width }
-        XCTAssertEqual(ink.contentOffset.x, 0, accuracy: 0.5, "The ink row opens at its start.")
+        let row = try XCTUnwrap(rail(for: fixture.store.toolbar, hostWidth: 1_024).inkRow)
+        XCTAssertEqual(row.slots.prefix(4).map(\.item), EditorInkCatalog.presets.map { .preset($0) })
+        XCTAssertLessThanOrEqual(ink.contentSize.width, ink.bounds.width + 0.5, "On the 12.9-inch iPad the ink row fits.")
+        XCTAssertEqual(ink.contentSize.width, row.contentWidth, accuracy: 0.5, "The strip lays out the slots it was measured with.")
 
+        // With nothing to scroll, the reveal only highlights the colours: the well of an unselected
+        // swatch tints around its colour while the strip stays where it was.
+        let swatches = row.slots.filter { if case .swatch = $0.item { true } else { false } }
+        let swatch = try XCTUnwrap(swatches.dropFirst().first)
+        let strip = fixture.frame(of: ink)
+        let wellCorner = CGPoint(x: strip.minX + swatch.minX + 5, y: strip.midY)
+        let unlit = try rendered(fixture.window).rgba(at: wellCorner)
         fixture.store.handlePencil(.showColorPalette, from: fixture.controller)
-        try await NotebookTestFixtures.waitUntil { ink.contentOffset.x > 1 }
-        try await settled { ink.contentOffset.x }
-        // Something comes before the colours, or the reveal would not have scrolled, and it is
-        // short: the three widths, not the preset chips, so all of it shows at rest.
-        XCTAssertLessThan(ink.contentOffset.x, ink.bounds.width / 2, "Only the widths come before the colours.")
+        try await NotebookTestFixtures.waitUntil { (try? self.rendered(fixture.window).rgba(at: wellCorner)) != unlit }
+        XCTAssertEqual(ink.contentOffset.x, 0, accuracy: 0.5)
     }
 
     func testPencilRevealOpensTheCompactInkPanelAndPausingWritingClosesIt() async throws {
@@ -447,6 +567,27 @@ final class NotebookToolbarTests: XCTestCase {
         }
     }
 
+    /// Colours stored before the picker rounded them can lie within one step of another swatch.
+    /// The shelf shows each visible colour once, so every strip control keeps its own id.
+    func testShelfShowsEachVisibleColourOnceWithItsOwnID() throws {
+        let charcoal = EditorInkCatalog.swatches[0].quantized
+        let green = EditorInkColor(red: 51 / 255, green: 128 / 255, blue: 77 / 255)
+        let nearGreen = EditorInkColor(red: 51.3 / 255, green: 128 / 255, blue: 77 / 255)
+        let nearCharcoal = EditorInkColor(red: charcoal.red + 0.4 / 255, green: charcoal.green, blue: charcoal.blue)
+        let stored = EditorToolbarPreferences(
+            placement: .docked(.topCenter), isCollapsed: false, customSwatches: [green, nearGreen, nearCharcoal]
+        )
+        XCTAssertEqual(stored.customSwatches.count, 3, "Stored colours are kept as they were saved.")
+        XCTAssertEqual(NotebookSwatchShelf.displayed(custom: stored.customSwatches), EditorInkCatalog.swatches + [green])
+        for width in [834.0, 1_366] as [CGFloat] {
+            let rail = self.rail(for: stored, hostWidth: width)
+            for row in [rail.toolRow, try XCTUnwrap(rail.inkRow)] {
+                let ids = row.slots.map(\.id)
+                XCTAssertEqual(Set(ids).count, ids.count, "\(width): every control has its own id.")
+            }
+        }
+    }
+
     func testPickingTheCurrentPresetColorKeepsItsIdentity() {
         let (store, owner) = availableStore()
         defer { store.detach(owner) }
@@ -484,20 +625,52 @@ final class NotebookToolbarTests: XCTestCase {
 
     func testCustomSwatchSelectionMarksStayReadable() {
         let mediumGray = EditorInkColor(red: 0.6, green: 0.6, blue: 0.6)
-        XCTAssertEqual(NotebookSwatchContrast.mark(for: mediumGray).uiColor, NotebookTheme.glyph.uiColor)
+        XCTAssertEqual(NotebookSwatchContrast.mark(for: mediumGray, contrast: .standard).uiColor, NotebookTheme.glyph.uiColor)
         let colors = EditorInkCatalog.swatches + (0...20).flatMap { index in
             [1.0, 0.5, 0.0].map { alpha in
                 let channel = Double(index) / 20
                 return EditorInkColor(red: channel, green: channel, blue: channel, alpha: alpha)
             }
         }
-        for color in colors {
-            let mark = NotebookSwatchShelf.color(from: NotebookSwatchContrast.mark(for: color).uiColor)
-            XCTAssertGreaterThanOrEqual(
-                mark.contrastRatio(against: NotebookSwatchContrast.background(for: color)), 3,
-                "Selection must remain visible on \(color)."
-            )
+        for contrast in [ColorSchemeContrast.standard, .increased] {
+            for color in colors {
+                let mark = NotebookSwatchShelf.color(from: NotebookSwatchContrast.mark(for: color, contrast: contrast).uiColor)
+                XCTAssertGreaterThanOrEqual(
+                    mark.contrastRatio(against: NotebookSwatchContrast.background(for: color, contrast: contrast)), 3,
+                    "Selection must remain visible on \(color) with \(contrast) contrast."
+                )
+            }
         }
+    }
+
+    func testSwatchMarksResolveTheWellForTheViewsContrast() {
+        let clear = EditorInkColor(red: 0, green: 0, blue: 0, alpha: 0)
+        let standard = NotebookSwatchContrast.background(for: clear, contrast: .standard)
+        let increased = NotebookSwatchContrast.background(for: clear, contrast: .increased)
+        let wells = [UIAccessibilityContrast.normal, .high].map { contrast in
+            NotebookSwatchShelf.color(from: NotebookTheme.selectedWell.uiColor.resolvedColor(
+                with: UITraitCollection(accessibilityContrast: contrast)
+            ))
+        }
+        XCTAssertEqual(standard, wells[0], "A transparent ink shows the standard well.")
+        XCTAssertEqual(increased, wells[1], "Under Increase Contrast the darker well is measured, whatever the current traits.")
+        XCTAssertNotEqual(standard, increased)
+    }
+
+    func testFaintSwatchesGetADarkRingAndCatalogueSwatchesKeepTheSoftOne() {
+        for swatch in EditorInkCatalog.swatches + EditorInkCatalog.presets.map(\.color) {
+            XCTAssertFalse(NotebookSwatchContrast.isFaint(swatch), "\(swatch) stands out from the ink row by itself.")
+        }
+        for faint in [
+            EditorInkColor(red: 0.95, green: 0.94, blue: 0.9), EditorInkColor(red: 1, green: 1, blue: 0.6),
+            EditorInkColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 0.1),
+        ] {
+            XCTAssertTrue(NotebookSwatchContrast.isFaint(faint), "\(faint) needs a dark ring.")
+        }
+        let shell = NotebookSwatchContrast.inkRowShell
+        XCTAssertEqual(shell.red * 255, 230, accuracy: 1)
+        XCTAssertEqual(shell.green * 255, 227, accuracy: 1)
+        XCTAssertEqual(shell.blue * 255, 220, accuracy: 1)
     }
 
     func testAddingCustomColoursSelectsThemAndKeepsTheShelfBounded() throws {
@@ -668,15 +841,10 @@ final class NotebookToolbarTests: XCTestCase {
         let start = NotebookStripOverflow(offset: 0, contentWidth: 900, containerWidth: 400)
         XCTAssertFalse(start.hidesLeading)
         XCTAssertTrue(start.hidesTrailing)
-        XCTAssertGreaterThan(start.nextTrailingOffset, 0)
-        XCTAssertLessThanOrEqual(start.nextTrailingOffset, 500)
 
         let end = NotebookStripOverflow(offset: 500, contentWidth: 900, containerWidth: 400)
         XCTAssertTrue(end.hidesLeading)
         XCTAssertFalse(end.hidesTrailing)
-        XCTAssertEqual(end.nextTrailingOffset, 500)
-        XCTAssertLessThan(end.nextLeadingOffset, 500)
-        XCTAssertGreaterThanOrEqual(end.nextLeadingOffset, 0)
 
         XCTAssertEqual(fits.hiddenEdges, .none)
         let scrolling = (100...400).map { NotebookStripOverflow(offset: CGFloat($0), contentWidth: 900, containerWidth: 400) }
@@ -686,6 +854,293 @@ final class NotebookToolbarTests: XCTestCase {
         )
         XCTAssertEqual(scrolling[0].hiddenEdges, NotebookStripOverflow.HiddenEdges(leading: true, trailing: true))
         XCTAssertEqual(end.hiddenEdges, NotebookStripOverflow.HiddenEdges(leading: true, trailing: false))
+    }
+
+    /// The ink strip of an 11-inch iPad in portrait with two custom colours: presets, then six of
+    /// the nine swatches before the trailing chevron.
+    func testRestingStripShowsOnlyWholeControls() throws {
+        let preferences = toolbar(customColors: 2)
+        let rail = self.rail(for: preferences, hostWidth: 834)
+        let row = try XCTUnwrap(rail.inkRow)
+        XCTAssertTrue(rail.inkRowOverflows)
+        let width = inkStripWidth(rail)
+        let swatches = row.slots.filter { if case .swatch = $0.item { true } else { false } }
+        XCTAssertEqual(swatches.count, 9)
+
+        let atStart = row.restingMask(for: stripOverflow(of: row, at: 0, in: width))
+        XCTAssertEqual(atStart.start, 0)
+        XCTAssertEqual(atStart.end, swatches[5].maxX, accuracy: 0.001, "The strip ends after the sixth whole swatch.")
+        XCTAssertGreaterThan(swatches[6].maxX, width, "The seventh would show in part, so it is masked.")
+        for slot in row.slots where !slot.item.isDivider {
+            let shown = slot.minX >= atStart.start && slot.maxX <= atStart.end
+            let hidden = slot.maxX <= atStart.start || slot.minX >= atStart.end
+            XCTAssertTrue(shown || hidden, "\(slot.id) is either whole or masked.")
+        }
+
+        // Anywhere a drag leaves it, the mask still shows only whole controls clear of the chevron.
+        for offset in stride(from: CGFloat(1.5), through: row.maximumOffset(containerWidth: width), by: 7) {
+            let overflow = stripOverflow(of: row, at: offset, in: width)
+            let mask = row.restingMask(for: overflow)
+            XCTAssertGreaterThanOrEqual(mask.start, NotebookTheme.controlSize - 0.5, "\(offset)")
+            for slot in row.slots where !slot.item.isDivider {
+                let minX = slot.minX - offset
+                let maxX = slot.maxX - offset
+                let shown = minX >= mask.start - 0.001 && maxX <= mask.end + 0.001
+                let hidden = maxX <= mask.start + 0.001 || minX >= mask.end - 0.001
+                XCTAssertTrue(shown || hidden, "\(slot.id) at \(offset)")
+            }
+        }
+    }
+
+    func testChevronsPageByWholeControlsAndFlicksRestOnThem() throws {
+        let rail = self.rail(for: toolbar(customColors: 8), hostWidth: 834)
+        let row = try XCTUnwrap(rail.inkRow)
+        let width = inkStripWidth(rail)
+        let maximum = row.maximumOffset(containerWidth: width)
+        let controls = row.slots.filter { !$0.item.isDivider }
+        var overflow = stripOverflow(of: row, at: 0, in: width)
+        var pages = 0
+        while overflow.hidesTrailing {
+            let hidden = try XCTUnwrap(controls.first { $0.maxX > overflow.offset + width + 0.5 })
+            let next = row.trailingPage(from: overflow)
+            XCTAssertGreaterThan(next, overflow.offset)
+            if next < maximum {
+                XCTAssertEqual(hidden.minX - next, NotebookStripRow.leadingClearance, accuracy: 0.001,
+                    "The first control hidden becomes the first one shown.")
+            }
+            overflow = stripOverflow(of: row, at: next, in: width)
+            pages += 1
+        }
+        XCTAssertEqual(overflow.offset, maximum, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(pages, 1)
+
+        while overflow.hidesLeading {
+            let hidden = try XCTUnwrap(controls.last { $0.minX < overflow.offset + NotebookStripRow.leadingClearance - 0.5 })
+            let previous = row.leadingPage(from: overflow)
+            XCTAssertLessThan(previous, overflow.offset)
+            XCTAssertLessThanOrEqual(hidden.maxX, previous + width + 0.5, "The nearest hidden control comes into view.")
+            overflow = stripOverflow(of: row, at: previous, in: width)
+        }
+        XCTAssertEqual(overflow.offset, 0)
+
+        let stops = row.restingOffsets(containerWidth: width)
+        XCTAssertEqual(stops.first, 0)
+        XCTAssertEqual(stops.last, maximum)
+        for proposed in stride(from: CGFloat(-40), through: maximum + 40, by: 13) {
+            let rest = row.restingOffset(near: proposed, containerWidth: width)
+            XCTAssertTrue(stops.contains(rest))
+            if rest > 0 {
+                XCTAssertTrue(controls.contains { abs($0.minX - rest - NotebookStripRow.leadingClearance) < 0.001 },
+                    "A flick rests with a whole control just clear of the leading chevron, at the end too.")
+            }
+        }
+    }
+
+    /// Scrolled to its end, a strip shows its first control just clear of the leading chevron, as
+    /// at every other stop, and its last control whole; the width left over shows after the last
+    /// control rather than as a gap before the first.
+    func testAStripAtItsEndLeavesItsSpareWidthAfterTheLastControl() throws {
+        var rows: [(label: String, row: NotebookStripRow, width: CGFloat)] = []
+        for custom in [0, 2, 4, 8] {
+            for hostWidth in [678.0, 834, 1_194] as [CGFloat] {
+                let rail = self.rail(for: toolbar(customColors: custom), hostWidth: hostWidth)
+                guard rail.inkRowOverflows else { continue }
+                rows.append(("ink row, \(hostWidth) with \(custom)", try XCTUnwrap(rail.inkRow), inkStripWidth(rail)))
+            }
+        }
+        for (sizeClass, hostWidth) in [(UserInterfaceSizeClass.regular, CGFloat(678)), (.compact, 507)] {
+            let composition = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: sizeClass)
+            let rail = composition.rail(forHostWidth: hostWidth)
+            XCTAssertTrue(rail.toolRowOverflows)
+            // The rail less its grip column, the cap after the strip and the trailing chevron's slot.
+            let width = rail.size.width - NotebookToolbarComposition.gripColumnWidth - composition.toolCapWidth
+                - NotebookTheme.controlSize
+            rows.append(("tool row, \(hostWidth)", rail.toolRow, width))
+        }
+        XCTAssertGreaterThanOrEqual(rows.count, 8)
+        // A stop further on would show a whole control more: at most the widest chip and a divider.
+        let widestStep = NotebookPresetChip.width(for: EditorInkCatalog.presets[1], at: .xxLarge)
+            + NotebookToolbarComposition.groupGap
+
+        for (label, row, width) in rows {
+            let maximum = row.maximumOffset(containerWidth: width)
+            let scrollWidth = row.scrollWidth(containerWidth: width)
+            XCTAssertEqual(scrollWidth - width, maximum, accuracy: 0.001, label)
+            let end = NotebookStripOverflow(offset: maximum, contentWidth: scrollWidth, containerWidth: width)
+            XCTAssertTrue(end.hidesLeading, label)
+            XCTAssertFalse(end.hidesTrailing, "\(label): nothing is left to page to.")
+            let mask = row.restingMask(for: end)
+            XCTAssertEqual(mask.start, NotebookStripRow.leadingClearance, accuracy: 0.001, "\(label): no gap before it.")
+            XCTAssertEqual(mask.end, width, label)
+            let last = try XCTUnwrap(row.slots.last { !$0.item.isDivider })
+            let spare = width - (last.maxX - maximum)
+            XCTAssertGreaterThanOrEqual(spare, -0.001, "\(label): the last control shows whole.")
+            XCTAssertLessThan(spare, widestStep, "\(label): less than one control is left over.")
+            XCTAssertEqual(row.restingOffsets(containerWidth: width).last, maximum, label)
+        }
+        let fits = try XCTUnwrap(self.rail(for: .standard, hostWidth: 1_024).inkRow)
+        XCTAssertEqual(fits.trailingRoom(containerWidth: 900), 0, "A strip that fits gains no room.")
+    }
+
+    // MARK: - Rail width rule
+
+    /// The rail at every regular-width window the spec measures, with 0, 2, 4 and 8 custom colours,
+    /// at the default text size and at the rail's xxLarge limit. Larger chips widen the ink row by
+    /// 47 points there, which is what moves the eleven-inch landscape rail apart from its limit.
+    func testRailWidthFollowsTheDockAndPlannedToolRules() {
+        struct Case {
+            let width: CGFloat
+            let customColors: Int
+            var textSize = DynamicTypeSize.large
+            let rail: CGFloat
+            let docksShared: Bool
+            let showsUpcoming: Bool
+        }
+        let cases = [
+            Case(width: 834, customColors: 0, rail: 807, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 2, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 4, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 8, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 1_194, customColors: 0, rail: 807, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 2, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 4, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 8, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_024, customColors: 0, rail: 965, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 2, rail: 965, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 4, rail: 991, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 8, rail: 1_000, docksShared: true, showsUpcoming: true),
+            Case(width: 1_366, customColors: 0, rail: 965, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 2, rail: 965, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 4, rail: 991, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 8, rail: 1_042, docksShared: false, showsUpcoming: true),
+            Case(width: 678, customColors: 0, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 2, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 4, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 8, rail: 654, docksShared: true, showsUpcoming: false),
+
+            Case(width: 834, customColors: 0, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 2, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 4, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 8, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
+            Case(width: 1_194, customColors: 0, textSize: .xxLarge, rail: 854, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 2, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 4, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_194, customColors: 8, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
+            Case(width: 1_024, customColors: 0, textSize: .xxLarge, rail: 965, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 2, textSize: .xxLarge, rail: 965, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 4, textSize: .xxLarge, rail: 1_000, docksShared: true, showsUpcoming: true),
+            Case(width: 1_024, customColors: 8, textSize: .xxLarge, rail: 1_000, docksShared: true, showsUpcoming: true),
+            Case(width: 1_366, customColors: 0, textSize: .xxLarge, rail: 965, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 2, textSize: .xxLarge, rail: 965, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 4, textSize: .xxLarge, rail: 1_038, docksShared: false, showsUpcoming: true),
+            Case(width: 1_366, customColors: 8, textSize: .xxLarge, rail: 1_042, docksShared: false, showsUpcoming: true),
+            Case(width: 678, customColors: 0, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 2, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 4, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 678, customColors: 8, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
+        ]
+        for test in cases {
+            let preferences = toolbar(customColors: test.customColors)
+            let label = "\(test.width) with \(test.customColors) custom colours at \(test.textSize)"
+            let rail = self.rail(for: preferences, hostWidth: test.width, textSize: test.textSize)
+            XCTAssertEqual(rail.size.width, test.rail, accuracy: 0.001, label)
+            XCTAssertEqual(rail.size.height, 2 * NotebookTheme.rowHeight + NotebookTheme.rowSpacing, label)
+            XCTAssertEqual(rail.docksShared, test.docksShared, label)
+            XCTAssertEqual(rail.showsUpcoming, test.showsUpcoming, label)
+            XCTAssertEqual(rail.upcomingTools.isEmpty, !test.showsUpcoming, label)
+            XCTAssertEqual(
+                rail.toolRow.slots.contains { $0.item == .upcomingLabel }, test.showsUpcoming,
+                "\(label): the planned tools show as a whole group or not at all."
+            )
+            let available = test.width - 2 * EditorToolbarLayout.margin
+            if test.docksShared {
+                XCTAssertLessThanOrEqual(rail.size.width, available, label)
+            } else {
+                XCTAssertGreaterThanOrEqual((available - rail.size.width) / 2, NotebookToolbarComposition.minimumDockTravel, label)
+            }
+            var floating = preferences
+            floating.place(.floating(CGPoint(x: 0.5, y: 0.5)))
+            XCTAssertEqual(self.rail(for: floating, hostWidth: test.width, textSize: test.textSize).size, rail.size,
+                "\(label): floating and docked rails share one width.")
+        }
+    }
+
+    func testRowsCountEveryDividerAndChipTheyLayOut() {
+        let composition = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
+        let inset = NotebookTheme.stripInsets.right
+        XCTAssertEqual(NotebookToolbarComposition.dividerWidth, 9)
+        XCTAssertEqual(NotebookToolbarComposition.groupGap, 13)
+        XCTAssertEqual(composition.toolRow(includingUpcoming: false).contentWidth + inset, 680)
+        XCTAssertEqual(composition.toolRow(includingUpcoming: true).contentWidth + inset, 921)
+        let chips = EditorInkCatalog.presets.map { NotebookPresetChip.width(for: $0, at: .large) }
+        XCTAssertEqual(chips, [77, 98, 96, 80], "Sepia, Charcoal, Graphite and Ochre at the default text size.")
+        for custom in 0...8 {
+            let swatches = EditorInkCatalog.swatches + (0..<custom).map { EditorInkColor(red: 0.1, green: Double($0) / 10, blue: 0.6) }
+            XCTAssertEqual(
+                composition.inkRow(swatches).contentWidth + NotebookToolbarComposition.inkCapWidth,
+                763 + 46 * CGFloat(custom), "\(custom) custom colours"
+            )
+        }
+        let large = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular, dynamicTypeSize: .xxLarge)
+        let accessibility = NotebookToolbarComposition(
+            preferences: .standard, horizontalSizeClass: .regular, dynamicTypeSize: .accessibility5
+        )
+        XCTAssertEqual(accessibility, large, "Text sizes above the rail's limit lay out as its limit.")
+        let largeChips = EditorInkCatalog.presets.map { NotebookPresetChip.width(for: $0, at: .xxLarge) }
+        XCTAssertEqual(largeChips.reduce(0, +) + 3 * NotebookTheme.itemSpacing, 404, accuracy: 4, "About 404 pt at xxLarge.")
+        XCTAssertEqual(large.toolRow(includingUpcoming: true), composition.toolRow(includingUpcoming: true),
+            "The tool row keeps its size at every text size.")
+    }
+
+    func testLargeTextNarrowsTheInkRowOnTheElevenInchIPad() throws {
+        let composition = NotebookToolbarComposition(
+            preferences: .standard, horizontalSizeClass: .regular, dynamicTypeSize: .xxLarge
+        )
+        let rail = composition.rail(forHostWidth: 834)
+        XCTAssertEqual(rail.size.width, 810)
+        XCTAssertTrue(rail.docksShared)
+        XCTAssertFalse(rail.showsUpcoming)
+        XCTAssertTrue(rail.inkRowOverflows)
+        let row = try XCTUnwrap(rail.inkRow)
+        let width = inkStripWidth(rail)
+        let mask = row.restingMask(for: stripOverflow(of: row, at: 0, in: width))
+        let shown = row.slots.filter { !$0.item.isDivider && $0.maxX <= mask.end + 0.001 }
+        XCTAssertEqual(shown.filter { if case .preset = $0.item { true } else { false } }.count, 4, "Every preset shows.")
+        XCTAssertEqual(shown.filter { if case .swatch = $0.item { true } else { false } }.count, 5)
+    }
+
+    func testPresetChipsUseShortLabelsThatFitTheirMeasuredWidth() {
+        XCTAssertEqual(EditorInkCatalog.presets.map(NotebookPresetChip.shortTitle), ["Sepia", "Charcoal", "Graphite", "Ochre"])
+        for size in [DynamicTypeSize.large, .xxLarge] {
+            for preset in EditorInkCatalog.presets {
+                let title = NotebookPresetChip.shortTitle(for: preset)
+                let text = UIHostingController(rootView: Text(title).font(NotebookTheme.controlLabel.font).fixedSize()
+                    .environment(\.dynamicTypeSize, size))
+                let rendered = text.sizeThatFits(in: CGSize(width: 1_000, height: 1_000)).width
+                let measured = NotebookPresetChip.labelWidth(title, at: size)
+                XCTAssertGreaterThanOrEqual(measured, rendered - 0.01, "\(title) at \(size)")
+                XCTAssertLessThan(measured, rendered + 1, "\(title) at \(size)")
+            }
+        }
+    }
+
+    /// The compact ink panel is presented outside the rail's text-size limit, so each chip keeps
+    /// to it by itself: at accessibility sizes it draws exactly as at the limit, its label never
+    /// spilling past the capsule measured for it.
+    func testPresetChipsDrawAtTheRailsTextLimitWherever() throws {
+        for preset in EditorInkCatalog.presets {
+            func chip(at size: DynamicTypeSize) throws -> RenderedPixels {
+                try RenderedPixels(rendering: NotebookPresetChip(preset: preset, isSelected: false) {}
+                    .environment(\.dynamicTypeSize, size))
+            }
+            let limit = try chip(at: NotebookToolbarComposition.textSizeLimit)
+            XCTAssertEqual(limit.size.width, NotebookPresetChip.width(for: preset, at: .xxLarge), preset.id)
+            for size in [DynamicTypeSize.accessibility1, .accessibility3, .accessibility5] {
+                let large = try chip(at: size)
+                XCTAssertEqual(large.size, limit.size, "\(preset.id) at \(size)")
+                XCTAssertTrue(large.rgba == limit.rgba, "\(preset.id) at \(size) draws as at the limit.")
+            }
+        }
     }
 
     // MARK: - Placement around the real canvas
@@ -729,11 +1184,8 @@ final class NotebookToolbarTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - host.bounds.height) < 0.5 }
         host.layoutIfNeeded()
 
-        let composition = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
-        let toolbar = EditorToolbarLayout.frame(
-            for: fixture.store.toolbar.placement, size: composition.toolbarSize(forHostWidth: host.bounds.width),
-            in: host.bounds
-        )
+        let toolbar = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
+            .frame(for: fixture.store.toolbar.placement, in: host.bounds)
         // The shell padding above the first row has no control, so only the toolbar's own shape claims it.
         let shellEdge = CGPoint(x: toolbar.midX, y: toolbar.minY + 2)
         let beside = CGPoint(x: toolbar.midX, y: toolbar.maxY + 40)
@@ -775,11 +1227,8 @@ final class NotebookToolbarTests: XCTestCase {
             }
         }
 
-        let composition = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
-        let toolbar = EditorToolbarLayout.frame(
-            for: fixture.store.toolbar.placement, size: composition.toolbarSize(forHostWidth: host.bounds.width),
-            in: host.bounds
-        )
+        let toolbar = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
+            .frame(for: fixture.store.toolbar.placement, in: host.bounds)
         let grip = CGPoint(x: toolbar.minX + NotebookTheme.dragHandleHitSize.width / 2, y: toolbar.midY)
         let target = fixture.hit(grip)
         XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "The grip never passes touches to the canvas.")
@@ -840,6 +1289,18 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Fixtures
 
+    /// A strip's scroll state at `offset`, as the strip reports it.
+    private func stripOverflow(of row: NotebookStripRow, at offset: CGFloat, in width: CGFloat) -> NotebookStripOverflow {
+        NotebookStripOverflow(offset: offset, contentWidth: row.scrollWidth(containerWidth: width), containerWidth: width)
+    }
+
+    private func rendered(_ window: UIWindow) throws -> RenderedPixels {
+        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        return try RenderedPixels(try XCTUnwrap(image.cgImage), scale: image.scale)
+    }
+
     /// Waits until a measurement stops changing between two layout passes.
     private func settled(_ measure: @escaping @MainActor () -> CGFloat) async throws {
         var previous = measure()
@@ -849,6 +1310,28 @@ final class NotebookToolbarTests: XCTestCase {
             return current > 0 && abs(current - previous) < 0.5
         }
         try await Task.sleep(for: .milliseconds(100))
+    }
+
+    private func toolbar(customColors: Int) -> EditorToolbarPreferences {
+        var preferences = EditorToolbarPreferences.standard
+        for index in 0..<customColors {
+            preferences.addCustomSwatch(EditorInkColor(red: 0.1, green: Double(index) / 10, blue: 0.6))
+        }
+        XCTAssertEqual(preferences.customSwatches.count, customColors)
+        return preferences
+    }
+
+    private func rail(
+        for preferences: EditorToolbarPreferences, hostWidth: CGFloat, textSize: DynamicTypeSize = .large
+    ) -> NotebookToolbarRail {
+        NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: .regular, dynamicTypeSize: textSize)
+            .rail(forHostWidth: hostWidth)
+    }
+
+    /// The ink strip's width in a rail: the row less its fixed cap and, when it scrolls, the chevron.
+    private func inkStripWidth(_ rail: NotebookToolbarRail) -> CGFloat {
+        rail.size.width - NotebookTheme.controlSize - NotebookToolbarComposition.inkCapWidth
+            - (rail.inkRowOverflows ? NotebookTheme.controlSize : 0)
     }
 
     /// A store that admits toolbar actions without mounting a canvas.
@@ -893,15 +1376,18 @@ final class NotebookToolbarTests: XCTestCase {
     private func assertPresentedAsAvailable(
         _ actions: NotebookToolbarActions, file: StaticString = #filePath, line: UInt = #line
     ) {
-        XCTAssertEqual(actions.contentOpacity, 1, file: file, line: line)
+        XCTAssertEqual(actions.contentOpacity(), 1, file: file, line: line)
+        XCTAssertEqual(actions.contentOpacity(for: .increased), 1, file: file, line: line)
         XCTAssertEqual(actions.dragGestureMask, .all, file: file, line: line)
     }
 
     private func assertPresentedAsUnavailable(
         _ actions: NotebookToolbarActions, file: StaticString = #filePath, line: UInt = #line
     ) {
-        XCTAssertLessThan(actions.contentOpacity, 1, "An unavailable toolbar is visibly dimmed.", file: file, line: line)
-        XCTAssertEqual(actions.contentOpacity, NotebookTheme.disabledOpacity, file: file, line: line)
+        XCTAssertLessThan(actions.contentOpacity(), 1, "An unavailable toolbar is visibly dimmed.", file: file, line: line)
+        XCTAssertEqual(actions.contentOpacity(), NotebookTheme.disabledOpacity, file: file, line: line)
+        XCTAssertEqual(actions.contentOpacity(for: .increased), NotebookTheme.disabledOpacityIncreased,
+            "Increase Contrast dims less, so paused tools stay legible.", file: file, line: line)
         XCTAssertEqual(actions.dragGestureMask, .none, "An unavailable toolbar cannot be dragged.", file: file, line: line)
     }
 
@@ -925,6 +1411,30 @@ final class NotebookToolbarTests: XCTestCase {
 private final class EmissionCounter {
     var count = 0
     var subscription: AnyCancellable?
+}
+
+/// Waits for the display to refresh.
+@MainActor
+private final class DisplayFrames: NSObject {
+    private var link: CADisplayLink?
+    private var resume: (() -> Void)?
+
+    static func next() async {
+        let frames = DisplayFrames()
+        await withCheckedContinuation { continuation in
+            frames.resume = { continuation.resume() }
+            let link = CADisplayLink(target: frames, selector: #selector(refreshed))
+            link.add(to: .main, forMode: .common)
+            frames.link = link
+        }
+    }
+
+    @objc private func refreshed() {
+        link?.invalidate()
+        link = nil
+        resume?()
+        resume = nil
+    }
 }
 
 /// Records the enabled state the toolbar passes down to the controls it contains.

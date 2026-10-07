@@ -136,6 +136,13 @@ final class NotebookLibraryModel: ObservableObject {
         }
     }
 
+    /// Hides the notice that a new notebook could not be selected. The open notebook is not
+    /// affected; a later attempt reports its own outcome.
+    func dismissCreationFailure() {
+        guard case .notebook = state, !isCreating else { return }
+        creationFailure = nil
+    }
+
     private func installSession(id: UUID, library: NotebookLibraryAccess) {
         let session = NotebookSession(
             notebookID: id, openStorage: { await library.storage(notebookID: id, requiresExistingCommit: true) }
@@ -156,19 +163,18 @@ struct NotebookLibraryHost: View {
         Group {
             switch model.state {
             case .loading:
-                ProgressView("Opening library")
+                NotebookStatusCard(loading: "Opening library")
+                    .centredOnPaper()
             case .creatingFirstNotebook:
                 if let failure = model.creationFailure {
-                    ContentUnavailableView {
-                        Label("Couldn't create your first notebook", systemImage: "exclamationmark.triangle")
-                    } description: {
-                        Text(failure.message)
-                    } actions: {
+                    NotebookStatusCard(title: "Couldn't create your first notebook", message: failure.message) {
                         Button("Try again") { Task { await model.retry() } }
                             .disabled(model.isCreating)
                     }
+                    .centredOnPaper()
                 } else {
-                    ProgressView("Creating your first notebook")
+                    NotebookStatusCard(loading: "Creating your first notebook")
+                        .centredOnPaper()
                 }
             case .notebook(let session):
                 NotebookScreen(session: session, startNewNotebook: {
@@ -177,35 +183,34 @@ struct NotebookLibraryHost: View {
                 .id(session.notebookID)
                 .overlay(alignment: .top) {
                     if let failure = model.creationFailure {
-                        Text("The new notebook could not be selected. \(failure.message)")
-                            .font(.callout)
-                            .padding()
-                            .background(.regularMaterial)
+                        selectionFailureBanner(failure)
                     }
                 }
             case .recoveryRequired:
-                ContentUnavailableView {
-                    Label("Retained notebooks need recovery", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text("Your existing notebooks and recovery copies will be kept. You can start a separate notebook.")
-                    if let failure = model.creationFailure { Text(failure.message) }
-                } actions: {
+                NotebookStatusCard(
+                    title: "Retained notebooks need recovery",
+                    message: Self.lines(
+                        "Your existing notebooks and recovery copies will be kept. You can start a separate notebook.",
+                        model.creationFailure?.message
+                    )
+                ) {
                     Button("Start new notebook and keep retained files") {
                         Task { await model.startNewNotebook() }
                     }
                     .disabled(model.isCreating)
+                } secondary: {
                     Button("Check library again") { Task { await model.retry() } }
                         .disabled(model.isCreating)
                 }
+                .centredOnPaper()
             case .failed(let failure):
-                ContentUnavailableView {
-                    Label("Couldn't open library", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(failure.message)
-                    Text("Your retained files have not been replaced.")
-                } actions: {
+                NotebookStatusCard(
+                    title: "Couldn't open library",
+                    message: Self.lines(failure.message, "Your retained files have not been replaced.")
+                ) {
                     Button("Try again") { Task { await model.retry() } }
                 }
+                .centredOnPaper()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -213,5 +218,50 @@ struct NotebookLibraryHost: View {
         .background { NotebookTheme.paperIvory.color.ignoresSafeArea() }
         .preferredColorScheme(.light)
         .task { await model.load() }
+    }
+
+    /// The notice that a new notebook could not be selected. It lies over the top of the open
+    /// notebook, so it can be dismissed to uncover the controls beneath it.
+    private func selectionFailureBanner(_ failure: NotebookSaveFailure) -> some View {
+        HStack(spacing: 0) {
+            Text("The new notebook could not be selected. \(failure.message)")
+                .font(.callout)
+                .foregroundStyle(NotebookTheme.glyph.color)
+                .padding([.vertical, .leading], NotebookTheme.popoverPadding)
+            Button {
+                model.dismissCreationFailure()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.callout.weight(.semibold))
+                    .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(NotebookKeyStyle())
+            .accessibilityLabel("Dismiss")
+            .help("Dismiss")
+            // Inset like a readout cell in the tray, so a pressed well stays clear of the shell's edge.
+            .padding(.trailing, NotebookTheme.readoutInset)
+        }
+        .background { NotebookPanelShell(cornerRadius: NotebookTheme.compactPanelCornerRadius) }
+        .frame(maxWidth: NotebookTheme.statusCardMaxWidth)
+        .padding([.top, .horizontal], NotebookTheme.sectionSpacing)
+    }
+
+    /// Separate statements of a card's message, one per line.
+    private static func lines(_ lines: String?...) -> String {
+        lines.compactMap { $0 }.joined(separator: "\n")
+    }
+}
+
+private extension View {
+    /// Centres a status card on the paper, scrolling it when a large text size makes it taller
+    /// than the screen. The padding keeps the card's shadow clear of the edges.
+    func centredOnPaper() -> some View {
+        ViewThatFits(in: .vertical) {
+            padding(NotebookTheme.detailPadding)
+            ScrollView {
+                padding(NotebookTheme.detailPadding)
+            }
+        }
     }
 }

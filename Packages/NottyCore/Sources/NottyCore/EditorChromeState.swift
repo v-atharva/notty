@@ -59,13 +59,17 @@ public struct EditorChromeRevealOutcome: Equatable, Sendable {
 /// decelerating. Programmatic offsets, layout adjustments, zoom-only changes and the canvas's
 /// own scrolling during a stroke would otherwise hide or reveal the chrome by themselves.
 ///
+/// Travel is net: scrolling back takes away from the distance counted, never below zero, so a
+/// slow drag's small reversals neither reset nor stall it, and a small correction while reading
+/// reveals nothing once reading carries on.
+///
 /// While any pin is set the header and tools show in every mode. Inputs still update the
 /// requested state underneath, which takes effect once the pins clear.
 public struct EditorChromeState: Equatable, Sendable {
-    /// Downward travel that hides the chrome.
-    public static let hideTravel: CGFloat = 24
-    /// Upward travel that reveals it, a little more than hiding takes so a small correction
-    /// while reading leaves the page clear.
+    /// Downward travel that hides the chrome. Under Reduce Motion the header fades out here
+    /// instead of following the page.
+    public static let hideTravel: CGFloat = 28
+    /// Upward travel that reveals it.
     public static let revealTravel: CGFloat = 28
     public static let transientRevealDuration = Duration.seconds(1.5)
 
@@ -80,14 +84,23 @@ public struct EditorChromeState: Equatable, Sendable {
     private var isToolActive = false
     /// Notebooks open at their top, so the first scroll there is not an arrival.
     private var wasAtTop = true
-    /// Travel since the last reversal or visibility request; positive moves into the notebook.
-    private var travel: CGFloat = 0
+    /// Net travel into the notebook since travel last restarted: how far below the highest point
+    /// reached the notebook now sits.
+    private var descent: CGFloat = 0
+    /// Net travel back toward the top over the same span.
+    private var ascent: CGFloat = 0
 
     public init(mode: EditorChromeMode = .focus) {
         self.mode = mode
     }
 
     public var showsHeader: Bool { isForcedVisible || isRevealed }
+
+    /// How far a header that follows the page has moved up with it: the net travel into the
+    /// notebook since the header last showed, a scroll last came to rest or a stroke began.
+    /// It stays below `hideTravel`, since reaching that hides the header. Zero while the header
+    /// is hidden or kept in place.
+    public var headerTravel: CGFloat { isRevealed && !isForcedVisible ? descent : 0 }
 
     public var showsTools: Bool {
         isForcedVisible || mode == .overlay || isRevealed || activeTransient != nil
@@ -119,7 +132,7 @@ public struct EditorChromeState: Equatable, Sendable {
     public mutating func toolBegan() -> Bool {
         changingVisibility {
             $0.isToolActive = true
-            $0.travel = 0
+            $0.restartTravel()
         }
     }
 
@@ -156,6 +169,13 @@ public struct EditorChromeState: Equatable, Sendable {
     public mutating func userScrolled(by delta: CGFloat, isAtTop: Bool) -> Bool {
         guard !isToolActive else { return false }
         return changingVisibility { $0.scroll(by: delta, isAtTop: isAtTop) }
+    }
+
+    /// The user's scrolling has come to rest. Travel short of either threshold is dropped, as a
+    /// header left part-way settles back, so the next scroll starts from nothing. Never changes
+    /// visibility.
+    public mutating func userScrollEnded() {
+        restartTravel()
     }
 
     @discardableResult
@@ -200,23 +220,28 @@ public struct EditorChromeState: Equatable, Sendable {
         guard delta.isFinite, delta != 0 else { return }
         // Moving down while still at the top is overscroll settling back, not reading on.
         if isAtTop, delta > 0 {
-            travel = 0
+            restartTravel()
             return
         }
-        if travel != 0, (delta > 0) != (travel > 0) { travel = 0 }
-        travel += delta
-        if travel >= Self.hideTravel {
+        descent = max(descent + delta, 0)
+        ascent = max(ascent - delta, 0)
+        if descent >= Self.hideTravel {
             hide()
-        } else if travel <= -Self.revealTravel {
+        } else if ascent >= Self.revealTravel {
             show()
         }
+    }
+
+    private mutating func restartTravel() {
+        descent = 0
+        ascent = 0
     }
 
     /// Shows everything the mode can hide and supersedes any transient reveal.
     private mutating func show() {
         isRevealed = true
         activeTransient = nil
-        travel = 0
+        restartTravel()
     }
 
     /// A hide trigger, which also cancels any transient reveal. Pinned mode never hides.
@@ -224,7 +249,7 @@ public struct EditorChromeState: Equatable, Sendable {
         guard mode != .pinned else { return }
         isRevealed = false
         activeTransient = nil
-        travel = 0
+        restartTravel()
     }
 
     private mutating func changingVisibility(_ change: (inout EditorChromeState) -> Void) -> Bool {

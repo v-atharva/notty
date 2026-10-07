@@ -180,6 +180,63 @@ final class NotebookWritingStatusTests: XCTestCase {
         }
     }
 
+    func testSaveReadoutNamesEveryStateAndColoursOnlyFailures() {
+        let ready = presentation(.idle)
+        let cases: [(NotebookSavePresentation, NotebookSaveStatus, String, String, NotebookReadout.Tone)] = [
+            (ready, .idle, "doc", "Ready", .standard),
+            (ready, .saving, "circle.dotted", "Saving", .standard),
+            (ready, .saved(Date(timeIntervalSince1970: 100)), "checkmark.circle", "Saved", .standard),
+            (ready, .failed(.storageFull), "exclamationmark.triangle.fill", "Save failed", .alert),
+            (presentation(.idle, performingRecovery: true), .idle, "lifepreserver", "Recovery", .standard),
+            (presentation(.idle, recoveryFailure: .storageFull), .idle, "exclamationmark.triangle.fill", "Recovery failed", .alert),
+            (presentation(.idle, isReady: false), .idle, "lock", "Not ready", .standard),
+        ]
+        for (state, displayed, symbol, caption, tone) in cases {
+            let readout = NotebookReadout.save(state, displayed: displayed)
+            XCTAssertEqual(readout.symbol, symbol, caption)
+            XCTAssertEqual(readout.caption, caption)
+            XCTAssertEqual(readout.tone, tone, caption)
+            XCTAssertEqual(readout.label, caption + ". Notebook save details", "The spoken label is unchanged.")
+        }
+    }
+
+    /// Ready, Saving and Saved share one caption slot, so the readout never shifts while writing;
+    /// a rarer, longer caption widens it rather than being cut off.
+    func testSaveReadoutHoldsItsWidthAcrossReadySavingAndSaved() throws {
+        func width(_ displayed: NotebookSaveStatus) throws -> CGFloat {
+            let readout = NotebookReadout.save(presentation(displayed), displayed: displayed)
+            let label = NotebookReadoutLabel(readout: readout, steadyCaptions: NotebookReadout.steadySaveCaptions)
+            return try RenderedPixels(rendering: label).size.width
+        }
+        let steady = try [NotebookSaveStatus.idle, .saving, .saved(Date(timeIntervalSince1970: 100))].map(width)
+        XCTAssertEqual(steady[0], steady[1], accuracy: 0.01)
+        XCTAssertEqual(steady[0], steady[2], accuracy: 0.01)
+        XCTAssertEqual(steady[0], NotebookTheme.statusReadoutMinWidth, accuracy: 1, "12 + 16 + 6 + the SAVING slot + 12")
+        XCTAssertGreaterThan(try width(.failed(.storageFull)), steady[0])
+    }
+
+    func testHistoryAndLimitReadoutsCarryAWordForEveryUnusualState() {
+        XCTAssertNil(NotebookReadout.integrity(nil), "Nothing shows before the check starts.")
+        let checking = NotebookReadout.integrity(.checking)
+        XCTAssertNil(checking?.symbol, "A check in progress shows a progress indicator.")
+        XCTAssertEqual(checking?.caption, "Checking")
+        let verified = NotebookReadout.integrity(.verified(revisions: 3))
+        XCTAssertEqual(verified?.symbol, "checkmark.seal")
+        XCTAssertNil(verified?.caption)
+        XCTAssertEqual(verified?.label, "Notebook history verified")
+        let damaged = NotebookReadout.integrity(.damaged(.corruptData))
+        XCTAssertEqual(damaged?.symbol, "xmark.seal")
+        XCTAssertEqual(damaged?.caption, "Damaged")
+        XCTAssertEqual(damaged?.tone, .alert)
+        let incomplete = NotebookReadout.integrity(.incomplete(.corruptData))
+        XCTAssertEqual(incomplete?.caption, "Incomplete")
+        XCTAssertEqual(incomplete?.tone, .caution)
+        XCTAssertEqual(NotebookReadout.nearLimit.symbol, "gauge.with.dots.needle.67percent")
+        XCTAssertEqual(NotebookReadout.nearLimit.tone, .caution)
+        XCTAssertEqual(NotebookReadout.nearLimit.captionTone.uiColor, NotebookTheme.cautionGlyph.uiColor)
+        XCTAssertEqual(damaged?.glyphTone.uiColor, NotebookTheme.alertGlyph.uiColor)
+    }
+
     func testSuccessExpiryCannotClearNewerFailureAndDoesNotRebuildCanvas() async throws {
         let clock = WritingFeedbackClock()
         do {
@@ -864,11 +921,14 @@ final class NotebookWritingStatusTests: XCTestCase {
         XCTAssertEqual(calls, 8)
     }
 
-    private func presentation(_ status: NotebookSaveStatus) -> NotebookSavePresentation {
+    private func presentation(
+        _ status: NotebookSaveStatus, performingRecovery: Bool = false,
+        recoveryFailure: NotebookSaveFailure? = nil, isReady: Bool = true
+    ) -> NotebookSavePresentation {
         NotebookSavePresentation(
-            status: status, inputPaused: false, performingRecovery: false,
+            status: status, inputPaused: false, performingRecovery: performingRecovery,
             canPreserveRecovery: false, canReopenSaved: false,
-            recoveryMessage: nil, recoveryFailure: nil, isReady: true
+            recoveryMessage: nil, recoveryFailure: recoveryFailure, isReady: isReady
         )
     }
 

@@ -34,7 +34,10 @@ struct NotebookCanvas: UIViewControllerRepresentable {
         }
         controller.onInteractionInterrupted = { [weak session] in
             session?.cancelCanvasToolCompletion(ownerID: seed.ownerID)
+            // A canvas leaving mid-stroke never reports the stroke's end.
+            session?.writingChrome.toolCancelled()
         }
+        controller.onAddPage = { [weak session] in session?.extendPaper() }
         session.attachCanvas(
             ownerID: seed.ownerID,
             observations: { [weak controller] in controller?.captureBarrier() },
@@ -51,6 +54,7 @@ struct NotebookCanvas: UIViewControllerRepresentable {
         controller.onDetach = { [weak session] in
             session?.detachCanvas(ownerID: seed.ownerID)
         }
+        controller.writingChrome = session.writingChrome
         controller.setInputGate(session.inputGate)
         return controller
     }
@@ -60,6 +64,7 @@ struct NotebookCanvas: UIViewControllerRepresentable {
         controller.setPageCount(pageCount)
         controller.applyChrome(context.environment.notebookCanvasChrome)
         controller.placeUnderToolbar(of: context.environment.notebookToolbarStore)
+        session.writingChrome.attach(to: context.environment.notebookToolbarStore)
     }
 
     static func dismantleUIViewController(

@@ -46,6 +46,8 @@ final class NotebookViewController: UIViewController {
     var onUndoAvailabilityChange: ((NotebookUndoAvailability) -> Void)?
     var onToolCompletion: ((NotebookToolCompletion) -> Void)?
     var onInteractionInterrupted: (() -> Void)?
+    /// Hears the user's own scrolling and tool use, which hide and reveal the header and tools.
+    weak var writingChrome: NotebookWritingChrome?
     var canPerformHistoryAction: (() -> Bool)?
     var reserveHistoryAction: (() -> Bool)?
     var currentUndoAvailability: NotebookUndoAvailability {
@@ -66,7 +68,9 @@ final class NotebookViewController: UIViewController {
     private(set) var observationWork = NotebookObservationWork()
     var barrierPointComparisons: Int { observationWork.comparedPoints }
     var barrierSignatureChecks: Int { observationWork.signatureChecks }
-    private(set) var inputGate = NotebookInputGate.open
+    private(set) var inputGate = NotebookInputGate.open {
+        didSet { updateEndOfPaperTab() }
+    }
     private var pageCount: Int
     private var previousViewportSize = CGSize.zero
     private var isAdjustingLayout = false
@@ -76,6 +80,19 @@ final class NotebookViewController: UIViewController {
     /// The store whose toolbar the host draws over this canvas.
     private weak var overlayStore: NotebookSceneToolStore?
     private var resizeCapture: ResizeCapture?
+    /// Paper behind the status bar, between the canvas and the chrome drawn over it.
+    private(set) lazy var statusVeil = NotebookStatusVeil(accessibility: paperView.accessibility)
+    /// The "Add page" tab on the stone below the last page.
+    let endOfPaperTab = NotebookEndOfPaperTab()
+    /// Adds a page at the end of the notebook. Only a canvas given this shows the end-of-paper
+    /// tab and keeps room below the last page for it.
+    var onAddPage: (() -> Void)? {
+        didSet {
+            guard isViewLoaded else { return }
+            updateInsets()
+            updateEndOfPaperTab()
+        }
+    }
 
     /// Whether the page rested at its revealed top when a resize began. It is taken at the first
     /// sign of the resize, before any of its changes apply, and every layout and inset change of
@@ -148,6 +165,9 @@ final class NotebookViewController: UIViewController {
         canvas.accessibilityLabel = "Notebook paper"
         canvas.accessibilityHint =
             "Write with Apple Pencil. Use a finger to scroll and pinch to zoom."
+        // The status veil stands in for the system's edge effects, which would tint the paper.
+        canvas.topEdgeEffect.isHidden = true
+        canvas.bottomEdgeEffect.isHidden = true
 
         // Without Apple's tool picker, Pencil tap and squeeze reach the app only through its own interaction.
         if allowsEditing, !isTornDown {
@@ -158,6 +178,14 @@ final class NotebookViewController: UIViewController {
 
         view.addSubview(paperView)
         view.addSubview(canvas)
+        endOfPaperTab.addTarget(self, action: #selector(addPage), for: .touchUpInside)
+        view.addSubview(endOfPaperTab)
+        view.addSubview(statusVeil)
+        registerForTraitChanges(
+            [UITraitPreferredContentSizeCategory.self]
+        ) { (controller: NotebookViewController, _: UITraitCollection) in
+            controller.updateEndOfPaperTab()
+        }
         updatePaperGeometry()
         updateContentExtent()
         refreshUndoManager()
@@ -483,6 +511,10 @@ final class NotebookViewController: UIViewController {
         let manager = retainedUndoManager ?? canvas.nativeUndoManager
         manager?.removeAllActions()
         onInteractionInterrupted?()
+        // A stroke cut short by teardown never reports its end, so the writing view is told it was
+        // cancelled. Telling it twice, as the interruption callback may, changes nothing.
+        writingChrome?.toolCancelled()
+        writingChrome = nil
         inputGate = .readOnly
         canvas.permitsMutation = false
         canvas.permitsHistoryAccess = false
@@ -536,6 +568,54 @@ final class NotebookViewController: UIViewController {
 
     private func updatePaperViewport() {
         paperView.setViewport(scale: canvas.zoomScale, offset: canvas.contentOffset)
+        statusVeil.update(
+            width: view.bounds.width, safeTop: view.safeAreaInsets.top,
+            isOverPaper: canvas.zoomScale >= view.bounds.width / logicalWidth * 0.999
+        )
+        updateEndOfPaperTab()
+    }
+
+    private var showsEndOfPaperTab: Bool { allowsEditing && onAddPage != nil }
+
+    /// Places the end-of-paper tab centred on the page, its top `endTabGap` below the last page
+    /// on screen. It only moves as the paper scrolls; its content changes with the gate, the
+    /// page limit and the text size.
+    private func updateEndOfPaperTab() {
+        guard isViewLoaded else { return }
+        let tab = endOfPaperTab
+        guard showsEndOfPaperTab else {
+            if !tab.isHidden { tab.isHidden = true }
+            return
+        }
+        let mode: NotebookEndOfPaperTab.Mode = pageCount >= Self.maximumPageCount
+            ? .limitReached : inputGate.allowsMutation ? .available : .paused
+        // The tab keeps the same margin from the window's sides as from the page above it.
+        tab.configure(
+            mode: mode, contentSize: traitCollection.preferredContentSizeCategory,
+            maximumWidth: view.bounds.width - 2 * NotebookTheme.endTabGap
+        )
+        let scale = canvas.zoomScale
+        let size = tab.bounds.size
+        let pageBottom = logicalHeight * scale - canvas.contentOffset.y
+        let pixel = 1 / max(traitCollection.displayScale, 1)
+        // Whole device pixels keep the label sharp at any zoom.
+        let origin = CGPoint(
+            x: ((logicalWidth * scale - size.width) / 2 - canvas.contentOffset.x) / pixel,
+            y: (pageBottom + NotebookTheme.endTabGap) / pixel
+        )
+        let frame = CGRect(
+            origin: CGPoint(x: origin.x.rounded() * pixel, y: origin.y.rounded() * pixel), size: size
+        )
+        let hidden = frame.minY >= view.bounds.height || frame.maxY <= 0
+        UIView.performWithoutAnimation {
+            if tab.frame != frame { tab.frame = frame }
+            if tab.isHidden != hidden { tab.isHidden = hidden }
+        }
+    }
+
+    @objc private func addPage() {
+        guard endOfPaperTab.mode == .available else { return }
+        onAddPage?()
     }
 
     /// Reserves the canvas edges the toolbar covers as scroll space, on top of the chrome.
@@ -627,7 +707,11 @@ final class NotebookViewController: UIViewController {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
         let obstruction = toolbarObstruction
         var top = max(chrome.top, 0) + max(obstruction.top, 0)
-        var bottom = max(chrome.bottom, 0) + max(obstruction.bottom, 0)
+        // The end-of-paper tab needs room below the last page, clear of the home indicator.
+        let chromeBottom = showsEndOfPaperTab
+            ? max(chrome.bottom, view.safeAreaInsets.bottom, 0) + NotebookTheme.endScrollMinimum
+            : max(chrome.bottom, 0)
+        var bottom = chromeBottom + max(obstruction.bottom, 0)
         if canvas.hasActiveTool {
             // A smaller inset pulls an offset beyond it back into range, which would move the
             // page under the stroke; the space is released when the stroke ends.
@@ -674,6 +758,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         toolBeginSignature = try? InkDrawingSignature(canvas.drawing)
         if let toolBeginSignature { observationWork.add(toolBeginSignature.constructionWork) }
         setToolActive(true)
+        writingChrome?.toolBegan()
         publishUndoAvailability()
     }
 
@@ -689,6 +774,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         toolBeginSignature = nil
         toolBeginGeneration = nil
         setToolActive(false)
+        writingChrome?.toolEnded()
         if let pendingTool { applyTool(pendingTool) }
         releaseHeldInsets()
         publishUndoAvailability()
@@ -718,6 +804,25 @@ extension NotebookViewController: PKCanvasViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard !isAdjustingLayout else { return }
         updatePaperViewport()
+        writingChrome?.userScrollMoved(in: scrollView)
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        // The user moving the page ends any claim that it rested at its top when a resize began.
+        resizeCapture = nil
+        writingChrome?.userScrollBegan(in: scrollView)
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate { writingChrome?.userScrollEnded() }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        writingChrome?.userScrollEnded()
+    }
+
+    func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
+        writingChrome?.scrolledToTop()
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {

@@ -270,10 +270,59 @@ enum NotebookTheme {
     static let readoutGlyphSize: CGFloat = 16
     /// A pressed readout sinks less than a pressed key, so its caption keeps 4.5:1.
     static let pressedTrayOpacity = 0.35
-    /// Scrolling back up this far brings a hidden header back.
-    static let headerRevealDistance: CGFloat = 28
     /// The header fades over the last stretch of its scroll-away travel, never hanging under the status bar.
     static let headerFadeDistance: CGFloat = 24
+    /// The header's inset from the window's sides, the same as a docked toolbar's margin.
+    static let headerSideInset: CGFloat = 12
+    /// Below this shell width the nameplate gives way to the title.
+    static let headerNameplateMinimumWidth: CGFloat = 560
+    /// Below this shell width the save readout drops its caption and a verified history its cell.
+    static let headerCompactWidth: CGFloat = 480
+    /// Least room between the tray and Undo; compact headers narrow it to the header padding.
+    static let headerTrailingGap: CGFloat = 12
+    /// The least room the title keeps beside the readouts; a header too narrow for it moves Redo
+    /// into the notebook menu.
+    static let headerTitleMinimumWidth: CGFloat = 96
+    /// Space either side of a readout's glyph and caption.
+    static let readoutPadding: CGFloat = 12
+    /// Space between a readout's glyph and its caption.
+    static let readoutSpacing: CGFloat = 6
+    static let accentGlyphSize: CGFloat = 17
+    /// The light caught along the accent key's top edge.
+    static let accentHighlightOpacity = 0.35
+    /// The focus ring drawn around the accent key.
+    static let accentFocusCornerRadius: CGFloat = 14
+    /// A header left part-way settles, a reveal springs in and a hide eases out. Under Reduce
+    /// Motion, and when a pin brings it back, the header only fades.
+    static let headerSettleDuration = 0.20
+    static let headerRevealDuration = 0.28
+    static let headerHideDuration = 0.18
+    static let chromeFadeDuration = 0.15
+
+    // MARK: - Notebook menu and recovery copies
+
+    /// A menu row's trailing inset, and the gap between its glyph and its text.
+    static let menuRowInset: CGFloat = 12
+    /// Where a menu row's glyph column starts: far enough in that the broadest glyph, Focus's
+    /// pencil and scribble, clears the selected row's mark.
+    static let menuGlyphInset: CGFloat = 16
+    /// Every row glyph centres in a column as wide as the glyph, so titles line up across sections.
+    static let menuGlyphColumnWidth: CGFloat = 20
+    /// Room above and below a writing view row's title and description.
+    static let menuRowTextPadding: CGFloat = 4
+    /// Least room between a writing view's text and its shortcut hint.
+    static let menuShortcutGap: CGFloat = 8
+    /// The longest writing view description shrinks, at most this far, rather than wrapping, to
+    /// share its row with the shortcut hint at the standard text size.
+    static let menuDescriptionMinimumScale: CGFloat = 0.85
+    /// Space between a section's caps label and its rows.
+    static let sectionLabelSpacing: CGFloat = 8
+    /// Glyphs of the toolbar position segments and the planned-feature rows.
+    static let menuSecondaryGlyphSize: CGFloat = 17
+    /// The disabled rows of planned features under "Coming later".
+    static let comingLaterRowHeight: CGFloat = 32
+    /// Space between a recovery card's title and the line explaining it.
+    static let recoveryCardTitleSpacing: CGFloat = 6
 
     // MARK: - Toolbar metrics
 
@@ -310,12 +359,24 @@ enum NotebookTheme {
     static let gripSeparatorLength: CGFloat = 20
     /// Collapsed floating rail; it is the reveal control, so both sides are at least 44 pt.
     static let collapsedHandleSize = CGSize(width: 56, height: 44)
+    /// The tool on the collapsed handle and the collapse key under a floating rail's grip.
+    static let handleGlyphSize: CGFloat = 20
     /// Ink bead on the collapsed handle, showing the ink in use.
     static let handleBeadDiameter: CGFloat = 8
+    /// Where the bead sits from the handle's centre, down and to the trailing side.
+    static let handleBeadOffset: CGFloat = 10
     /// The faint tab left where Focus mode hid the tools.
     static let revealTabSize = CGSize(width: 48, height: 20)
     static let revealTabHitSize = CGSize(width: 64, height: 44)
     static let revealTabOpacity = 0.94
+    /// A hiding rail fades and rises this far, quickly, and settles back without bounce.
+    static let toolsHideTravel: CGFloat = 8
+    static let toolsHideDuration = 0.18
+    static let toolsRevealDuration = 0.24
+    /// Fades that stand in for the tools' movement under Reduce Motion, and the reveal tab's fade in.
+    static let toolsFadeDuration = 0.15
+    /// Dock markers fade in as a drag starts.
+    static let dockMarkerFadeDuration = 0.12
     /// Opacity of the rail's content while writing is paused; the shell stays opaque.
     static let disabledOpacity = 0.55
     /// The same, under Increase Contrast.
@@ -346,7 +407,6 @@ enum NotebookTheme {
     static let presetDotSpacing: CGFloat = 6
     /// The selection mark inside a selected chip sits this far above the capsule's bottom.
     static let presetMarkInset: CGFloat = 3
-    static let presetCheckmarkSize: CGFloat = 11
     static let swatchCheckmarkSize: CGFloat = 12
     /// Inner ring that keeps pale or mid-tone swatches defined on the shell and the well.
     static let swatchRingOpacity = 0.22

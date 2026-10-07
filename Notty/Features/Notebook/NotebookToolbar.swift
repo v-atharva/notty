@@ -10,8 +10,12 @@ struct NotebookToolbarActions {
 
     var isEnabled: Bool { store.isToolbarAvailable }
 
-    /// The controls stay visible while writing is paused, but dimmed so they read as unavailable.
-    var contentOpacity: Double { isEnabled ? 1 : NotebookTheme.disabledOpacity }
+    /// The controls stay visible while writing is paused, but dimmed so they read as unavailable;
+    /// under Increase Contrast they dim less, so they stay legible.
+    func contentOpacity(for contrast: ColorSchemeContrast = .standard) -> Double {
+        guard !isEnabled else { return 1 }
+        return contrast == .increased ? NotebookTheme.disabledOpacityIncreased : NotebookTheme.disabledOpacity
+    }
 
     /// A paused toolbar cannot be dragged, so no drag preview starts that could never be stored.
     var dragGestureMask: GestureMask { isEnabled ? .all : .none }
@@ -81,6 +85,15 @@ struct NotebookToolbarActions {
         if store.toolbar.isCollapsed { setCollapsed(false) }
     }
 
+    /// What every stand-in for the rail does when tapped: the reveal tab, the handle a hidden
+    /// floating rail leaves and the user's collapsed handle. Tools the writing view hides are
+    /// asked back, and a collapsed handle expands, so one tap shows the whole rail. While writing
+    /// is paused only the request goes through, as the stored collapse cannot change then.
+    func showTools() {
+        if store.areToolsHidden { store.revealTools() }
+        setCollapsed(false)
+    }
+
     private func change(_ body: (inout EditorToolState) -> Void) {
         guard isEnabled else { return }
         store.update(body)
@@ -108,9 +121,12 @@ enum NotebookSwatchShelf {
         return known.first { $0.quantized == picked } ?? picked
     }
 
+    /// One swatch per visible colour. Colours stored before the picker rounded them can differ
+    /// from another swatch by less than one step; the earlier swatch, quick swatches first, stands
+    /// for both.
     static func displayed(custom: [EditorInkColor]) -> [EditorInkColor] {
         var seen = Set<EditorInkColor>()
-        return (EditorInkCatalog.swatches + custom).filter { seen.insert($0).inserted }
+        return (EditorInkCatalog.swatches + custom).filter { seen.insert($0.quantized).inserted }
     }
 }
 
@@ -159,23 +175,47 @@ enum NotebookToolbarRevealResponse: Equatable {
     case showInkRow
 }
 
+// MARK: - Composition
+
 /// Which parts of the toolbar show and how much room it takes, decided from the stored
-/// preferences and the window width.
+/// preferences, the text size and the window width.
 struct NotebookToolbarComposition: Equatable {
+    /// The least distance a toolbar keeps between neighbouring docks. A window too narrow for
+    /// that and every working control shares one dock slot instead.
+    static let minimumDockTravel: CGFloat = 150
+    /// The rail stops growing with the text size here and shows the Large Content Viewer instead.
+    static let textSizeLimit = DynamicTypeSize.xxLarge
+    /// A divider with its padding, laid out like a control.
+    static let dividerWidth = NotebookTheme.dividerThickness + 2 * NotebookTheme.dividerPadding
+    /// The grip column at the rail's leading edge. Floating, it holds the collapse key under the
+    /// grip, so the rail keeps its docked width.
+    static let gripColumnWidth = NotebookTheme.controlSize
+    /// Key edge to key edge across a divider.
+    static let groupGap = dividerWidth + 2 * NotebookTheme.itemSpacing
+
     /// At compact width the colour and width row folds into one current-ink chip.
     let foldsInkOptions: Bool
     let isFloating: Bool
     let isCollapsed: Bool
+    /// The colours on the shelf, quick swatches first.
+    let swatches: [EditorInkColor]
+    /// The text size the preset labels are set at, never above `textSizeLimit`.
+    let dynamicTypeSize: DynamicTypeSize
 
-    init(preferences: EditorToolbarPreferences, horizontalSizeClass: UserInterfaceSizeClass?) {
+    init(
+        preferences: EditorToolbarPreferences, horizontalSizeClass: UserInterfaceSizeClass?,
+        dynamicTypeSize: DynamicTypeSize = .large
+    ) {
         foldsInkOptions = horizontalSizeClass == .compact
         if case .floating = preferences.placement { isFloating = true } else { isFloating = false }
         isCollapsed = preferences.isCollapsed
+        swatches = NotebookSwatchShelf.displayed(custom: preferences.customSwatches)
+        self.dynamicTypeSize = min(dynamicTypeSize, Self.textSizeLimit)
     }
 
     var showsRevealHandle: Bool { isCollapsed }
-    /// The disabled placeholders that close the tool row; a collapsed toolbar shows none.
-    var upcomingTools: [NotebookUpcomingFeature] { isCollapsed ? [] : NotebookUpcomingFeature.placed(.toolStrip) }
+    /// A floating rail offers its collapse key: in the grip column under two rows, and after the
+    /// current-ink chip on the single compact row.
     var showsCollapseControl: Bool { isFloating && !isCollapsed }
     var rowCount: Int { foldsInkOptions ? 1 : 2 }
 
@@ -188,62 +228,304 @@ struct NotebookToolbarComposition: Equatable {
         CGFloat(rowCount) * NotebookTheme.rowHeight + CGFloat(rowCount - 1) * NotebookTheme.rowSpacing
     }
 
-    /// The least distance a toolbar keeps between neighbouring docks, by paging its planned
-    /// tools when the window is too narrow for them as well, so a move between docks is plain.
-    static let minimumDockTravel: CGFloat = 150
-
-    /// Room for the drag handle, the whole tool row and the controls beside it, so every tool and
-    /// planned-tool placeholder shows without paging.
-    var preferredWidth: CGFloat { width(withToolRow: toolRowWidth(includingUpcoming: true)) }
-
-    /// Room for the working tools alone, clear of the chevron and fade that stand for the planned
-    /// tools paging in after them.
-    var workingToolsWidth: CGFloat {
-        let chevron = NotebookTheme.controlSize + NotebookStripOverflow.fadeLength
-        return width(withToolRow: toolRowWidth(includingUpcoming: false) + chevron)
-    }
-
-    /// The preferred width where the window still leaves the docks `minimumDockTravel` apart,
-    /// otherwise narrower down to the working tools, and never wider than the window.
+    /// The size the toolbar takes: the collapsed handle, or the expanded rail.
     func toolbarSize(forHostWidth width: CGFloat) -> CGSize {
-        if showsRevealHandle { return NotebookTheme.collapsedHandleSize }
+        toolbarSize(of: rail(forHostWidth: width))
+    }
+
+    func toolbarSize(of rail: NotebookToolbarRail) -> CGSize {
+        showsRevealHandle ? NotebookTheme.collapsedHandleSize : rail.size
+    }
+
+    /// Where the toolbar rests for `placement`. Docks the window cannot tell apart all rest in
+    /// the centre, whichever is stored.
+    func frame(for placement: EditorToolbarPlacement, in usable: CGRect) -> CGRect {
+        frame(for: placement, rail: rail(forHostWidth: usable.width), in: usable)
+    }
+
+    /// The same, for a rail already laid out for `usable`.
+    func frame(for placement: EditorToolbarPlacement, rail: NotebookToolbarRail, in usable: CGRect) -> CGRect {
+        var shown = placement
+        if case .docked = placement, rail.docksShared { shown = .docked(.topCenter) }
+        return EditorToolbarLayout.frame(for: shown, size: toolbarSize(of: rail), in: usable)
+    }
+
+    /// The expanded rail for a window `width` wide. Floating and docked rails share it, so
+    /// docking and undocking never resize the rail.
+    ///
+    /// The rail grows to show every tool, including the planned ones, while the docks stay
+    /// `minimumDockTravel` apart. A window too narrow to keep them apart with every working
+    /// control showing shares one dock slot and lets the rail use its whole width. The planned
+    /// tools show as a whole group or not at all, and the rows scroll whatever does not fit. The
+    /// single compact row always scrolls on to the planned tools.
+    func rail(forHostWidth width: CGFloat) -> NotebookToolbarRail {
         let available = max(width - 2 * EditorToolbarLayout.margin, 0)
-        // Neighbouring docks lie half the spare width apart. A floating toolbar adds its collapse
-        // control on top, so it shows the same tools as a docked one.
-        let collapseControl = showsCollapseControl ? NotebookTheme.controlSize : 0
-        let keepsDocksApart = available - 2 * Self.minimumDockTravel + collapseControl
-        let toolbarWidth = min(preferredWidth, max(workingToolsWidth, keepsDocksApart), available)
-        return CGSize(width: toolbarWidth, height: expandedHeight)
+        let travel = available - 2 * Self.minimumDockTravel
+        let grip = Self.gripColumnWidth
+        let working = toolRow(includingUpcoming: false)
+        let complete = toolRow(includingUpcoming: true)
+        let ink = foldsInkOptions ? nil : inkRow(swatches)
+        let inkWidth = ink.map { $0.contentWidth + Self.inkCapWidth } ?? 0
+        let quickInkWidth = foldsInkOptions ? 0 : inkRow(EditorInkCatalog.swatches).contentWidth + Self.inkCapWidth
+        let core = grip + max(working.contentWidth + toolCapWidth, quickInkWidth)
+        let docksShared = core > travel
+        let limit = docksShared ? available : travel
+        var railWidth = min(grip + max(complete.contentWidth + toolCapWidth, inkWidth), limit)
+        let showsUpcoming = foldsInkOptions || grip + complete.contentWidth + toolCapWidth <= railWidth
+        if !showsUpcoming {
+            railWidth = min(grip + max(working.contentWidth + toolCapWidth, inkWidth), limit)
+        }
+        let tools = showsUpcoming ? complete : working
+        let rows = railWidth - grip
+        return NotebookToolbarRail(
+            size: CGSize(width: railWidth, height: expandedHeight),
+            docksShared: docksShared, showsUpcoming: showsUpcoming,
+            toolRow: tools, inkRow: ink,
+            toolRowOverflows: tools.contentWidth + toolCapWidth > rows + 0.5,
+            inkRowOverflows: ink != nil && inkWidth > rows + 0.5
+        )
     }
 
-    private func width(withToolRow toolRow: CGFloat) -> CGFloat {
-        var width = NotebookTheme.dragHandleHitSize.width + toolRow
-        if foldsInkOptions { width += NotebookTheme.currentInkChipWidth }
-        if showsCollapseControl { width += NotebookTheme.controlSize }
-        return width
+    /// Room after the tool strip: the trailing inset, or at compact width a divider, the
+    /// current-ink chip and any collapse key before it.
+    var toolCapWidth: CGFloat {
+        let inset = NotebookTheme.stripInsets.right
+        guard foldsInkOptions else { return inset }
+        let collapseKey = showsCollapseControl ? NotebookTheme.itemSpacing + NotebookTheme.controlSize : 0
+        return Self.groupGap + NotebookTheme.currentInkChipWidth + collapseKey + inset
     }
 
-    /// The tool row's content as `NotebookToolbar` lays it out: the ink families, eraser, lasso
-    /// and ruler, then the "Soon" mark and the placeholders, each a control wide, with a divider
-    /// before the ruler and one before the planned tools.
-    private func toolRowWidth(includingUpcoming: Bool) -> CGFloat {
-        let upcoming = includingUpcoming ? upcomingTools : []
-        let workingControls = EditorInkFamily.allCases.count + 3
-        let upcomingControls = upcoming.isEmpty ? 0 : upcoming.count + 1
-        let dividers = upcoming.isEmpty ? 1 : 2
-        let controls = workingControls + upcomingControls
-        return CGFloat(controls) * NotebookTheme.controlSize
-            + CGFloat(dividers) * NotebookTheme.dividerThickness
-            + CGFloat(controls + dividers - 1) * NotebookTheme.itemSpacing
-            + NotebookTheme.stripInsets.left + NotebookTheme.stripInsets.right
+    /// Room after the ink strip, which never scrolls: a divider, the custom colour well and the
+    /// trailing inset.
+    static let inkCapWidth = groupGap + NotebookTheme.controlSize + NotebookTheme.stripInsets.right
+
+    /// The ink families, then the eraser, lasso and ruler, then the widths, then the planned
+    /// tools after a caption. At compact width the widths live in the current-ink chip's panel.
+    func toolRow(includingUpcoming: Bool) -> NotebookStripRow {
+        var items: [NotebookStripItem] = EditorInkFamily.allCases.map { .family($0) }
+        items += [.divider(0), .eraser, .lasso, .ruler]
+        if !foldsInkOptions { items += [.divider(1)] + EditorWidthStep.allCases.map { .width($0) } }
+        if includingUpcoming {
+            items += [.divider(2), .upcomingLabel] + NotebookUpcomingFeature.placed(.toolStrip).map { .upcoming($0) }
+        }
+        return row(items)
     }
+
+    /// The presets lead, so they show at rest on every regular-width window; the swatches
+    /// follow, custom colours newest first.
+    func inkRow(_ swatches: [EditorInkColor]) -> NotebookStripRow {
+        row(EditorInkCatalog.presets.map { .preset($0) } + [.divider(0)] + swatches.map { .swatch($0) })
+    }
+
+    private func row(_ items: [NotebookStripItem]) -> NotebookStripRow {
+        NotebookStripRow(items: items) { item in
+            switch item {
+            case .divider: Self.dividerWidth
+            case let .preset(preset): NotebookPresetChip.width(for: preset, at: dynamicTypeSize)
+            default: NotebookTheme.controlSize
+            }
+        }
+    }
+}
+
+/// The expanded rail in one window width.
+struct NotebookToolbarRail: Equatable {
+    let size: CGSize
+    /// The window is too narrow to tell the docks apart, so every docked rail rests in the
+    /// centre and one dock slot stands for all three.
+    let docksShared: Bool
+    /// Whether the planned tools close the tool row: at regular width only where the whole group
+    /// fits, and always on the scrolling compact row.
+    let showsUpcoming: Bool
+    let toolRow: NotebookStripRow
+    /// Nil at compact width, where the ink controls fold into the current-ink chip.
+    let inkRow: NotebookStripRow?
+    /// A row wider than its strip keeps room for a trailing chevron that pages it.
+    let toolRowOverflows: Bool
+    let inkRowOverflows: Bool
+
+    /// The disabled placeholders that close the tool row.
+    var upcomingTools: [NotebookUpcomingFeature] {
+        showsUpcoming ? NotebookUpcomingFeature.placed(.toolStrip) : []
+    }
+}
+
+// MARK: - Strips
+
+/// A control, caption or divider in one of the rail's scrolling strips.
+enum NotebookStripItem: Hashable, Identifiable {
+    case family(EditorInkFamily)
+    case eraser
+    case lasso
+    case ruler
+    case width(EditorWidthStep)
+    /// The caption that introduces the planned tools.
+    case upcomingLabel
+    case upcoming(NotebookUpcomingFeature)
+    case preset(EditorInkPreset)
+    case swatch(EditorInkColor)
+    /// A hairline between groups, numbered to tell a row's dividers apart.
+    case divider(Int)
+
+    var id: String {
+        switch self {
+        case let .family(family): "family.\(family.rawValue)"
+        case .eraser: "eraser"
+        case .lasso: "lasso"
+        case .ruler: "ruler"
+        case let .width(step): "width.\(step.rawValue)"
+        case .upcomingLabel: "upcoming"
+        case let .upcoming(feature): "upcoming.\(feature.id)"
+        case let .preset(preset): "preset.\(preset.id)"
+        case let .swatch(color):
+            // The shelf keeps one swatch per quantized colour, so its 8-bit steps name each apart.
+            "swatch." + [color.red, color.green, color.blue, color.alpha].map { String(Int(($0 * 255).rounded())) }
+                .joined(separator: ".")
+        case let .divider(index): "divider.\(index)"
+        }
+    }
+
+    /// Dividers carry nothing to read or press, so they never count as a whole control shown.
+    var isDivider: Bool {
+        if case .divider = self { return true }
+        return false
+    }
+}
+
+/// One item of a strip at the width the strip lays it out at.
+struct NotebookStripSlot: Equatable, Identifiable {
+    let item: NotebookStripItem
+    /// Leading edge in the strip's content, after the leading inset.
+    let minX: CGFloat
+    let width: CGFloat
+
+    var id: String { item.id }
+    var maxX: CGFloat { minX + width }
+}
+
+/// A strip's content at fixed widths. The rail's width rule, the resting mask, snapping and
+/// paging all measure these slots, which are exactly what the strip lays out.
+struct NotebookStripRow: Equatable {
+    /// A control paged or snapped into view lands this far in, clear of the leading chevron.
+    static let leadingClearance = NotebookTheme.controlSize + NotebookTheme.itemSpacing
+
+    let slots: [NotebookStripSlot]
+    /// The leading inset and every slot with its spacing, which the rail's width rule counts. It
+    /// ends at the last control, since whatever follows the strip supplies the trailing inset.
+    let contentWidth: CGFloat
+
+    init(items: [NotebookStripItem], width: (NotebookStripItem) -> CGFloat) {
+        var x = NotebookTheme.stripInsets.left
+        var slots: [NotebookStripSlot] = []
+        for item in items {
+            if !slots.isEmpty { x += NotebookTheme.itemSpacing }
+            let slot = NotebookStripSlot(item: item, minX: x, width: width(item))
+            slots.append(slot)
+            x = slot.maxX
+        }
+        self.slots = slots
+        contentWidth = x
+    }
+
+    private var controls: [NotebookStripSlot] { slots.filter { !$0.item.isDivider } }
+
+    /// The furthest the strip scrolls: far enough to show its last control whole, then on to the
+    /// next stop where a control sits just clear of the leading chevron. The width left over
+    /// then shows after the last control instead of as a gap before the first.
+    func maximumOffset(containerWidth: CGFloat) -> CGFloat {
+        let end = contentWidth - containerWidth
+        guard end > 0.5 else { return 0 }
+        return controls.lazy.map { $0.minX - Self.leadingClearance }.first { $0 >= end - 0.5 } ?? end
+    }
+
+    /// Room after the last control that lets the strip reach its maximum offset. A strip that
+    /// fits needs none.
+    func trailingRoom(containerWidth: CGFloat) -> CGFloat {
+        let maximum = maximumOffset(containerWidth: containerWidth)
+        guard maximum > 0 else { return 0 }
+        return max(maximum + containerWidth - contentWidth, 0)
+    }
+
+    /// The width the strip scrolls through in a container, its trailing room included.
+    func scrollWidth(containerWidth: CGFloat) -> CGFloat {
+        contentWidth + trailingRoom(containerWidth: containerWidth)
+    }
+
+    /// Offsets the strip may rest at: either end, or with a control just clear of the leading
+    /// chevron.
+    func restingOffsets(containerWidth: CGFloat) -> [CGFloat] {
+        let maximum = maximumOffset(containerWidth: containerWidth)
+        let stops = controls.map { min(max($0.minX - Self.leadingClearance, 0), maximum) }
+        return Array(Set([0, maximum] + stops)).sorted()
+    }
+
+    /// The resting offset nearest to where a scroll would end.
+    func restingOffset(near proposed: CGFloat, containerWidth: CGFloat) -> CGFloat {
+        restingOffsets(containerWidth: containerWidth).min { abs($0 - proposed) < abs($1 - proposed) } ?? 0
+    }
+
+    /// Pages forward so that the first control not wholly shown becomes the first one shown.
+    func trailingPage(from overflow: NotebookStripOverflow) -> CGFloat {
+        let width = overflow.containerWidth
+        let maximum = maximumOffset(containerWidth: width)
+        guard let hidden = controls.first(where: { $0.maxX > overflow.offset + width + 0.5 }) else { return maximum }
+        let target = min(max(hidden.minX - Self.leadingClearance, 0), maximum)
+        if target > overflow.offset + 0.5 { return target }
+        return restingOffsets(containerWidth: width).first { $0 > overflow.offset + 0.5 } ?? maximum
+    }
+
+    /// Pages back so that the nearest control hidden past the leading edge becomes the last one
+    /// shown.
+    func leadingPage(from overflow: NotebookStripOverflow) -> CGFloat {
+        let width = overflow.containerWidth
+        guard let hidden = controls.last(where: { $0.minX < overflow.offset + Self.leadingClearance - 0.5 }) else {
+            return 0
+        }
+        let earlier = restingOffsets(containerWidth: width).filter { $0 < overflow.offset - 0.5 }
+        return earlier.first { $0 + width >= hidden.maxX - 0.5 } ?? earlier.last ?? 0
+    }
+
+    /// The offset that shows `id` first, just clear of the leading chevron.
+    func offset(showing id: NotebookStripItem.ID, containerWidth: CGFloat) -> CGFloat {
+        guard let slot = slots.first(where: { $0.id == id }) else { return 0 }
+        return min(max(slot.minX - Self.leadingClearance, 0), maximumOffset(containerWidth: containerWidth))
+    }
+
+    /// The part of the strip shown at rest: from the first whole control clear of the leading
+    /// chevron to the end of the last whole control, so no part of a control is ever drawn.
+    func restingMask(for overflow: NotebookStripOverflow) -> NotebookStripMask {
+        let offset = overflow.offset
+        let width = overflow.containerWidth
+        let start: CGFloat
+        if overflow.hidesLeading {
+            let first = controls.first { $0.minX >= offset + NotebookTheme.controlSize - 0.5 }
+            start = (first?.minX ?? offset + width) - offset
+        } else {
+            start = 0
+        }
+        let end: CGFloat
+        if overflow.hidesTrailing {
+            let last = controls.last { $0.maxX <= offset + width + 0.5 }
+            end = (last?.maxX ?? offset) - offset
+        } else {
+            end = width
+        }
+        return NotebookStripMask(start: min(max(start, 0), width), end: min(max(end, start), width))
+    }
+}
+
+/// The span of a strip drawn at rest, in the strip's own coordinates.
+struct NotebookStripMask: Equatable {
+    /// Length of the fade at an edge with hidden controls while the strip moves.
+    static let fadeLength: CGFloat = 16
+
+    let start: CGFloat
+    let end: CGFloat
 }
 
 /// How far a scrolling strip's tools extend past either edge.
 struct NotebookStripOverflow: Equatable {
     static let none = NotebookStripOverflow(offset: 0, contentWidth: 0, containerWidth: 0)
-    /// Length of the fade in front of the chevron at an edge with hidden tools.
-    static let fadeLength: CGFloat = 16
 
     let offset: CGFloat
     let contentWidth: CGFloat
@@ -266,10 +548,6 @@ struct NotebookStripOverflow: Equatable {
     var hidesTrailing: Bool { offset < maximumOffset - 1 }
     var hiddenEdges: HiddenEdges { HiddenEdges(leading: hidesLeading, trailing: hidesTrailing) }
 
-    /// Pages by most of the visible width, so a tool from the previous view stays in sight.
-    var nextTrailingOffset: CGFloat { min(offset + containerWidth * 0.75, maximumOffset) }
-    var nextLeadingOffset: CGFloat { max(offset - containerWidth * 0.75, 0) }
-
     private var maximumOffset: CGFloat { max(contentWidth - containerWidth, 0) }
 
     /// The part of the overflow the strip draws, which changes only when an edge is reached or left.
@@ -281,103 +559,339 @@ struct NotebookStripOverflow: Equatable {
     }
 }
 
-/// The strip's latest scroll geometry, kept out of view state so scrolling does not redraw
-/// the strip on every frame; only the chevrons read it, when tapped.
+/// The strip's latest scroll state, kept out of view state so scrolling does not redraw the
+/// strip on every frame. It publishes nothing; it is an observable object only so the strip
+/// creates it once rather than on every rebuild of the rail.
 @MainActor
-private final class NotebookStripGeometry {
+private final class NotebookStripGeometry: ObservableObject {
     var overflow = NotebookStripOverflow.none
+    var isMoving = false
 }
 
-/// The ivory tool rail: ink families, eraser, lasso, ruler and the disabled placeholders for
-/// planned tools in the first row; widths, colours and presets in the second. The drag handle
-/// comes from the host, which owns placement.
+/// Lets a flicked strip come to rest at an end or with a whole control just clear of the
+/// leading chevron.
+private struct NotebookStripSnapping: ScrollTargetBehavior {
+    let row: NotebookStripRow
+
+    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        target.rect.origin.x = row.restingOffset(near: target.rect.minX, containerWidth: context.containerSize.width)
+    }
+}
+
+/// A horizontally scrolling row of controls with hidden indicators. At rest only whole
+/// controls show; while it moves its edges fade instead. Separate chevrons page through
+/// controls hidden past either edge: the leading one over the strip's start, the trailing one
+/// in a slot after it that the row keeps while it is too wide.
 @MainActor
-struct NotebookToolbar<Handle: View>: View {
+private struct NotebookToolStrip<Control: View>: View {
+    let label: String
+    let row: NotebookStripRow
+    let reservesTrailingChevron: Bool
+    /// Each change scrolls `revealTarget` into view just clear of the leading edge.
+    var reveals: UInt64 = 0
+    var revealTarget: NotebookStripItem.ID?
+    @ViewBuilder let control: (NotebookStripItem) -> Control
+    @State private var position = ScrollPosition(edge: .leading)
+    @StateObject private var geometry = NotebookStripGeometry()
+    /// Changes only when the strip is resized, which sets its trailing room.
+    @State private var containerWidth: CGFloat = 0
+    @State private var hiddenEdges = NotebookStripOverflow.HiddenEdges.none
+    /// Nil until the strip is first measured, when it shows in full.
+    @State private var restingMask: NotebookStripMask?
+    @State private var isMoving = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ScrollView(.horizontal) {
+                HStack(spacing: NotebookTheme.itemSpacing) {
+                    ForEach(row.slots) { slot in
+                        control(slot.item)
+                            .frame(width: slot.width, height: NotebookTheme.controlSize)
+                    }
+                }
+                .padding(.leading, NotebookTheme.stripInsets.left)
+                .padding(.trailing, row.trailingRoom(containerWidth: containerWidth))
+                .padding(.vertical, NotebookTheme.stripInsets.top)
+            }
+            .scrollIndicators(.hidden)
+            // The system's edge effect would blur the shell's top edge wherever the rail meets
+            // the top of the window; the strip draws its own edges.
+            .scrollEdgeEffectHidden()
+            .scrollPosition($position)
+            .scrollTargetBehavior(NotebookStripSnapping(row: row))
+            .onScrollGeometryChange(for: NotebookStripOverflow.self) { geometry in
+                NotebookStripOverflow(geometry)
+            } action: { _, value in
+                geometry.overflow = value
+                if containerWidth != value.containerWidth { containerWidth = value.containerWidth }
+                if hiddenEdges != value.hiddenEdges { hiddenEdges = value.hiddenEdges }
+                // A programmatic scroll without animation, or a resize, settles without a phase change.
+                if !geometry.isMoving { updateRestingMask() }
+            }
+            .onScrollPhaseChange { _, phase in
+                let moving = phase != .idle
+                geometry.isMoving = moving
+                if !moving { updateRestingMask() }
+                guard moving != isMoving else { return }
+                withAnimation(reduceMotion ? nil : .linear(duration: NotebookTheme.stripFadeDuration)) {
+                    isMoving = moving
+                }
+            }
+            .mask { mask }
+            .overlay(alignment: .leading) {
+                if hiddenEdges.leading {
+                    chevron("chevron.left", label: "Show previous \(label.lowercased())") { row.leadingPage(from: $0) }
+                }
+            }
+            if reservesTrailingChevron {
+                ZStack {
+                    if hiddenEdges.trailing {
+                        chevron("chevron.right", label: "Show more \(label.lowercased())") { row.trailingPage(from: $0) }
+                    }
+                }
+                .frame(width: NotebookTheme.controlSize)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(label)
+        .onChange(of: reveals) {
+            guard let revealTarget else { return }
+            let target = row.offset(showing: revealTarget, containerWidth: geometry.overflow.containerWidth)
+            withAnimation(pageAnimation) { position.scrollTo(x: target) }
+        }
+    }
+
+    private var pageAnimation: Animation? {
+        reduceMotion ? nil : .easeOut(duration: NotebookTheme.stripPageDuration)
+    }
+
+    private func updateRestingMask() {
+        let mask = row.restingMask(for: geometry.overflow)
+        if restingMask != mask { restingMask = mask }
+    }
+
+    /// At rest a hard edge just past the last whole control, and clear under the leading
+    /// chevron up to the first whole one; while moving, a short fade at each edge with hidden
+    /// controls. The two cross-fade as the strip starts and settles.
+    private var mask: some View {
+        ZStack(alignment: .leading) {
+            Group {
+                if let restingMask {
+                    Color.black
+                        .frame(width: max(restingMask.end - restingMask.start, 0))
+                        .offset(x: restingMask.start)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Color.black
+                }
+            }
+            .opacity(isMoving ? 0 : 1)
+            HStack(spacing: 0) {
+                if hiddenEdges.leading {
+                    Color.clear.frame(width: NotebookTheme.controlSize)
+                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: NotebookStripMask.fadeLength)
+                }
+                Color.black
+                if hiddenEdges.trailing {
+                    LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: NotebookStripMask.fadeLength)
+                }
+            }
+            .opacity(isMoving ? 1 : 0)
+        }
+    }
+
+    private func chevron(
+        _ symbol: String, label: String, offset: @escaping (NotebookStripOverflow) -> CGFloat
+    ) -> some View {
+        Button {
+            withAnimation(pageAnimation) { position.scrollTo(x: offset(geometry.overflow)) }
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: NotebookTheme.chevronSize, weight: .semibold))
+                .modifier(NotebookKeyForeground())
+                .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NotebookKeyStyle())
+        .accessibilityLabel(label)
+        .accessibilityShowsLargeContentViewer {
+            Label(label, systemImage: symbol)
+        }
+    }
+}
+
+// MARK: - Rail
+
+/// The ivory tool rail on one shell. The first row holds the ink families, the eraser, lasso
+/// and ruler, the widths and the planned tools; the second the presets and colours, with the
+/// custom colour well fixed at its end. The grip column at the leading edge comes from the
+/// host, which owns placement; a floating rail adds its collapse key under the grip, or on the
+/// single compact row after the current-ink chip.
+@MainActor
+struct NotebookToolbar<Grip: View>: View {
     @ObservedObject var store: NotebookSceneToolStore
     let composition: NotebookToolbarComposition
+    let rail: NotebookToolbarRail
     let collapse: () -> Void
-    private let handle: Handle
+    private let grip: Grip
     @State private var showsInkPanel = false
     @State private var inkRowReveals: UInt64 = 0
     @State private var highlightsColors = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var contrast
 
     init(
-        store: NotebookSceneToolStore, composition: NotebookToolbarComposition,
-        collapse: @escaping () -> Void, @ViewBuilder handle: () -> Handle
+        store: NotebookSceneToolStore, composition: NotebookToolbarComposition, rail: NotebookToolbarRail,
+        collapse: @escaping () -> Void, @ViewBuilder grip: () -> Grip
     ) {
         self.store = store
         self.composition = composition
+        self.rail = rail
         self.collapse = collapse
-        self.handle = handle()
+        self.grip = grip()
     }
 
     private var actions: NotebookToolbarActions { NotebookToolbarActions(store: store) }
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
+        let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
         HStack(spacing: 0) {
-            handle
+            gripColumn
+                .frame(width: NotebookToolbarComposition.gripColumnWidth)
             VStack(spacing: 0) {
-                NotebookToolStrip(label: "Tools") { toolRow }
+                toolRow(marks)
                     .frame(height: NotebookTheme.rowHeight)
-                if !composition.foldsInkOptions {
-                    NotebookToolbarDivider(axis: .horizontal)
+                if let inkRow = rail.inkRow {
+                    NotebookChromeDivider(axis: .horizontal)
                         .frame(height: NotebookTheme.rowSpacing)
-                    NotebookToolStrip(
-                        label: "Ink", reveals: inkRowReveals, revealTarget: NotebookInkControls.colorsID
-                    ) {
-                        NotebookInkControls(store: store, layout: .strip, highlightsColors: highlightsColors)
+                    HStack(spacing: 0) {
+                        NotebookToolStrip(
+                            label: "Ink", row: inkRow, reservesTrailingChevron: rail.inkRowOverflows,
+                            reveals: inkRowReveals, revealTarget: firstSwatchID(in: inkRow)
+                        ) { control($0, marks: marks) }
+                        HStack(spacing: NotebookTheme.itemSpacing) {
+                            NotebookChromeDivider(axis: .vertical)
+                            NotebookCustomColorWell(
+                                store: store, isSelected: marks.marksCustomColor, isHighlighted: highlightsColors
+                            )
+                        }
+                        .padding(.leading, NotebookTheme.itemSpacing)
+                        .padding(.trailing, NotebookTheme.stripInsets.right)
                     }
                     .frame(height: NotebookTheme.rowHeight)
                 }
             }
-            if composition.foldsInkOptions {
-                NotebookCurrentInkChip(store: store, showsOptions: $showsInkPanel)
-            }
-            if composition.showsCollapseControl {
-                Button(action: collapse) {
-                    NotebookToolGlyph(symbol: "arrow.down.right.and.arrow.up.left", isSelected: false)
-                }
-                .buttonStyle(NotebookKeyStyle())
-                .accessibilityLabel("Hide tools")
-            }
         }
-        .opacity(actions.contentOpacity)
+        .opacity(actions.contentOpacity(for: contrast))
         .clipShape(shape)
-        .background { NotebookToolbarShell() }
+        .background { NotebookPanelShell() }
         .contentShape(shape)
         .disabled(!actions.isEnabled)
-        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+        .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Drawing tools")
         .onChange(of: store.revealRequest) { respondToPencilReveal() }
         .task(id: inkRowReveals) { await highlightColors() }
     }
 
-    @ViewBuilder private var toolRow: some View {
-        ForEach(EditorInkFamily.allCases, id: \.self) { family in
-            NotebookToolButton(
-                title: family.title, symbol: family.symbol, isSelected: store.tool.kind == .ink(family)
-            ) {
+    /// Docked, the whole column is the grip. Floating over two rows, the grip takes the top half
+    /// and the collapse key the bottom, so the rail keeps its docked width.
+    @ViewBuilder private var gripColumn: some View {
+        if composition.showsCollapseControl && composition.rowCount > 1 {
+            VStack(spacing: 0) {
+                grip
+                collapseKey
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .overlay {
+                Rectangle()
+                    .fill(NotebookTheme.divider.color)
+                    .frame(width: NotebookTheme.gripSeparatorLength, height: NotebookTheme.dividerThickness)
+                    .accessibilityHidden(true)
+            }
+        } else {
+            grip
+        }
+    }
+
+    private var collapseKey: some View {
+        let symbol = "arrow.down.right.and.arrow.up.left"
+        return Button(action: collapse) {
+            Image(systemName: symbol)
+                .font(.system(size: NotebookTheme.handleGlyphSize))
+                .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NotebookKeyStyle())
+        .accessibilityLabel("Hide tools")
+        .accessibilityShowsLargeContentViewer {
+            Label("Hide tools", systemImage: symbol)
+        }
+    }
+
+    private func toolRow(_ marks: NotebookInkMarks) -> some View {
+        HStack(spacing: 0) {
+            NotebookToolStrip(label: "Tools", row: rail.toolRow, reservesTrailingChevron: rail.toolRowOverflows) {
+                control($0, marks: marks)
+            }
+            if composition.foldsInkOptions {
+                HStack(spacing: NotebookTheme.itemSpacing) {
+                    NotebookChromeDivider(axis: .vertical)
+                    NotebookCurrentInkChip(store: store, showsOptions: $showsInkPanel)
+                    if composition.showsCollapseControl { collapseKey }
+                }
+                .padding(.leading, NotebookTheme.itemSpacing)
+                .padding(.trailing, NotebookTheme.stripInsets.right)
+            } else {
+                Color.clear.frame(width: NotebookTheme.stripInsets.right)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func control(_ item: NotebookStripItem, marks: NotebookInkMarks) -> some View {
+        switch item {
+        case let .family(family):
+            NotebookToolButton(title: family.title, symbol: family.symbol, isSelected: store.tool.kind == .ink(family)) {
                 actions.select(.ink(family))
             }
-        }
-        NotebookEraserButton(kind: store.tool.kind, actions: actions)
-        NotebookToolButton(title: "Lasso", symbol: "lasso", isSelected: store.tool.kind == .lasso) {
-            actions.select(.lasso)
-        }
-        NotebookToolbarDivider(axis: .vertical)
-        NotebookToolButton(title: "Ruler", symbol: "ruler", isSelected: store.tool.isRulerActive, isToggle: true) {
-            actions.toggleRuler()
-        }
-        if !composition.upcomingTools.isEmpty {
-            NotebookToolbarDivider(axis: .vertical)
-            NotebookUpcomingMark()
-            ForEach(composition.upcomingTools) { feature in
-                NotebookUpcomingToolButton(feature: feature)
+        case .eraser:
+            NotebookEraserButton(kind: store.tool.kind, actions: actions)
+        case .lasso:
+            NotebookToolButton(title: "Lasso", symbol: "lasso", isSelected: store.tool.kind == .lasso) {
+                actions.select(.lasso)
             }
+        case .ruler:
+            NotebookToolButton(title: "Ruler", symbol: "ruler", isSelected: store.tool.isRulerActive, isToggle: true) {
+                actions.toggleRuler()
+            }
+        case let .width(step):
+            NotebookWidthButton(step: step, isSelected: marks.width == step) {
+                actions.selectWidth(step)
+            }
+        case .upcomingLabel:
+            NotebookUpcomingMark()
+        case let .upcoming(feature):
+            NotebookUpcomingToolButton(feature: feature)
+        case let .preset(preset):
+            NotebookPresetChip(preset: preset, isSelected: marks.presetID == preset.id) {
+                actions.apply(preset)
+            }
+        case let .swatch(color):
+            NotebookSwatchButton(color: color, isSelected: marks.color == color, isHighlighted: highlightsColors) {
+                actions.selectColor(color)
+            }
+        case .divider:
+            NotebookChromeDivider(axis: .vertical)
         }
+    }
+
+    private func firstSwatchID(in row: NotebookStripRow) -> NotebookStripItem.ID? {
+        row.slots.first { if case .swatch = $0.item { true } else { false } }?.id
     }
 
     /// The store only counts gestures while the toolbar is available, so every count deserves an answer.
@@ -403,102 +917,63 @@ struct NotebookToolbar<Handle: View>: View {
     }
 }
 
-/// Widths, swatches, the custom colour well and presets, laid out in a strip or a panel.
-/// The panel is presented in a popover, outside the toolbar's environment, so it disables
-/// itself while writing is paused.
+/// The presets, colours and widths in the compact current-ink chip's popover. It is presented
+/// outside the toolbar's environment, so it disables itself while writing is paused.
 @MainActor
 struct NotebookInkControls: View {
-    enum Layout {
-        case strip
-        case panel
-    }
-
-    /// Identifies the colour group, which an Apple Pencil reveal scrolls into view.
-    static let colorsID = "colors"
     /// How long the colours stay highlighted after an Apple Pencil gesture asks for them.
     static let highlightDuration = Duration.seconds(1.2)
 
     @ObservedObject var store: NotebookSceneToolStore
-    let layout: Layout
-    var highlightsColors = false
 
     private var actions: NotebookToolbarActions { NotebookToolbarActions(store: store) }
-    private var marks: NotebookInkMarks { NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches) }
 
     var body: some View {
-        let marks = marks
-        switch layout {
-        case .strip:
-            // Widths lead because the colour group grows with custom colours; presets, the
-            // widest and least frequent choice, come last.
-            widths(marks)
-            NotebookToolbarDivider(axis: .vertical)
-            HStack(spacing: NotebookTheme.itemSpacing) { swatches(marks) }
-                .background {
-                    if highlightsColors {
-                        RoundedRectangle(cornerRadius: NotebookTheme.selectedWellCornerRadius, style: .continuous)
-                            .fill(NotebookTheme.selectedWell.color.opacity(NotebookTheme.pressedWellOpacity))
-                            .accessibilityHidden(true)
+        let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
+        VStack(alignment: .leading, spacing: NotebookTheme.inkPanelSectionSpacing) {
+            section("Presets") {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: NotebookTheme.presetColumnMinimum), alignment: .leading)],
+                    spacing: 0
+                ) {
+                    ForEach(EditorInkCatalog.presets) { preset in
+                        NotebookPresetChip(preset: preset, isSelected: marks.presetID == preset.id) {
+                            actions.apply(preset)
+                        }
                     }
                 }
-                .id(Self.colorsID)
-            NotebookToolbarDivider(axis: .vertical)
-            presets(marks)
-        case .panel:
-            VStack(alignment: .leading, spacing: NotebookTheme.inkPanelSectionSpacing) {
-                section("Presets") {
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: NotebookTheme.presetColumnMinimum), alignment: .leading)],
-                        spacing: 0
-                    ) { presets(marks) }
-                }
-                section("Colors") {
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: NotebookTheme.controlSize), spacing: NotebookTheme.rowSpacing)],
-                        spacing: NotebookTheme.rowSpacing
-                    ) { swatches(marks) }
-                }
-                section("Width") {
-                    HStack(spacing: NotebookTheme.itemSpacing) { widths(marks) }
+            }
+            section("Colors") {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: NotebookTheme.controlSize), spacing: NotebookTheme.rowSpacing)],
+                    spacing: NotebookTheme.rowSpacing
+                ) {
+                    ForEach(NotebookSwatchShelf.displayed(custom: store.toolbar.customSwatches), id: \.self) { color in
+                        NotebookSwatchButton(color: color, isSelected: marks.color == color) {
+                            actions.selectColor(color)
+                        }
+                    }
+                    NotebookCustomColorWell(store: store, isSelected: marks.marksCustomColor)
                 }
             }
-            .padding(NotebookTheme.inkPanelPadding)
-            .frame(width: NotebookTheme.inkPanelWidth)
-            .disabled(!store.isToolbarAvailable)
-        }
-    }
-
-    @ViewBuilder private func presets(_ marks: NotebookInkMarks) -> some View {
-        ForEach(EditorInkCatalog.presets) { preset in
-            NotebookPresetChip(preset: preset, isSelected: marks.presetID == preset.id) {
-                actions.apply(preset)
+            section("Width") {
+                HStack(spacing: NotebookTheme.itemSpacing) {
+                    ForEach(EditorWidthStep.allCases, id: \.self) { step in
+                        NotebookWidthButton(step: step, isSelected: marks.width == step) {
+                            actions.selectWidth(step)
+                        }
+                    }
+                }
             }
         }
-    }
-
-    @ViewBuilder private func swatches(_ marks: NotebookInkMarks) -> some View {
-        ForEach(NotebookSwatchShelf.displayed(custom: store.toolbar.customSwatches), id: \.self) { color in
-            NotebookSwatchButton(color: color, isSelected: marks.color == color) {
-                actions.selectColor(color)
-            }
-        }
-        NotebookCustomColorWell(store: store, isSelected: marks.marksCustomColor)
-    }
-
-    @ViewBuilder private func widths(_ marks: NotebookInkMarks) -> some View {
-        ForEach(EditorWidthStep.allCases, id: \.self) { step in
-            NotebookWidthButton(step: step, isSelected: marks.width == step) {
-                actions.selectWidth(step)
-            }
-        }
+        .padding(NotebookTheme.inkPanelPadding)
+        .frame(width: NotebookTheme.inkPanelWidth)
+        .disabled(!store.isToolbarAvailable)
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: NotebookTheme.itemSpacing) {
-            Text(title)
-                .font(NotebookTheme.controlLabel.font)
-                .foregroundStyle(NotebookTheme.glyph.color)
-                .accessibilityAddTraits(.isHeader)
+            NotebookSectionLabel(title)
             content()
         }
     }
@@ -515,20 +990,23 @@ private struct NotebookCurrentInkChip: View {
             HStack(spacing: NotebookTheme.itemSpacing) {
                 Circle()
                     .fill(store.tool.color.swiftUIColor)
-                    .overlay(NotebookSwatchOutline())
+                    .overlay(NotebookSwatchRing(color: store.tool.color))
                     .frame(width: NotebookTheme.currentInkSwatchDiameter, height: NotebookTheme.currentInkSwatchDiameter)
                 Circle()
                     .modifier(NotebookKeyForeground())
                     .frame(width: store.tool.widthStep.dotDiameter, height: store.tool.widthStep.dotDiameter)
             }
-            .frame(minWidth: NotebookTheme.currentInkChipWidth, minHeight: NotebookTheme.controlSize)
+            .frame(width: NotebookTheme.currentInkChipWidth, height: NotebookTheme.controlSize)
             .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle())
         .accessibilityLabel("Ink options")
         .accessibilityValue("\(store.tool.color.accessibilityName), \(store.tool.widthStep.title) width")
+        .accessibilityShowsLargeContentViewer {
+            Label("Ink options", systemImage: "paintpalette")
+        }
         .popover(isPresented: $showsOptions) {
-            NotebookInkControls(store: store, layout: .panel)
+            NotebookInkControls(store: store)
                 .presentationCompactAdaptation(.popover)
         }
         .onChange(of: store.isToolbarAvailable) { _, available in
@@ -537,91 +1015,7 @@ private struct NotebookCurrentInkChip: View {
     }
 }
 
-/// A horizontally scrolling row with hidden indicators, faded edges and chevrons that page
-/// through tools hidden past either edge.
-@MainActor
-private struct NotebookToolStrip<Content: View>: View {
-    let label: String
-    /// Each change scrolls `revealTarget` to the leading edge.
-    var reveals: UInt64 = 0
-    var revealTarget: String?
-    @ViewBuilder let content: Content
-    @State private var position = ScrollPosition(edge: .leading)
-    @State private var geometry = NotebookStripGeometry()
-    @State private var hiddenEdges = NotebookStripOverflow.HiddenEdges.none
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: NotebookTheme.itemSpacing) { content }
-                .scrollTargetLayout()
-                .padding(NotebookTheme.stripEdgeInsets)
-        }
-        .scrollIndicators(.hidden)
-        .scrollPosition($position)
-        .onScrollGeometryChange(for: NotebookStripOverflow.self) { geometry in
-            NotebookStripOverflow(geometry)
-        } action: { _, value in
-            geometry.overflow = value
-            if hiddenEdges != value.hiddenEdges { hiddenEdges = value.hiddenEdges }
-        }
-        .mask { fade }
-        .overlay(alignment: .leading) {
-            if hiddenEdges.leading {
-                chevron("chevron.left", label: "Show previous \(label.lowercased())") { $0.nextLeadingOffset }
-            }
-        }
-        .overlay(alignment: .trailing) {
-            if hiddenEdges.trailing {
-                chevron("chevron.right", label: "Show more \(label.lowercased())") { $0.nextTrailingOffset }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(label)
-        .onChange(of: reveals) {
-            guard let revealTarget else { return }
-            withAnimation(pageAnimation) { position.scrollTo(id: revealTarget, anchor: .leading) }
-        }
-    }
-
-    private var pageAnimation: Animation? {
-        reduceMotion ? nil : .easeOut(duration: NotebookTheme.stripPageDuration)
-    }
-
-    /// Clears the strip entirely under a chevron, so no tool shows through it as a composite
-    /// glyph, and fades just before it so the strip still reads as continuing.
-    private var fade: some View {
-        HStack(spacing: 0) {
-            if hiddenEdges.leading {
-                Color.clear.frame(width: NotebookTheme.controlSize)
-                LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                    .frame(width: NotebookStripOverflow.fadeLength)
-            }
-            Color.black
-            if hiddenEdges.trailing {
-                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
-                    .frame(width: NotebookStripOverflow.fadeLength)
-                Color.clear.frame(width: NotebookTheme.controlSize)
-            }
-        }
-    }
-
-    private func chevron(
-        _ symbol: String, label: String, offset: @escaping (NotebookStripOverflow) -> CGFloat
-    ) -> some View {
-        Button {
-            withAnimation(pageAnimation) { position.scrollTo(x: offset(geometry.overflow)) }
-        } label: {
-            Image(systemName: symbol)
-                .font(.system(size: NotebookTheme.chevronSize, weight: .semibold))
-                .modifier(NotebookKeyForeground())
-                .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NotebookKeyStyle())
-        .accessibilityLabel(label)
-    }
-}
+// MARK: - Controls
 
 @MainActor
 private struct NotebookToolButton: View {
@@ -662,14 +1056,14 @@ private struct NotebookEraserButton: View {
         return nil
     }
 
+    private var symbol: String { selectedMode == .bitmap ? "eraser.line.dashed" : "eraser" }
+
     var body: some View {
         Menu {
             modeButton("Object eraser", mode: .vector)
             modeButton("Pixel eraser", mode: .bitmap)
         } label: {
-            NotebookToolGlyph(
-                symbol: selectedMode == .bitmap ? "eraser.line.dashed" : "eraser", isSelected: selectedMode != nil
-            )
+            NotebookToolGlyph(symbol: symbol, isSelected: selectedMode != nil)
         } primaryAction: {
             actions.selectEraser()
         }
@@ -683,6 +1077,9 @@ private struct NotebookEraserButton: View {
         .accessibilityValue(selectedMode.map { $0 == .vector ? "Object" : "Pixel" } ?? "")
         .accessibilityHint("Touch and hold to choose object or pixel erasing.")
         .accessibilityAddTraits(selectedMode == nil ? [] : .isSelected)
+        .accessibilityShowsLargeContentViewer {
+            Label("Eraser", systemImage: symbol)
+        }
     }
 
     private func modeButton(_ title: String, mode: EditorEraserMode) -> some View {
@@ -698,32 +1095,96 @@ private struct NotebookEraserButton: View {
     }
 }
 
+/// A preset as a short labelled capsule: a recessed well and a mark under the label when
+/// selected, an outline otherwise. The full name stays its accessibility label, so it never
+/// collides with a swatch's name.
 @MainActor
 struct NotebookPresetChip: View {
+    /// Short names that fit a chip, keyed by preset.
+    nonisolated private static let shortTitles = [
+        "sepia-fountain": "Sepia",
+        "charcoal-monoline": "Charcoal",
+        "graphite-pencil": "Graphite",
+        "ochre-marker": "Ochre",
+    ]
+
+    nonisolated static func shortTitle(for preset: EditorInkPreset) -> String {
+        shortTitles[preset.id] ?? preset.name
+    }
+
+    /// The chip's width at a text size, which the rail's width rule counts and the chip lays out.
+    nonisolated static func width(for preset: EditorInkPreset, at size: DynamicTypeSize) -> CGFloat {
+        2 * NotebookTheme.presetChipPadding + NotebookTheme.presetDotDiameter + NotebookTheme.presetDotSpacing
+            + labelWidth(shortTitle(for: preset), at: size)
+    }
+
+    /// The label's width in the control label face at a text size, rounded up to whole points.
+    nonisolated static func labelWidth(_ text: String, at size: DynamicTypeSize) -> CGFloat {
+        let size = min(size, NotebookToolbarComposition.textSizeLimit)
+        return measuredLabelWidths[size]?[text] ?? measureLabel(text, at: size)
+    }
+
+    /// Every short title at every text size the rail is set at, measured once, as the rail's
+    /// width rule asks for them on each layout.
+    nonisolated private static let measuredLabelWidths: [DynamicTypeSize: [String: CGFloat]] = {
+        let titles = EditorInkCatalog.presets.map(shortTitle)
+        let sizes = DynamicTypeSize.allCases.filter { $0 <= NotebookToolbarComposition.textSizeLimit }
+        return Dictionary(uniqueKeysWithValues: sizes.map { size in
+            (size, Dictionary(uniqueKeysWithValues: titles.map { ($0, measureLabel($0, at: size)) }))
+        })
+    }()
+
+    /// The face takes its text style's size at the text size, as SwiftUI sets it.
+    nonisolated private static func measureLabel(_ text: String, at size: DynamicTypeSize) -> CGFloat {
+        let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
+        let style = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits)
+        let font = UIFont.systemFont(ofSize: style.pointSize, weight: .medium)
+        return (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+    }
+
     let preset: EditorInkPreset
     let isSelected: Bool
     let action: () -> Void
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
+        let title = Self.shortTitle(for: preset)
         Button(action: action) {
-            HStack(spacing: NotebookTheme.itemSpacing) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: NotebookTheme.presetCheckmarkSize, weight: .bold))
-                    .opacity(isSelected ? 1 : 0)
-                    .accessibilityHidden(true)
+            HStack(spacing: NotebookTheme.presetDotSpacing) {
                 Circle()
                     .fill(preset.color.swiftUIColor)
+                    .overlay {
+                        Circle().strokeBorder(
+                            NotebookTheme.shadowTone.color.opacity(NotebookTheme.swatchRingOpacity),
+                            lineWidth: NotebookTheme.shellBorderWidth
+                        )
+                    }
                     .frame(width: NotebookTheme.presetDotDiameter, height: NotebookTheme.presetDotDiameter)
-                Text(preset.name)
+                Text(title)
                     .font(NotebookTheme.controlLabel.font)
+                    // Capped here as well as on the rail, so the label never outgrows the width
+                    // measured for it, as in the compact ink panel presented outside the rail.
+                    .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
                     .lineLimit(1)
                     .fixedSize()
+                    .frame(width: Self.labelWidth(title, at: dynamicTypeSize), height: NotebookTheme.presetChipHeight)
+                    .overlay(alignment: .bottom) {
+                        if isSelected {
+                            Capsule()
+                                .frame(width: NotebookTheme.selectionMarkSize.width, height: NotebookTheme.selectionMarkSize.height)
+                                .padding(.bottom, NotebookTheme.presetMarkInset)
+                                .accessibilityHidden(true)
+                        }
+                    }
             }
             .modifier(NotebookKeyForeground())
             .padding(.horizontal, NotebookTheme.presetChipPadding)
             .frame(height: NotebookTheme.presetChipHeight)
             .background {
-                if !isSelected {
+                // Outlined wherever the key draws no well, so a selected chip keeps its capsule
+                // while writing is paused.
+                if !(isSelected && isEnabled) {
                     Capsule().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
                 }
             }
@@ -731,8 +1192,12 @@ struct NotebookPresetChip: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected, shape: .capsule))
+        .help(preset.name)
         .accessibilityLabel("\(preset.name) preset")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityShowsLargeContentViewer {
+            Label(preset.name, systemImage: "circle.fill")
+        }
     }
 }
 
@@ -740,60 +1205,113 @@ struct NotebookPresetChip: View {
 private struct NotebookSwatchButton: View {
     let color: EditorInkColor
     let isSelected: Bool
+    var isHighlighted = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Circle()
                 .fill(color.swiftUIColor)
-                .overlay(NotebookSwatchOutline())
+                .overlay(NotebookSwatchRing(color: color))
                 .frame(width: NotebookTheme.swatchDiameter, height: NotebookTheme.swatchDiameter)
                 .overlay {
                     if isSelected { NotebookSwatchCheckmark(color: color) }
                 }
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                .background {
+                    if isHighlighted { NotebookColorHighlight() }
+                }
                 .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel(color.accessibilityName)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityShowsLargeContentViewer {
+            Label(color.accessibilityName, systemImage: "circle.fill")
+        }
+    }
+}
+
+/// Marks the colours an Apple Pencil gesture asked to see.
+private struct NotebookColorHighlight: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: NotebookTheme.selectedWellCornerRadius, style: .continuous)
+            .fill(NotebookTheme.selectedWell.color.opacity(NotebookTheme.pressedWellOpacity))
+            .accessibilityHidden(true)
+    }
+}
+
+/// The hairline inside a swatch that keeps it defined on the shell and in a well. A colour too
+/// faint to stand out from the ink row by itself gets a dark ring instead.
+private struct NotebookSwatchRing: View {
+    let color: EditorInkColor
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        Circle().strokeBorder(tone, lineWidth: NotebookTheme.shellBorderWidth)
+    }
+
+    private var tone: Color {
+        if contrast == .increased { return NotebookTheme.panelLowerEdge.color }
+        if NotebookSwatchContrast.isFaint(color) { return NotebookTheme.glyphSecondary.color }
+        return NotebookTheme.shadowTone.color.opacity(NotebookTheme.swatchRingOpacity)
     }
 }
 
 /// The checkmark on a selected colour, dark on light colours and light on dark ones.
 private struct NotebookSwatchCheckmark: View {
     let color: EditorInkColor
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         Image(systemName: "checkmark")
             .font(.system(size: NotebookTheme.swatchCheckmarkSize, weight: .bold))
-            .foregroundStyle(tone.color)
+            .foregroundStyle(NotebookSwatchContrast.mark(for: color, contrast: contrast).color)
             .accessibilityHidden(true)
-    }
-
-    private var tone: NotebookTheme.Tone {
-        NotebookSwatchContrast.mark(for: color)
     }
 }
 
-/// Chooses a readable mark against the actual selected swatch, including transparent ink.
+/// Readable marks and rings for swatches, measured against what is actually behind them.
 enum NotebookSwatchContrast {
-    static func background(for color: EditorInkColor) -> EditorInkColor {
-        let well = NotebookSwatchShelf.color(from: NotebookTheme.selectedWell.uiColor)
-        let alpha = color.alpha
+    /// The ink row's shell at its centre, where the swatches sit: 76% down the rail's gradient.
+    static var inkRowShell: EditorInkColor {
+        let top = NotebookSwatchShelf.color(from: NotebookTheme.panelTop.uiColor)
+        let bottom = NotebookSwatchShelf.color(from: NotebookTheme.panelBottom.uiColor)
+        let position = 0.76
         return EditorInkColor(
-            red: color.red * alpha + well.red * (1 - alpha),
-            green: color.green * alpha + well.green * (1 - alpha),
-            blue: color.blue * alpha + well.blue * (1 - alpha)
+            red: top.red + (bottom.red - top.red) * position,
+            green: top.green + (bottom.green - top.green) * position,
+            blue: top.blue + (bottom.blue - top.blue) * position
         )
     }
 
-    static func mark(for color: EditorInkColor) -> NotebookTheme.Tone {
-        let surface = background(for: color)
+    /// The selected swatch as it shows in its well, which darkens under Increase Contrast.
+    static func background(for color: EditorInkColor, contrast: ColorSchemeContrast) -> EditorInkColor {
+        let traits = UITraitCollection(accessibilityContrast: UIAccessibilityContrast(contrast))
+        let well = NotebookSwatchShelf.color(from: NotebookTheme.selectedWell.uiColor.resolvedColor(with: traits))
+        return composite(color, over: well)
+    }
+
+    static func mark(for color: EditorInkColor, contrast: ColorSchemeContrast) -> NotebookTheme.Tone {
+        let surface = background(for: color, contrast: contrast)
         let dark = NotebookSwatchShelf.color(from: NotebookTheme.glyph.uiColor)
         let light = NotebookSwatchShelf.color(from: NotebookTheme.paperIvory.uiColor)
         return dark.contrastRatio(against: surface) >= light.contrastRatio(against: surface)
             ? NotebookTheme.glyph : NotebookTheme.paperIvory
+    }
+
+    /// True for a colour under 3:1 against the ink row, which its own edge cannot define.
+    static func isFaint(_ color: EditorInkColor) -> Bool {
+        composite(color, over: inkRowShell).contrastRatio(against: inkRowShell) < 3
+    }
+
+    private static func composite(_ color: EditorInkColor, over background: EditorInkColor) -> EditorInkColor {
+        let alpha = color.alpha
+        return EditorInkColor(
+            red: color.red * alpha + background.red * (1 - alpha),
+            green: color.green * alpha + background.green * (1 - alpha),
+            blue: color.blue * alpha + background.blue * (1 - alpha)
+        )
     }
 }
 
@@ -808,6 +1326,7 @@ private struct NotebookCustomColorWell: View {
 
     @ObservedObject var store: NotebookSceneToolStore
     let isSelected: Bool
+    var isHighlighted = false
     @State private var isPicking = false
     @State private var pick = NotebookColorPick()
 
@@ -829,6 +1348,9 @@ private struct NotebookCustomColorWell: View {
                     if isSelected { NotebookSwatchCheckmark(color: store.tool.color) }
                 }
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                .background {
+                    if isHighlighted { NotebookColorHighlight() }
+                }
                 .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
@@ -836,8 +1358,12 @@ private struct NotebookCustomColorWell: View {
         .accessibilityValue(isSelected ? store.tool.color.accessibilityName : "")
         .accessibilityHint("Opens the color picker. The color showing when you close it is added to your swatches.")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityShowsLargeContentViewer {
+            Label("Custom color", systemImage: "paintpalette")
+        }
         .sheet(isPresented: $isPicking) {
             NotebookColorPicker(initial: store.tool.color, pick: pick) { isPicking = false }
+                .presentationBackground(NotebookTheme.panelSurface.color)
         }
         .onChange(of: isPicking) { _, picking in
             if !picking { pick.finish(with: actions) }
@@ -933,6 +1459,9 @@ private struct NotebookWidthButton: View {
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel("\(step.title) width")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityShowsLargeContentViewer {
+            Label("\(step.title) width", systemImage: "circle.fill")
+        }
     }
 }
 
@@ -952,53 +1481,6 @@ struct NotebookToolGlyph: View {
                 if isSelected { NotebookSelectionMark() }
             }
             .contentShape(Rectangle())
-    }
-}
-
-/// The toolbar's raised ivory shell: a pale fill, a one-point bevel and a shallow shadow.
-struct NotebookToolbarShell: View {
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
-        let shadow = NotebookTheme.shellShadow
-        shape
-            .fill(NotebookTheme.panelSurface.color)
-            .overlay {
-                shape.strokeBorder(
-                    LinearGradient(
-                        colors: [NotebookTheme.panelHighlight.color, NotebookTheme.panelLowerEdge.color],
-                        startPoint: .top, endPoint: .bottom
-                    ),
-                    lineWidth: NotebookTheme.shellBorderWidth
-                )
-            }
-            .shadow(color: shadow.color, radius: shadow.radius, x: shadow.offset.width, y: shadow.offset.height)
-    }
-}
-
-/// A hairline around a colour so pale swatches stay visible on the ivory shell.
-private struct NotebookSwatchOutline: View {
-    var body: some View {
-        Circle().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
-    }
-}
-
-private struct NotebookToolbarDivider: View {
-    let axis: Axis
-
-    var body: some View {
-        Group {
-            switch axis {
-            case .vertical:
-                Rectangle()
-                    .frame(width: NotebookTheme.dividerThickness, height: NotebookTheme.dividerLength)
-            case .horizontal:
-                Rectangle()
-                    .frame(height: NotebookTheme.dividerThickness)
-                    .padding(.horizontal, NotebookTheme.stripInsets.left)
-            }
-        }
-        .foregroundStyle(NotebookTheme.divider.color)
-        .accessibilityHidden(true)
     }
 }
 
@@ -1030,6 +1512,27 @@ extension EditorInkFamily {
     }
 }
 
+extension EditorToolKind {
+    /// The symbol the toolbar shows for this tool, as on its own key.
+    var symbol: String {
+        switch self {
+        case let .ink(family): family.symbol
+        case .eraser(.vector): "eraser"
+        case .eraser(.bitmap): "eraser.line.dashed"
+        case .lasso: "lasso"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case let .ink(family): family.title
+        case .eraser(.vector): "Object eraser"
+        case .eraser(.bitmap): "Pixel eraser"
+        case .lasso: "Lasso"
+        }
+    }
+}
+
 private extension EditorWidthStep {
     var title: String {
         switch self {
@@ -1048,9 +1551,9 @@ private extension EditorWidthStep {
     }
 }
 
-private extension EditorInkColor {
+extension EditorInkColor {
     /// Spoken names for the quick swatches, in catalog order.
-    static let catalogNames: [EditorInkColor: String] = Dictionary(
+    private static let catalogNames: [EditorInkColor: String] = Dictionary(
         zip(EditorInkCatalog.swatches, ["Charcoal", "Sepia", "Rust", "Sage", "Dusty blue", "Plum", "Ochre"]),
         uniquingKeysWith: { first, _ in first }
     )

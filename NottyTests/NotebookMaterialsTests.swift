@@ -613,10 +613,616 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertEqual(paper.headMarginLayer.backgroundColor, NotebookTheme.paperIvory.cgColor)
         XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
         XCTAssertTrue(NotebookPaperView.backdropColor === NotebookTheme.backdropStone.uiColor)
-        XCTAssertEqual(paper.edgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor)
-        XCTAssertEqual(paper.leadingEdgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor)
-        XCTAssertEqual(paper.pageTopLayer.backgroundColor, NotebookTheme.paperDivider.cgColor)
-        XCTAssertEqual(paper.boundaryLayers.first?.backgroundColor, NotebookTheme.paperDivider.cgColor)
+        let traits = paper.traitCollection
+        XCTAssertEqual(paper.edgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor(for: traits))
+        XCTAssertEqual(paper.leadingEdgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor(for: traits))
+        XCTAssertEqual(paper.pageTopLayer.backgroundColor, NotebookTheme.paperDivider.cgColor(for: traits))
+        XCTAssertEqual(paper.boundaryLayers.first?.backgroundColor, NotebookTheme.paperDivider.cgColor(for: traits))
+    }
+
+    /// Under Increase Contrast the page edges become solid one-point charcoal lines and the
+    /// dividers darken, and both follow the setting while the paper is shown.
+    func testPageEdgesTurnSolidCharcoalUnderIncreaseContrastAndFollowALiveChange() async throws {
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 600, height: 800), accessibility: AccessibilitySettings().source
+        )
+        paper.setGeometry(width: 794, height: 2_246, boundaries: [1_123])
+        paper.setViewport(scale: 0.5, offset: CGPoint(x: -100, y: -50))
+        paper.finishZoom()
+        let host = try await hostInWindow(paper)
+        defer { host.close() }
+        let pixel = 1 / (paper.traitCollection.displayScale * 0.5)
+        let standardEdge: [CGFloat] = [0.47, 0.40, 0.31, 0.65]
+        let charcoal: [CGFloat] = [0.17, 0.16, 0.15, 1]
+        assertLines(of: paper, edge: standardEdge, dividerAlpha: 0.30, edgeThickness: pixel, "standard contrast")
+
+        paper.traitOverrides.accessibilityContrast = .high
+        try await NotebookTestFixtures.waitUntil {
+            paper.layoutIfNeeded()
+            return paper.traitCollection.accessibilityContrast == .high
+        }
+        assertLines(of: paper, edge: charcoal, dividerAlpha: 0.55, edgeThickness: 2, "increased contrast")
+        XCTAssertEqual(paper.pageTopLayer.bounds.height, pixel, accuracy: 0.000_1, "dividers stay one device pixel")
+        paper.setGeometry(width: 794, height: 3_369, boundaries: [1_123, 2_246])
+        assertComponents(
+            of: try XCTUnwrap(paper.boundaryLayers.last?.backgroundColor), equal: [0.47, 0.40, 0.31, 0.55],
+            "a divider added later takes the increased tone"
+        )
+
+        paper.traitOverrides.accessibilityContrast = .normal
+        try await NotebookTestFixtures.waitUntil {
+            paper.layoutIfNeeded()
+            return paper.traitCollection.accessibilityContrast == .normal
+        }
+        assertLines(of: paper, edge: standardEdge, dividerAlpha: 0.30, edgeThickness: pixel, "contrast restored")
+    }
+
+    /// The status veil lies between the canvas and the chrome, covers the top safe area plus
+    /// its fade with paper, and replaces the system's scroll edge effects.
+    func testStatusVeilCoversTheStatusBarWithPaperOnlyOverThePage() async throws {
+        let settings = AccessibilitySettings()
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: settings.source),
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        // A known top safe area, whatever the window's own.
+        controller.additionalSafeAreaInsets = UIEdgeInsets(top: 20, left: 0, bottom: 0, right: 0)
+        controller.view.layoutIfNeeded()
+        let canvas = controller.canvasView
+        let veil = controller.statusVeil
+        let safeTop = controller.view.safeAreaInsets.top
+        XCTAssertGreaterThanOrEqual(safeTop, 20)
+        XCTAssertTrue(canvas.topEdgeEffect.isHidden, "The system's top edge effect would tint the paper.")
+        XCTAssertTrue(canvas.bottomEdgeEffect.isHidden)
+        let subviews = controller.view.subviews
+        XCTAssertGreaterThan(
+            try XCTUnwrap(subviews.firstIndex(of: veil)), try XCTUnwrap(subviews.firstIndex(of: canvas))
+        )
+        XCTAssertFalse(veil.isUserInteractionEnabled)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
+        XCTAssertFalse(veil.isHidden)
+        let fade = NotebookTheme.statusVeilFade
+        XCTAssertEqual(fade, 10)
+        XCTAssertEqual(veil.frame, CGRect(x: 0, y: 0, width: 834, height: safeTop + fade))
+        let locations = try XCTUnwrap(veil.gradientLayer.locations).map(\.doubleValue)
+        XCTAssertEqual(locations[0], 0)
+        XCTAssertEqual(locations[1], Double(safeTop / (safeTop + fade)), accuracy: 0.000_1)
+        XCTAssertEqual(locations[2], 1)
+        let colors = try veilColors(veil)
+        for (color, alpha) in zip(colors, [0.94, 0.94, 0]) {
+            assertComponents(of: color, equal: [0.98, 0.96, 0.91, CGFloat(alpha)], "paper veil")
+        }
+        let underVeil = NotebookTestFixtures.hit(CGPoint(x: 400, y: safeTop / 2), in: controller.view)
+        XCTAssertTrue(underVeil.isDescendant(of: canvas), "Touches pass through the veil.")
+
+        canvas.setZoomScale(canvas.minimumZoomScale, animated: false)
+        XCTAssertLessThan(canvas.zoomScale, 834 / 794)
+        XCTAssertTrue(veil.isHidden, "Below width fit the veil would lie over stone.")
+        canvas.setZoomScale(834 / 794, animated: false)
+        XCTAssertFalse(veil.isHidden)
+
+        settings.reducesTransparency = true
+        settings.post(UIAccessibility.reduceTransparencyStatusDidChangeNotification)
+        XCTAssertTrue(veil.isOpaqueBand)
+        XCTAssertEqual(veil.frame, CGRect(x: 0, y: 0, width: 834, height: safeTop), "An opaque band without a fade.")
+        for color in try veilColors(veil) {
+            assertComponents(of: color, equal: [0.98, 0.96, 0.91, 1], "opaque paper band")
+        }
+        settings.reducesTransparency = false
+        settings.post(UIAccessibility.reduceTransparencyStatusDidChangeNotification)
+        XCTAssertFalse(veil.isOpaqueBand)
+        XCTAssertEqual(veil.frame.height, safeTop + fade)
+
+        // A safe-area change alone, as when a navigation bar shows or hides, resizes the veil
+        // in the layout pass that follows, without any scroll.
+        let offset = canvas.contentOffset
+        for extra: CGFloat in [74, 0] {
+            controller.additionalSafeAreaInsets = UIEdgeInsets(top: extra, left: 0, bottom: 0, right: 0)
+            controller.view.layoutIfNeeded()
+            let top = controller.view.safeAreaInsets.top
+            XCTAssertEqual(top, safeTop - 20 + extra, accuracy: 0.5)
+            XCTAssertEqual(veil.frame, CGRect(x: 0, y: 0, width: 834, height: top + fade), "extra safe area \(extra)")
+            let locations = try XCTUnwrap(veil.gradientLayer.locations).map(\.doubleValue)
+            XCTAssertEqual(locations[1], Double(top / (top + fade)), accuracy: 0.000_1)
+        }
+        XCTAssertEqual(canvas.contentOffset, offset, "The veil never moves the page.")
+    }
+
+    /// A veil created while Reduce Transparency is already on starts as the opaque band.
+    func testStatusVeilStartsAsAnOpaqueBandWhenReduceTransparencyIsAlreadyOn() async throws {
+        let settings = AccessibilitySettings()
+        settings.reducesTransparency = true
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: settings.source),
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        controller.additionalSafeAreaInsets = UIEdgeInsets(top: 20, left: 0, bottom: 0, right: 0)
+        controller.view.layoutIfNeeded()
+        let veil = controller.statusVeil
+        let safeTop = controller.view.safeAreaInsets.top
+        XCTAssertTrue(veil.isOpaqueBand)
+        XCTAssertFalse(veil.isHidden)
+        XCTAssertEqual(veil.frame, CGRect(x: 0, y: 0, width: 834, height: safeTop), "An opaque band without a fade.")
+        for color in try veilColors(veil) {
+            assertComponents(of: color, equal: [0.98, 0.96, 0.91, 1], "opaque paper band")
+        }
+    }
+
+    /// The veil and the tab follow the paper directly, even when a scroll lands inside an
+    /// animation block such as a rotation's.
+    func testVeilAndEndOfPaperTabNeverAnimate() async throws {
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source),
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        controller.onAddPage = {}
+        let canvas = controller.canvasView
+        UIView.animate(withDuration: 1) {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+            canvas.setZoomScale(canvas.minimumZoomScale, animated: false)
+            controller.view.layoutIfNeeded()
+        }
+        let tab = controller.endOfPaperTab
+        XCTAssertFalse(tab.isHidden)
+        for layer in [tab.layer, controller.statusVeil.layer] {
+            XCTAssertTrue(layer.animationKeys()?.isEmpty ?? true, "\(layer)")
+        }
+    }
+
+    /// The tab sits centred on the page with its top 20 points below the last page, wherever the
+    /// page is scrolled or zoomed, and the canvas keeps room for it above the home indicator.
+    func testEndOfPaperTabFollowsTheLastPageAndHasRoomAboveTheHomeIndicator() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source),
+            toolStore: store, size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        XCTAssertTrue(tab.isHidden, "A canvas that cannot add pages shows no tab.")
+        XCTAssertEqual(canvas.contentInset.bottom, 0)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 250), animated: false)
+        let offset = canvas.contentOffset
+        var added = 0
+        controller.onAddPage = { added += 1 }
+        let safeBottom = controller.view.safeAreaInsets.bottom
+        XCTAssertEqual(NotebookTheme.endScrollMinimum, 104)
+        XCTAssertEqual(canvas.contentInset.bottom, safeBottom + 104, accuracy: 0.5)
+        XCTAssertEqual(canvas.contentOffset, offset, "Room below the last page never moves the page.")
+        XCTAssertTrue(tab.isHidden, "The tab waits below the visible area.")
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        try assertTab(of: controller, followsTheLastPage: "at the end of the paper")
+        XCTAssertLessThanOrEqual(
+            tab.frame.maxY, canvas.bounds.height - safeBottom, "The tab clears the home indicator."
+        )
+        XCTAssertEqual(tab.frame.height, NotebookTheme.endTabHeight)
+        XCTAssertEqual(tab.titleLabel.text, "Add page")
+        XCTAssertFalse(tab.iconView.isHidden)
+        XCTAssertNotNil(UIImage(systemName: NotebookEndOfPaperTab.symbolName))
+        XCTAssertEqual(tab.accessibilityLabel, "Add page")
+        XCTAssertEqual(tab.accessibilityHint, "Adds a page at the end of the notebook.")
+        XCTAssertEqual(tab.accessibilityTraits, .button)
+        XCTAssertEqual(tab.layer.shadowOpacity, Float(NotebookTheme.shellShadow.opacity))
+        XCTAssertNotNil(tab.layer.shadowPath, "A fixed shadow path keeps moves from re-rendering the blur.")
+        let hit = NotebookTestFixtures.hit(CGPoint(x: tab.frame.midX, y: tab.frame.midY), in: controller.view)
+        XCTAssertTrue(hit === tab, "\(hit)")
+        tab.sendActions(for: .touchUpInside)
+        XCTAssertEqual(added, 1)
+
+        canvas.setZoomScale(canvas.minimumZoomScale, animated: false)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        try assertTab(of: controller, followsTheLastPage: "zoomed out")
+
+        // A toolbar floating at the bottom stacks its own room on top of the tab's.
+        store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 140, right: 0))
+        XCTAssertEqual(canvas.contentInset.bottom, safeBottom + 104 + 140, accuracy: 0.5)
+        store.setOverlayObstruction(.zero)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+        XCTAssertTrue(tab.isHidden, "Hidden while below the visible area.")
+    }
+
+    func testEndOfPaperTabReadsPaperLimitReachedAtTwelvePages() async throws {
+        let fixture = try await presentController(
+            pageCount: 11, paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source),
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        var added = 0
+        controller.onAddPage = { added += 1 }
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        XCTAssertEqual(tab.mode, .available)
+        let availableWidth = tab.bounds.width
+
+        controller.setPageCount(NotebookViewController.maximumPageCount)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        XCTAssertEqual(tab.mode, .limitReached)
+        XCTAssertEqual(tab.titleLabel.text, "Paper limit reached")
+        XCTAssertTrue(tab.iconView.isHidden, "Nothing can be added, so the plus badge goes.")
+        XCTAssertGreaterThan(tab.bounds.width, availableWidth)
+        XCTAssertFalse(tab.isEnabled)
+        XCTAssertEqual(tab.accessibilityLabel, "Paper limit reached")
+        XCTAssertNil(tab.accessibilityHint)
+        XCTAssertTrue(tab.accessibilityTraits.contains(.notEnabled))
+        XCTAssertEqual(tab.layer.shadowOpacity, 0, "At the limit the tab lies flat without a shadow.")
+        try assertTab(of: controller, followsTheLastPage: "twelve pages")
+        tab.sendActions(for: .touchUpInside)
+        XCTAssertEqual(added, 0)
+    }
+
+    func testEndOfPaperTabShowsDisabledWhileTheGateBlocksWriting() async throws {
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source),
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        var added = 0
+        controller.onAddPage = { added += 1 }
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        let bottom = canvas.contentInset.bottom
+
+        for gate in [NotebookInputGate.capacity, .failed, .recovering, .readOnly] {
+            controller.setInputGate(gate)
+            XCTAssertEqual(tab.mode, .paused, "\(gate)")
+            XCTAssertFalse(tab.isHidden, "\(gate): shown disabled rather than hidden")
+            XCTAssertFalse(tab.isEnabled, "\(gate)")
+            XCTAssertEqual(tab.titleLabel.text, "Add page", "\(gate)")
+            XCTAssertTrue(tab.accessibilityTraits.contains(.notEnabled), "\(gate)")
+            XCTAssertEqual(canvas.contentInset.bottom, bottom, "\(gate): the room stays")
+            tab.sendActions(for: .touchUpInside)
+            XCTAssertEqual(added, 0, "\(gate)")
+            controller.setInputGate(.open)
+            XCTAssertEqual(tab.mode, .available, "\(gate)")
+            XCTAssertTrue(tab.isEnabled)
+        }
+        tab.sendActions(for: .touchUpInside)
+        XCTAssertEqual(added, 1)
+    }
+
+    /// While writing is paused the tab keeps its shell and shadow and dims its content as the
+    /// paused rail does: to 0.55, or 0.70 under Increase Contrast.
+    func testPausedEndOfPaperTabKeepsItsShellAndDimsItsContent() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let tab = controller.endOfPaperTab
+        let title = tab.titleLabel.convert(tab.titleLabel.bounds, to: tab)
+        let face = CGPoint(x: 8, y: tab.bounds.midY)
+        let below = CGPoint(x: tab.bounds.midX, y: tab.bounds.maxY + 2)
+        let beyond = CGPoint(x: tab.bounds.midX, y: tab.bounds.maxY + 22)
+        let glyph = try XCTUnwrap(SRGBPixels.components(NotebookTheme.glyph.uiColor))
+        let shell = try Self.mix(NotebookTheme.panelTop, NotebookTheme.panelBottom, 0.5)
+        let surface = try XCTUnwrap(SRGBPixels.components(NotebookTheme.panelSurface.uiColor))
+
+        let available = try renderTab(of: controller, margin: 24)
+        let availableInk = available.darkestPoint(in: title)
+        assertColor(available.color(at: availableInk), matches: glyph, "available: the title in the glyph tone")
+        controller.setInputGate(.failed)
+        XCTAssertEqual(tab.mode, .paused)
+        for contrast in [UIAccessibilityContrast.normal, .high] {
+            controller.traitOverrides.accessibilityContrast = contrast
+            try await NotebookTestFixtures.waitUntil {
+                controller.updateTraitsIfNeeded()
+                controller.view.layoutIfNeeded()
+                return tab.traitCollection.accessibilityContrast == contrast
+            }
+            let increased = contrast == .high
+            let name = increased ? "paused, increased contrast" : "paused"
+            let opacity = increased ? NotebookTheme.disabledOpacityIncreased : NotebookTheme.disabledOpacity
+            let paused = try renderTab(of: controller, margin: 24)
+            assertColor(paused.color(at: face), matches: increased ? surface : shell, "\(name): the shell stays")
+            // The face beside the title's darkest pixel, on the same row of the gradient.
+            let ink = paused.darkestPoint(in: title)
+            let background = paused.color(at: CGPoint(x: face.x, y: ink.y))
+            assertColor(
+                paused.color(at: ink), matches: Self.blend(glyph, opacity, over: background), "\(name): the title dims"
+            )
+            XCTAssertEqual(tab.layer.shadowOpacity, Float(NotebookTheme.shellShadow.opacity), name)
+            XCTAssertLessThan(
+                SRGBPixels.relativeLuminance(paused.color(at: below)),
+                SRGBPixels.relativeLuminance(paused.color(at: beyond)) - 0.005, "\(name): the shadow stays"
+            )
+        }
+    }
+
+    /// The room below the last page follows the home indicator, but never shrinks while a
+    /// stroke is in progress, so the page stays under the pen.
+    func testEndOfPaperRoomFollowsTheSafeAreaAndHoldsDuringAStroke() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        let room = canvas.contentInset.bottom
+        XCTAssertEqual(room, controller.view.safeAreaInsets.bottom + NotebookTheme.endScrollMinimum, accuracy: 0.5)
+
+        controller.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: 40, right: 0)
+        controller.view.layoutIfNeeded()
+        let grown = canvas.contentInset.bottom
+        XCTAssertEqual(grown, room + 40, accuracy: 0.5, "More room at once for a taller home indicator area.")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        let end = canvas.contentOffset
+
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.additionalSafeAreaInsets = .zero
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentInset.bottom, grown, "The room is held while the stroke is in progress.")
+        XCTAssertEqual(canvas.contentOffset, end, "The page never moves under the pen.")
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(canvas.contentInset.bottom, room, accuracy: 0.5, "Released when the stroke ends.")
+        XCTAssertEqual(canvas.contentOffset.y, Self.endOffset(of: canvas), accuracy: 0.5, "Settled at the new end.")
+        try assertTab(of: controller, followsTheLastPage: "after the release")
+    }
+
+    /// Scrolling moves the tab without drawing it again: its edge is a bitmap drawn once per
+    /// size and tone, no layer is masked, and the shadow keeps its path.
+    func testScrollingMovesTheEndOfPaperTabWithoutDrawingItAgain() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        let renders = tab.edgeRenders
+        XCTAssertGreaterThan(renders, 0)
+        let shadowPath = try XCTUnwrap(tab.layer.shadowPath)
+        let end = Self.endOffset(of: canvas)
+        var positions = Set<CGFloat>()
+        for step in 0..<50 {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end - CGFloat(step)), animated: false)
+            controller.view.layoutIfNeeded()
+            positions.insert(tab.frame.minY)
+        }
+        XCTAssertEqual(positions.count, 50, "The tab follows the paper.")
+        XCTAssertEqual(tab.edgeRenders, renders, "Moving never draws the edge again.")
+        XCTAssertEqual(tab.layer.shadowPath, shadowPath)
+        var layers = [tab.layer]
+        while let layer = layers.popLast() {
+            XCTAssertNil(layer.mask, "A mask renders offscreen on every frame: \(layer)")
+            XCTAssertFalse(layer.shouldRasterize, "\(layer)")
+            layers += layer.sublayers ?? []
+        }
+
+        controller.traitOverrides.accessibilityContrast = .high
+        try await NotebookTestFixtures.waitUntil {
+            controller.updateTraitsIfNeeded()
+            controller.view.layoutIfNeeded()
+            return tab.traitCollection.accessibilityContrast == .high
+        }
+        XCTAssertEqual(tab.edgeRenders, renders + 1, "A new tone draws the edge once.")
+    }
+
+    /// The tab is a lit shell with rounded corners. Pressed, it sinks into the pressed well and
+    /// its content drops one point, as a secondary action key does.
+    func testEndOfPaperTabSinksIntoThePressedWellAndDropsItsContentWhilePressed() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let tab = controller.endOfPaperTab
+        let title = tab.titleLabel.convert(tab.titleLabel.bounds, to: tab)
+        let resting = try renderTab(of: controller)
+        tab.isHighlighted = true
+        let pressed = try renderTab(of: controller)
+        tab.isHighlighted = false
+
+        // Beside the content, halfway down, where the shell gradient is at its middle.
+        let face = CGPoint(x: 8, y: tab.bounds.midY)
+        let shell = try Self.mix(NotebookTheme.panelTop, NotebookTheme.panelBottom, 0.5)
+        let well = try XCTUnwrap(SRGBPixels.components(NotebookTheme.selectedWell.uiColor))
+        assertColor(resting.color(at: face), matches: shell, "the shell")
+        assertColor(
+            pressed.color(at: face), matches: Self.blend(well, NotebookTheme.pressedWellOpacity, over: shell),
+            "the pressed well"
+        )
+        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
+        for (render, state) in [(resting, "resting"), (pressed, "pressed")] {
+            let corner = SRGBPixels.relativeLuminance(render.color(at: CGPoint(x: 0.25, y: 0.25)))
+            XCTAssertLessThan(corner, SRGBPixels.relativeLuminance(stone) + 0.005, "\(state): the corners are rounded")
+        }
+        let columns = title.minX...title.maxX
+        let restingTop = try XCTUnwrap(resting.firstRow(darkerThan: 0.2, columns: columns), "The title was not drawn.")
+        let pressedTop = try XCTUnwrap(pressed.firstRow(darkerThan: 0.2, columns: columns))
+        XCTAssertEqual(pressedTop - restingTop, NotebookTheme.pressTravel, accuracy: 0.01)
+    }
+
+    /// Under Increase Contrast the tab turns flat with a dark outline and keeps its shadow, and
+    /// it follows the setting while shown.
+    func testEndOfPaperTabTurnsFlatWithAnOutlineUnderIncreaseContrast() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let tab = controller.endOfPaperTab
+        // Above the content, where the shell gradient is still lighter than the flat surface.
+        let face = CGPoint(x: tab.bounds.midX, y: 6)
+        // Halfway down the leading side, inside the one-point edge.
+        let side = CGPoint(x: 0.25, y: tab.bounds.midY)
+        let pixelCentre = 6 + 0.5 / tab.traitCollection.displayScale
+        let shell = try Self.mix(NotebookTheme.panelTop, NotebookTheme.panelBottom, pixelCentre / tab.bounds.height)
+        let shellMiddle = try Self.mix(NotebookTheme.panelTop, NotebookTheme.panelBottom, 0.5)
+        let surface = try XCTUnwrap(SRGBPixels.components(NotebookTheme.panelSurface.uiColor))
+        let outline = try XCTUnwrap(SRGBPixels.components(
+            NotebookTheme.panelLowerEdge.uiColor.resolvedColor(with: UITraitCollection(accessibilityContrast: .high))
+        ))
+
+        let standard = try renderTab(of: controller)
+        assertColor(standard.color(at: face), matches: shell, "standard contrast: the shell")
+        assertColor(standard.color(at: side), matches: shellMiddle, "standard contrast: no edge along the sides")
+        for contrast in [UIAccessibilityContrast.high, .normal] {
+            controller.traitOverrides.accessibilityContrast = contrast
+            try await NotebookTestFixtures.waitUntil {
+                controller.updateTraitsIfNeeded()
+                controller.view.layoutIfNeeded()
+                return tab.traitCollection.accessibilityContrast == contrast
+            }
+            let render = try renderTab(of: controller)
+            let increased = contrast == .high
+            let name = increased ? "increased contrast" : "contrast restored"
+            assertColor(render.color(at: face), matches: increased ? surface : shell, "\(name): face")
+            assertColor(render.color(at: side), matches: increased ? outline : shellMiddle, "\(name): side")
+            XCTAssertEqual(tab.layer.shadowOpacity, Float(NotebookTheme.shellShadow.opacity), name)
+        }
+    }
+
+    /// The tab grows with the text size, still ends above the home indicator at the largest
+    /// size, and returns to its standard size.
+    func testEndOfPaperTabGrowsWithTheTextSizeAndStaysClearOfTheHomeIndicator() async throws {
+        let fixture = try await presentTabAtTheEnd()
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        let standard = controller.traitCollection.preferredContentSizeCategory
+        let standardSize = tab.bounds.size
+        let standardIcon = tab.iconView.intrinsicContentSize
+        XCTAssertEqual(standardSize.height, NotebookTheme.endTabHeight)
+        let room = canvas.contentInset.bottom
+        let largest = UIContentSizeCategory.accessibilityExtraExtraExtraLarge
+
+        controller.traitOverrides.preferredContentSizeCategory = largest
+        try await NotebookTestFixtures.waitUntil {
+            controller.updateTraitsIfNeeded()
+            controller.view.layoutIfNeeded()
+            return controller.traitCollection.preferredContentSizeCategory == largest
+        }
+        XCTAssertEqual(NotebookTheme.tabLabel.style, .subheadline)
+        let scaled = UIFontMetrics(forTextStyle: .subheadline).scaledValue(
+            for: NotebookTheme.tabLabel.pointSize,
+            compatibleWith: UITraitCollection(preferredContentSizeCategory: largest)
+        )
+        XCTAssertEqual(tab.titleLabel.font.pointSize, scaled, accuracy: 0.5)
+        XCTAssertGreaterThan(tab.iconView.intrinsicContentSize.height, standardIcon.height)
+        XCTAssertGreaterThan(tab.bounds.height, NotebookTheme.endTabHeight)
+        XCTAssertGreaterThan(tab.bounds.width, standardSize.width)
+        XCTAssertEqual(canvas.contentInset.bottom, room, "The room below the last page stays.")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        try assertTab(of: controller, followsTheLastPage: "largest text size")
+        XCTAssertLessThanOrEqual(
+            tab.frame.maxY, controller.view.bounds.height - controller.view.safeAreaInsets.bottom,
+            "The tab clears the home indicator at the largest text size."
+        )
+
+        controller.traitOverrides.remove(UITraitPreferredContentSizeCategory.self)
+        try await NotebookTestFixtures.waitUntil {
+            controller.updateTraitsIfNeeded()
+            controller.view.layoutIfNeeded()
+            return controller.traitCollection.preferredContentSizeCategory == standard
+        }
+        XCTAssertEqual(tab.bounds.size, standardSize)
+        XCTAssertEqual(tab.iconView.intrinsicContentSize, standardIcon)
+    }
+
+    /// In a narrow window at the largest text size the tab keeps the margin from the window's
+    /// sides, and its title shrinks to fit rather than being cut off.
+    func testEndOfPaperTabFitsANarrowWindowAtTheLargestTextSize() async throws {
+        let width: CGFloat = 375
+        let fixture = try await presentTabAtTheEnd(
+            pageCount: NotebookViewController.maximumPageCount, size: CGSize(width: width, height: 800)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        let largest = UIContentSizeCategory.accessibilityExtraExtraExtraLarge
+        controller.traitOverrides.preferredContentSizeCategory = largest
+        try await NotebookTestFixtures.waitUntil {
+            controller.updateTraitsIfNeeded()
+            controller.view.layoutIfNeeded()
+            return controller.traitCollection.preferredContentSizeCategory == largest
+        }
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        XCTAssertEqual(tab.mode, .limitReached)
+        XCTAssertFalse(tab.isHidden)
+        let margin = NotebookTheme.endTabGap
+        XCTAssertGreaterThanOrEqual(tab.frame.minX, margin - 0.5)
+        XCTAssertLessThanOrEqual(tab.frame.maxX, width - margin + 0.5)
+        let natural = tab.titleLabel.sizeThatFits(
+            CGSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        )
+        let shown = tab.titleLabel.bounds.width
+        XCTAssertGreaterThan(natural.width, shown, "The title is too wide for the window at full size.")
+        XCTAssertLessThanOrEqual(shown, tab.bounds.width - 32)
+        XCTAssertTrue(tab.titleLabel.adjustsFontSizeToFitWidth)
+        XCTAssertLessThanOrEqual(
+            natural.width * tab.titleLabel.minimumScaleFactor, shown, "Shrinking fits the whole title."
+        )
+        XCTAssertGreaterThan(
+            tab.sizeThatFits(tab.bounds.size).width, tab.bounds.width,
+            "sizeThatFits reports the natural size, so sizeToFit never narrows the tab further."
+        )
+    }
+
+    func testReadOnlyViewerShowsNoTabAndKeepsItsRange() async throws {
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        controller.onAddPage = { XCTFail("A viewer never adds pages.") }
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 834, height: 1_194)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(controller)
+        let canvas = controller.canvasView
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        XCTAssertTrue(controller.endOfPaperTab.isHidden)
+        XCTAssertEqual(canvas.contentInset.bottom, 0)
+    }
+
+    /// The notebook screen's canvas adds a page through the session when its tab is tapped.
+    func testEndOfPaperTabOnTheNotebookScreenExtendsThePaper() async throws {
+        let id = UUID()
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = try NotebookStorageProbe(stored: try await NotebookTestFixtures.stored(id: id), recoveryRoot: root)
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        await session.load()
+        let scene = try NotebookTestFixtures.windowScene()
+        NotebookTestFixtures.restoreSceneToolDefaults(for: scene, after: self)
+        let window = UIWindow(windowScene: scene)
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
+        window.frame = CGRect(x: 0, y: 0, width: 834, height: 1_194)
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer {
+            session.flush()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntil {
+            guard let controller = NotebookTestFixtures.notebookController(in: hosting) else { return false }
+            return hosting.hasAppeared && controller.isCanvasVisible
+        }
+        let controller = try XCTUnwrap(NotebookTestFixtures.notebookController(in: hosting))
+        let canvas = controller.canvasView
+        XCTAssertGreaterThanOrEqual(
+            canvas.contentInset.bottom, controller.view.safeAreaInsets.bottom + NotebookTheme.endScrollMinimum - 0.5
+        )
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        let tab = controller.endOfPaperTab
+        XCTAssertFalse(tab.isHidden)
+        XCTAssertEqual(tab.mode, .available)
+        XCTAssertEqual(session.pageCount, 3)
+        tab.sendActions(for: .touchUpInside)
+        XCTAssertEqual(session.pageCount, 4)
+        let threePages = canvas.bounds.width / 794 * 1_123 * 3
+        try await NotebookTestFixtures.waitUntil { canvas.contentSize.height > threePages + 1 }
     }
 
     /// PencilKit input cannot be synthesized in a unit test, and the stroke shown while the
@@ -772,6 +1378,170 @@ final class NotebookMaterialsTests: XCTestCase {
         [paper.pageTopLayer, paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer]
             + [paper.bottomShadowLayer, paper.leadingShadowLayer, paper.trailingShadowLayer]
             + [paper.leadingCornerShadowLayer, paper.trailingCornerShadowLayer]
+    }
+
+    private static func endOffset(of canvas: UIScrollView) -> CGFloat {
+        canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
+    }
+
+    /// Shows a canvas that can add pages, scrolled to the end of its paper.
+    private func presentTabAtTheEnd(
+        pageCount: Int = 3, size: CGSize = CGSize(width: 834, height: 1_194)
+    ) async throws -> Fixture {
+        let fixture = try await presentController(
+            pageCount: pageCount,
+            paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source), size: size
+        )
+        fixture.controller.onAddPage = {}
+        let canvas = fixture.controller.canvasView
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: Self.endOffset(of: canvas)), animated: false)
+        fixture.controller.view.layoutIfNeeded()
+        return fixture
+    }
+
+    /// The controller's view around its end tab, with `margin` points of the backdrop on every side.
+    private func renderTab(of controller: NotebookViewController, margin: CGFloat = 8) throws -> TabRender {
+        let view = try XCTUnwrap(controller.view)
+        let region = controller.endOfPaperTab.frame.insetBy(dx: -margin, dy: -margin)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = view.traitCollection.displayScale
+        let image = UIGraphicsImageRenderer(size: region.size, format: format).image { _ in
+            view.drawHierarchy(
+                in: CGRect(origin: CGPoint(x: -region.minX, y: -region.minY), size: view.bounds.size),
+                afterScreenUpdates: true
+            )
+        }
+        return TabRender(pixels: try SRGBPixels(image), scale: format.scale, margin: margin)
+    }
+
+    /// Pixels around the end tab, read at points in the tab's own coordinates.
+    private struct TabRender {
+        let pixels: SRGBPixels
+        let scale: CGFloat
+        let margin: CGFloat
+
+        func color(at point: CGPoint) -> SRGBPixels.Color {
+            pixels.color(x: pixel(point.x), y: pixel(point.y))
+        }
+
+        /// The centre of the darkest pixel within `rect`, both in the tab's points.
+        func darkestPoint(in rect: CGRect) -> CGPoint {
+            let pixels = self.pixels
+            let points = (pixel(rect.minY)..<pixel(rect.maxY)).flatMap { y in
+                (pixel(rect.minX)..<pixel(rect.maxX)).map { (x: $0, y: y) }
+            }
+            let darkest = points.min {
+                SRGBPixels.relativeLuminance(pixels.color(x: $0.x, y: $0.y))
+                    < SRGBPixels.relativeLuminance(pixels.color(x: $1.x, y: $1.y))
+            } ?? (x: 0, y: 0)
+            return CGPoint(
+                x: (CGFloat(darkest.x) + 0.5) / scale - margin, y: (CGFloat(darkest.y) + 0.5) / scale - margin
+            )
+        }
+
+        /// The first row, in points, where a pixel within `columns` is darker than `luminance`.
+        func firstRow(darkerThan luminance: Double, columns: ClosedRange<CGFloat>) -> CGFloat? {
+            let xs = pixel(columns.lowerBound)...pixel(columns.upperBound)
+            let row = (0..<pixels.height).first { y in
+                xs.contains { SRGBPixels.relativeLuminance(pixels.color(x: $0, y: y)) < luminance }
+            }
+            return row.map { CGFloat($0) / scale - margin }
+        }
+
+        private func pixel(_ point: CGFloat) -> Int {
+            Int(((point + margin) * scale).rounded(.down))
+        }
+    }
+
+    /// The colour `fraction` of the way from `start` to `end`, as a two-stop gradient draws it.
+    private static func mix(
+        _ start: NotebookTheme.Tone, _ end: NotebookTheme.Tone, _ fraction: Double
+    ) throws -> SRGBPixels.Color {
+        let first = try XCTUnwrap(SRGBPixels.components(start.uiColor))
+        let second = try XCTUnwrap(SRGBPixels.components(end.uiColor))
+        return blend(second, fraction, over: first)
+    }
+
+    private static func blend(
+        _ color: SRGBPixels.Color, _ opacity: Double, over background: SRGBPixels.Color
+    ) -> SRGBPixels.Color {
+        SRGBPixels.Color(
+            red: color.red * opacity + background.red * (1 - opacity),
+            green: color.green * opacity + background.green * (1 - opacity),
+            blue: color.blue * opacity + background.blue * (1 - opacity)
+        )
+    }
+
+    private func assertColor(
+        _ color: SRGBPixels.Color, matches expected: SRGBPixels.Color, _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(color.red, expected.red, accuracy: 0.01, message, file: file, line: line)
+        XCTAssertEqual(color.green, expected.green, accuracy: 0.01, message, file: file, line: line)
+        XCTAssertEqual(color.blue, expected.blue, accuracy: 0.01, message, file: file, line: line)
+    }
+
+    /// Checks that the tab is shown centred on the page with its top `endTabGap` below the
+    /// last page, in the controller's coordinates.
+    private func assertTab(
+        of controller: NotebookViewController, followsTheLastPage state: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let canvas = controller.canvasView
+        let tab = controller.endOfPaperTab
+        let pageBottom = canvas.contentSize.height - canvas.contentOffset.y
+        let pageCentre = canvas.contentSize.width / 2 - canvas.contentOffset.x
+        XCTAssertFalse(tab.isHidden, state, file: file, line: line)
+        XCTAssertEqual(NotebookTheme.endTabGap, 20, file: file, line: line)
+        XCTAssertEqual(tab.frame.minY, pageBottom + 20, accuracy: 0.5, state, file: file, line: line)
+        XCTAssertEqual(tab.frame.midX, pageCentre, accuracy: 0.5, state, file: file, line: line)
+        let scale = tab.traitCollection.displayScale
+        for edge in [tab.frame.minX * scale, tab.frame.minY * scale] {
+            XCTAssertEqual(edge, edge.rounded(), accuracy: 0.001, "\(state): whole pixels", file: file, line: line)
+        }
+    }
+
+    private func assertLines(
+        of paper: NotebookPaperView, edge: [CGFloat], dividerAlpha: CGFloat, edgeThickness: CGFloat, _ state: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        for layer in [paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer] {
+            guard let color = layer.backgroundColor else { return XCTFail(state, file: file, line: line) }
+            assertComponents(of: color, equal: edge, "\(state): edge", file: file, line: line)
+        }
+        for layer in paper.boundaryLayers + [paper.pageTopLayer] {
+            guard let color = layer.backgroundColor else { return XCTFail(state, file: file, line: line) }
+            assertComponents(
+                of: color, equal: [0.47, 0.40, 0.31, dividerAlpha], "\(state): divider", file: file, line: line
+            )
+        }
+        XCTAssertEqual(paper.edgeLayer.bounds.height, edgeThickness, accuracy: 0.000_1, state, file: file, line: line)
+        XCTAssertEqual(
+            paper.leadingEdgeLayer.frame.width, edgeThickness, accuracy: 0.000_1, state, file: file, line: line
+        )
+        XCTAssertEqual(
+            paper.leadingEdgeLayer.frame.maxX, 0, accuracy: 0.000_1, "\(state): just outside the page",
+            file: file, line: line
+        )
+    }
+
+    private func assertComponents(
+        of color: CGColor, equal expected: [CGFloat], _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let components = color.converted(to: space, intent: .defaultIntent, options: nil)?.components else {
+            return XCTFail(message, file: file, line: line)
+        }
+        XCTAssertEqual(components.count, expected.count, message, file: file, line: line)
+        for (actual, value) in zip(components, expected) {
+            XCTAssertEqual(actual, value, accuracy: 0.002, message, file: file, line: line)
+        }
+    }
+
+    private func veilColors(_ veil: NotebookStatusVeil) throws -> [CGColor] {
+        let colors = try XCTUnwrap(veil.gradientLayer.colors)
+        return colors.map { $0 as! CGColor }
     }
 
     private func ready(_ materials: NotebookMaterials) async {

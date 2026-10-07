@@ -10,6 +10,7 @@ struct NotebookToolbarHost<Content: View>: View {
     private let content: Content
     private let extendsCanvasUnderChrome: Bool
     private let topReservation: CGFloat
+    private let revealActions: [NotebookToolsRevealAction]
     @State private var sceneStore: NotebookSceneToolStore?
     @State private var chrome = NotebookCanvasChrome.none
 
@@ -18,13 +19,16 @@ struct NotebookToolbarHost<Content: View>: View {
     ///   - extendsCanvasUnderChrome: lets paper cover system edges while controls stay in the safe area.
     ///   - topReservation: room below the top safe area for a header drawn over the canvas. The
     ///     toolbar lays out below it, and the canvas reserves it as covered chrome.
+    ///   - revealActions: what VoiceOver offers on the stand-in left while the writing view hides
+    ///     the tools, after bringing them back; the writing view's own choices, for instance.
     init(
         store: NotebookSceneToolStore? = nil, extendsCanvasUnderChrome: Bool = false, topReservation: CGFloat = 0,
-        @ViewBuilder content: () -> Content
+        revealActions: [NotebookToolsRevealAction] = [], @ViewBuilder content: () -> Content
     ) {
         injectedStore = store
         self.extendsCanvasUnderChrome = extendsCanvasUnderChrome
         self.topReservation = topReservation
+        self.revealActions = revealActions
         self.content = content()
     }
 
@@ -50,7 +54,7 @@ struct NotebookToolbarHost<Content: View>: View {
                 // Measure the expanded canvas inside the safe-area modifier, not its safe proposal.
                 .ignoresSafeArea(extendsCanvasUnderChrome ? .container : .keyboard)
             if let store {
-                NotebookToolbarLayer(store: store)
+                NotebookToolbarLayer(store: store, revealActions: revealActions)
                     .padding(.top, topReservation)
                     // The toolbar is read before the canvas, as it sits above it.
                     .accessibilityElement(children: .contain)
@@ -69,7 +73,55 @@ struct NotebookToolbarHost<Content: View>: View {
             }
         }
     }
+}
 
+/// A named accessibility action on the stand-in for hidden tools.
+struct NotebookToolsRevealAction {
+    let name: String
+    let perform: @MainActor () -> Void
+}
+
+extension NotebookToolsRevealAction {
+    /// Brings the rail back from whatever stands in for it. A tap on any stand-in performs it.
+    @MainActor
+    static func showTools(from store: NotebookSceneToolStore, animation: Animation?) -> Self {
+        Self(name: "Show tools and title") {
+            withAnimation(animation) { NotebookToolbarActions(store: store).showTools() }
+        }
+    }
+
+    /// What VoiceOver offers on a stand-in: the tools back first, then the writing view's own
+    /// choices in their order.
+    @MainActor
+    static func standInActions(
+        for store: NotebookSceneToolStore, animation: Animation?, adding choices: [Self]
+    ) -> [Self] {
+        [showTools(from: store, animation: animation)] + choices
+    }
+}
+
+/// How the tools leave and come back when the writing view hides them. They fade as they rise
+/// a little and spring back without bounce; under Reduce Motion they only fade. The stand-in
+/// left behind fades in once they have gone and vanishes as soon as a reveal starts.
+struct NotebookToolsTransition: Equatable {
+    let reduceMotion: Bool
+
+    /// How far above their place hidden tools rest.
+    var hiddenOffset: CGFloat { reduceMotion ? 0 : -NotebookTheme.toolsHideTravel }
+
+    var hide: Animation {
+        reduceMotion ? .linear(duration: NotebookTheme.toolsFadeDuration) : .easeIn(duration: NotebookTheme.toolsHideDuration)
+    }
+
+    var reveal: Animation {
+        reduceMotion
+            ? .linear(duration: NotebookTheme.toolsFadeDuration)
+            : .spring(duration: NotebookTheme.toolsRevealDuration, bounce: 0)
+    }
+
+    var standInAppearance: Animation {
+        .easeOut(duration: NotebookTheme.toolsFadeDuration).delay(reduceMotion ? 0 : NotebookTheme.toolsHideDuration)
+    }
 }
 
 /// Where a dragged toolbar is drawn and where it comes to rest, fixed at the start of a drag.
@@ -79,15 +131,23 @@ struct NotebookToolbarDragResolver: Equatable {
     /// is dragged at its own size but measured against the slots the targets draw.
     let dockSize: CGSize
     let usable: CGRect
+    /// One centred slot stands for every dock, as the window cannot tell them apart.
+    let docksShared: Bool
     let startPlacement: EditorToolbarPlacement
     let startFrame: CGRect
 
-    init(placement: EditorToolbarPlacement, size: CGSize, dockSize: CGSize? = nil, usable: CGRect) {
+    init(
+        placement: EditorToolbarPlacement, size: CGSize, dockSize: CGSize? = nil, usable: CGRect,
+        docksShared: Bool = false
+    ) {
         self.size = size
         self.dockSize = dockSize ?? size
         self.usable = usable
+        self.docksShared = docksShared
         startPlacement = placement
-        startFrame = EditorToolbarLayout.frame(for: placement, size: size, in: usable)
+        var shown = placement
+        if docksShared, case .docked = placement { shown = .docked(.topCenter) }
+        startFrame = EditorToolbarLayout.frame(for: shown, size: size, in: usable)
     }
 
     /// Follows the finger but stays inside the canvas area; the leading and top edges win
@@ -104,9 +164,25 @@ struct NotebookToolbarDragResolver: Equatable {
     /// Resolved from the preview the user sees, so a toolbar shown on a dock lands in it
     /// even when the finger has moved past the edge.
     func placement(translation: CGSize) -> EditorToolbarPlacement {
-        EditorToolbarLayout.placement(
-            forDragEnding: previewFrame(translation: translation), dockSize: dockSize, in: usable,
-            current: startPlacement
+        let preview = previewFrame(translation: translation)
+        guard docksShared else {
+            return EditorToolbarLayout.placement(
+                forDragEnding: preview, dockSize: dockSize, in: usable, current: startPlacement
+            )
+        }
+        // Measured against an area just wide enough for the centred slot, every dock resolves
+        // to that slot. A drop there keeps the stored dock, which shows again in a wider window.
+        let slot = EditorToolbarLayout.frame(for: .docked(.topCenter), size: dockSize, in: usable)
+        let slotArea = CGRect(
+            x: slot.minX - EditorToolbarLayout.margin, y: usable.minY,
+            width: slot.width + 2 * EditorToolbarLayout.margin, height: usable.height
+        )
+        if case .docked = EditorToolbarLayout.placement(forDragEnding: preview, dockSize: dockSize, in: slotArea) {
+            if case .docked = startPlacement { return startPlacement }
+            return .docked(.topCenter)
+        }
+        return EditorToolbarLayout.placement(
+            forDragEnding: preview, dockSize: dockSize, in: usable, snapDistance: -.infinity
         )
     }
 
@@ -194,6 +270,71 @@ enum NotebookToolbarObstruction {
     }
 }
 
+/// Hands the toolbar's obstruction to the store whenever a view update brings a new one.
+/// `onChange` treats a second change within one frame as an update loop and drops it, which
+/// left the canvas with stale scroll space when the toolbar moved twice in quick succession;
+/// a view update delivers every value. The canvas tells a resize from a move by hearing of the
+/// re-measure before it is laid out at the new size, the order `onChange` was probed to keep;
+/// the hosted resize and rotation tests hold this report to it.
+private struct NotebookToolbarObstructionReporter: UIViewRepresentable {
+    let store: NotebookSceneToolStore
+    let measurement: NotebookToolbarObstruction.Measurement
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.isHidden = true
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.report(measurement, to: store)
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var store: NotebookSceneToolStore?
+        private var reported: NotebookToolbarObstruction.Measurement?
+
+        /// A store's first measurement is never a resize, as nothing was measured before it.
+        func report(_ measurement: NotebookToolbarObstruction.Measurement, to store: NotebookSceneToolStore) {
+            let previous = self.store === store ? reported : nil
+            guard measurement != previous else { return }
+            self.store = store
+            reported = measurement
+            store.setOverlayObstruction(
+                measurement.insets, followingResize: previous.map { $0.area != measurement.area } ?? false
+            )
+        }
+    }
+}
+
+/// Fades the rail as the writing view hides it, rising by `offset`, and brings it back. Its keys
+/// leave keyboard focus only once it has faded out completely, and are live again from the first
+/// frame of a reveal; disabled any earlier, they would redraw in the disabled tone mid-fade. A
+/// rail that comes up hidden has nothing to fade and is inert at once.
+struct NotebookRailFade: ViewModifier, Animatable {
+    /// 0 while shown, 1 once hidden.
+    var hiddenAmount: Double
+    let offset: CGFloat
+
+    nonisolated var animatableData: Double {
+        get { hiddenAmount }
+        set { hiddenAmount = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(1 - hiddenAmount)
+            .offset(y: offset * hiddenAmount)
+            .disabled(hiddenAmount >= 1)
+    }
+}
+
 /// Moves the toolbar to its drag preview. Only this modifier reads the per-frame position,
 /// so the toolbar it wraps is not rebuilt while it is dragged.
 struct NotebookToolbarDragPosition: ViewModifier {
@@ -249,7 +390,8 @@ final class NotebookToolbarDragSession {
     }
 }
 
-/// The toolbar, its collapsed handle and the dock targets shown while dragging.
+/// The toolbar, its collapsed handle, the stand-in left while the writing view hides the
+/// tools, and the dock targets shown while dragging.
 @MainActor
 private struct NotebookToolbarLayer: View {
     nonisolated static let coordinateSpace = "NotebookToolbarHost"
@@ -261,30 +403,57 @@ private struct NotebookToolbarLayer: View {
     private static let snap = Animation.spring(duration: 0.35, bounce: 0.2)
 
     @ObservedObject var store: NotebookSceneToolStore
+    let revealActions: [NotebookToolsRevealAction]
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var drag = NotebookToolbarDragSession()
     @State private var dockSnaps = 0
     @GestureState private var isDragging = false
 
+    /// True while the writing view hides an expanded rail. A collapsed handle stays in sight.
+    private static func hidesRail(in store: NotebookSceneToolStore) -> Bool {
+        store.areToolsHidden && !store.toolbar.isCollapsed
+    }
+
     private var actions: NotebookToolbarActions { NotebookToolbarActions(store: store) }
 
     var body: some View {
+        let hidden = Self.hidesRail(in: store)
         GeometryReader { proxy in
             let usable = CGRect(origin: .zero, size: proxy.size)
-            let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: sizeClass)
-            let size = composition.toolbarSize(forHostWidth: usable.width)
-            let dockSize = dockSlotSize(forHostWidth: usable.width)
-            let resting = EditorToolbarLayout.frame(for: store.toolbar.placement, size: size, in: usable)
+            let composition = NotebookToolbarComposition(
+                preferences: store.toolbar, horizontalSizeClass: sizeClass, dynamicTypeSize: dynamicTypeSize
+            )
+            let rail = composition.rail(forHostWidth: usable.width)
+            let resting = composition.frame(for: store.toolbar.placement, rail: rail, in: usable)
+            let transition = NotebookToolsTransition(reduceMotion: reduceMotion)
             ZStack(alignment: .topLeading) {
-                NotebookDockTargets(drag: drag, slotSize: dockSize, usable: usable)
-                toolbar(composition: composition, size: size, dockSize: dockSize, usable: usable)
+                NotebookDockTargets(drag: drag, slotSize: rail.size, usable: usable, docksShared: rail.docksShared)
+                toolbar(composition: composition, rail: rail, usable: usable)
                     .modifier(NotebookToolbarDragPosition(drag: drag, restingFrame: resting))
+                    // Keyed to the store itself, so however often it changes within a frame the
+                    // rail ends up as last asked.
+                    .animation(hidden ? transition.hide : transition.reveal) {
+                        $0.modifier(NotebookRailFade(hiddenAmount: hidden ? 1 : 0, offset: transition.hiddenOffset))
+                    }
+                    .allowsHitTesting(!hidden)
+                    .accessibilityHidden(hidden)
+                if !composition.showsRevealHandle {
+                    standIn(composition: composition, rail: rail, resting: resting, usable: usable)
+                        .animation(hidden ? transition.standInAppearance : nil) { $0.opacity(hidden ? 1 : 0) }
+                        .allowsHitTesting(hidden)
+                        .accessibilityHidden(!hidden)
+                        // Out of sight it is out of keyboard focus too. It shows only while enabled.
+                        .disabled(!hidden)
+                }
             }
-            .onChange(
-                of: NotebookToolbarObstruction.Measurement(toolbar: resting, area: usable), initial: true
-            ) { old, new in
-                store.setOverlayObstruction(new.insets, followingResize: new.area != old.area)
+            // Measured from where the expanded rail rests whether or not it shows, so hiding the
+            // tools never changes the scroll space and never moves the page.
+            .background {
+                NotebookToolbarObstructionReporter(
+                    store: store, measurement: NotebookToolbarObstruction.Measurement(toolbar: resting, area: usable)
+                )
             }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: dockSnaps)
@@ -299,21 +468,24 @@ private struct NotebookToolbarLayer: View {
     }
 
     @ViewBuilder
-    private func toolbar(
-        composition: NotebookToolbarComposition, size: CGSize, dockSize: CGSize, usable: CGRect
-    ) -> some View {
+    private func toolbar(composition: NotebookToolbarComposition, rail: NotebookToolbarRail, usable: CGRect) -> some View {
         let resolver = NotebookToolbarDragResolver(
-            placement: store.toolbar.placement, size: size, dockSize: dockSize, usable: usable
+            placement: store.toolbar.placement, size: composition.toolbarSize(of: rail),
+            dockSize: rail.size, usable: usable, docksShared: rail.docksShared
         )
         if composition.showsRevealHandle {
-            NotebookToolbarRevealHandle(actions: actions) {
-                withAnimation(reduceMotion ? nil : Self.presentation) { actions.setCollapsed(false) }
-            }
+            NotebookToolbarRevealHandle(
+                store: store, label: store.areToolsHidden ? "Show tools and title" : "Show tools"
+            ) { showTools() }
+            .disabled(!actions.isEnabled && !store.areToolsHidden)
             // Takes precedence over the button only once the finger moves, so a tap still reveals.
             .highPriorityGesture(dragGesture(resolver), including: actions.dragGestureMask)
-            .accessibilityActions { placementActions(composition: composition) }
+            .accessibilityActions {
+                placementActions(composition: composition)
+                if store.areToolsHidden { revealActionButtons }
+            }
         } else {
-            NotebookToolbar(store: store, composition: composition, collapse: collapse) {
+            NotebookToolbar(store: store, composition: composition, rail: rail, collapse: collapse) {
                 NotebookToolbarGrip()
                     .gesture(dragGesture(resolver), including: actions.dragGestureMask)
                     .accessibilityElement()
@@ -321,8 +493,59 @@ private struct NotebookToolbarLayer: View {
                     .accessibilityValue(placementDescription)
                     .accessibilityHint("Choose an action to dock the toolbar at the top or float it over the page.")
                     .accessibilityActions { placementActions(composition: composition) }
+                    .accessibilityShowsLargeContentViewer {
+                        Label("Move toolbar", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                    }
             }
         }
+    }
+
+    private var standInAnimation: Animation? { reduceMotion ? nil : Self.presentation }
+
+    /// Every stand-in for the rail brings it back the same way.
+    private func showTools() {
+        NotebookToolsRevealAction.showTools(from: store, animation: standInAnimation).perform()
+    }
+
+
+    /// What stays in sight while the writing view hides the tools: a docked rail leaves a small
+    /// tab hanging where it folded away, a floating rail its collapsed handle. Either asks for
+    /// the tools back; what else returns with them is the writing view's decision.
+    @ViewBuilder
+    private func standIn(
+        composition: NotebookToolbarComposition, rail: NotebookToolbarRail, resting: CGRect, usable: CGRect
+    ) -> some View {
+        if composition.isFloating {
+            let handle = EditorToolbarLayout.frame(
+                for: store.toolbar.placement, size: NotebookTheme.collapsedHandleSize, in: usable
+            )
+            NotebookToolbarRevealHandle(store: store, label: "Show tools and title") { showTools() }
+                .accessibilityActions { revealActionButtons }
+                .frame(width: handle.width, height: handle.height)
+                .position(x: handle.midX, y: handle.midY)
+        } else {
+            let tab = NotebookToolsRevealTab.frame(
+                hangingFrom: resting, dock: rail.docksShared ? .topCenter : dock(of: store.toolbar.placement)
+            )
+            NotebookToolsRevealTab { showTools() }
+                .accessibilityActions { revealActionButtons }
+                .frame(width: tab.width, height: tab.height)
+                .position(x: tab.midX, y: tab.midY)
+        }
+    }
+
+    private var revealActionButtons: some View {
+        let choices = NotebookToolsRevealAction.standInActions(
+            for: store, animation: standInAnimation, adding: revealActions
+        )
+        return ForEach(choices.indices, id: \.self) { index in
+            Button(choices[index].name) { choices[index].perform() }
+        }
+    }
+
+    private func dock(of placement: EditorToolbarPlacement) -> EditorToolbarDock {
+        if case let .docked(dock) = placement { return dock }
+        return .topCenter
     }
 
     private func dragGesture(_ resolver: NotebookToolbarDragResolver) -> some Gesture {
@@ -335,14 +558,6 @@ private struct NotebookToolbarLayer: View {
                     if let placement, resolver.snapsToNewDock(placement) { dockSnaps += 1 }
                 }
             }
-    }
-
-    private func dockSlotSize(forHostWidth width: CGFloat) -> CGSize {
-        NotebookToolbarComposition(
-            preferences: EditorToolbarPreferences(placement: .docked(.topCenter), isCollapsed: false, customSwatches: []),
-            horizontalSizeClass: sizeClass
-        )
-        .toolbarSize(forHostWidth: width)
     }
 
     @ViewBuilder
@@ -375,16 +590,18 @@ private struct NotebookToolbarLayer: View {
 /// Where the dock targets are drawn. Each dock is marked by a short slot at the edge of the
 /// docked toolbar it aligns, the leading edge, the centre or the trailing edge, which is where
 /// a dragged toolbar or handle snaps to it; the markers never overlap however wide the toolbar
-/// is. A toolbar as wide as the window has one frame for every dock, drawn as one slot.
+/// is. Docks the window cannot tell apart share one centred slot.
 enum NotebookDockMarkers {
     /// As wide as the zone around a dock's edge that snaps to it.
     static let markerWidth = 2 * EditorToolbarLayout.snapDistance
 
-    static func frames(slotSize: CGSize, in usable: CGRect) -> [EditorToolbarDock: CGRect] {
+    static func frames(slotSize: CGSize, in usable: CGRect, docksShared: Bool) -> [EditorToolbarDock: CGRect] {
         func slot(_ dock: EditorToolbarDock) -> CGRect {
             EditorToolbarLayout.frame(for: .docked(dock), size: slotSize, in: usable)
         }
-        guard slot(.topTrailing).minX - slot(.topLeading).minX >= 1 else { return [.topCenter: slot(.topCenter)] }
+        guard !docksShared, slot(.topTrailing).minX - slot(.topLeading).minX >= 1 else {
+            return [.topCenter: slot(.topCenter)]
+        }
         var markers: [EditorToolbarDock: CGRect] = [:]
         for dock in EditorToolbarDock.allCases {
             let slot = slot(dock)
@@ -401,55 +618,101 @@ enum NotebookDockMarkers {
 }
 
 /// Dock markers shown while the toolbar is dragged. The targeted dock's marker fills in and
-/// the full slot the toolbar will take is outlined.
-private struct NotebookDockTargets: View {
+/// the full slot the toolbar will take is outlined. Nothing lifts and no shadow changes.
+struct NotebookDockTargets: View {
     let drag: NotebookToolbarDragSession
     let slotSize: CGSize
     let usable: CGRect
+    let docksShared: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if drag.isActive {
-            let markers = NotebookDockMarkers.frames(slotSize: slotSize, in: usable)
-            // A single slot stands for every dock, so any targeted dock fills it.
-            let isShared = markers.count == 1
-            ZStack(alignment: .topLeading) {
-                ForEach(EditorToolbarDock.allCases, id: \.self) { dock in
-                    if let marker = markers[dock] {
-                        let isTargeted = isShared ? drag.targetedDock != nil : drag.targetedDock == dock
-                        target(
-                            marker,
-                            fill: isTargeted ? NotebookTheme.dockSlotTargetedFillOpacity : NotebookTheme.dockSlotFillOpacity
-                        )
+        ZStack(alignment: .topLeading) {
+            if drag.isActive {
+                let markers = NotebookDockMarkers.frames(slotSize: slotSize, in: usable, docksShared: docksShared)
+                // A single slot stands for every dock, so any targeted dock fills it and lands in it.
+                let isShared = markers.count == 1
+                ZStack(alignment: .topLeading) {
+                    ForEach(EditorToolbarDock.allCases, id: \.self) { dock in
+                        if let marker = markers[dock] {
+                            let isTargeted = isShared ? drag.targetedDock != nil : drag.targetedDock == dock
+                            NotebookDockTarget(fill: isTargeted ? .targeted : .idle, isLanding: isShared && isTargeted)
+                                .frame(width: marker.width, height: marker.height)
+                                .position(x: marker.midX, y: marker.midY)
+                        }
+                    }
+                    if !isShared, let dock = drag.targetedDock {
+                        let slot = EditorToolbarLayout.frame(for: .docked(dock), size: slotSize, in: usable)
+                        NotebookDockTarget(fill: .landing, isLanding: true)
+                            .frame(width: slot.width, height: slot.height)
+                            .position(x: slot.midX, y: slot.midY)
                     }
                 }
-                if !isShared, let dock = drag.targetedDock {
-                    target(EditorToolbarLayout.frame(for: .docked(dock), size: slotSize, in: usable), fill: 0)
-                }
+                .transition(.opacity)
             }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
         }
-    }
-
-    /// Targets lie over paper, or over the stone backdrop beside a zoomed-out page, so a pale
-    /// fill and dark dashes keep them readable on both.
-    private func target(_ frame: CGRect, fill: Double) -> some View {
-        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
-        return shape
-            .fill(NotebookTheme.panelSurface.color.opacity(fill))
-            .overlay {
-                shape.strokeBorder(
-                    NotebookTheme.glyph.color.opacity(NotebookTheme.dockSlotOutlineOpacity),
-                    style: NotebookTheme.dockSlotOutline
-                )
-            }
-            .frame(width: frame.width, height: frame.height)
-            .position(x: frame.midX, y: frame.midY)
+        .animation(reduceMotion ? nil : .easeOut(duration: NotebookTheme.dockMarkerFadeDuration), value: drag.isActive)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
-/// The drag region at the leading end of the toolbar, kept apart from the scrolling strips:
-/// two raised ridges, as on hardware.
+/// One dock target. Targets lie over paper, or over the stone backdrop beside a zoomed-out
+/// page, so a pale well tone and a dark outline keep them readable on both. Under Reduce
+/// Transparency the fills are precomposited and opaque; under Increase Contrast every outline
+/// is solid and full strength.
+struct NotebookDockTarget: View {
+    enum Fill {
+        /// A dock the toolbar could land in.
+        case idle
+        /// The dock the toolbar would land in.
+        case targeted
+        /// The full frame the toolbar would take.
+        case landing
+    }
+
+    let fill: Fill
+    /// The frame the toolbar would take is outlined solid; markers are dashed.
+    let isLanding: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
+        let outline = Self.outline(isLanding: isLanding, contrast: contrast)
+        shape
+            .fill(Self.tone(for: fill, reduceTransparency: reduceTransparency))
+            .overlay { shape.strokeBorder(outline.color, style: outline.style) }
+    }
+
+    static func tone(for fill: Fill, reduceTransparency: Bool) -> Color {
+        switch fill {
+        case .idle:
+            reduceTransparency
+                ? NotebookTheme.dockSlotOpaqueFill.color
+                : NotebookTheme.selectedWell.color.opacity(NotebookTheme.dockSlotFillOpacity)
+        case .targeted:
+            reduceTransparency
+                ? NotebookTheme.dockSlotTargetedOpaqueFill.color
+                : NotebookTheme.selectedWell.color.opacity(NotebookTheme.dockSlotTargetedFillOpacity)
+        case .landing:
+            reduceTransparency
+                ? NotebookTheme.dockSlotLandingOpaqueFill.color
+                : NotebookTheme.selectedWell.color.opacity(NotebookTheme.dockSlotLandingFillOpacity)
+        }
+    }
+
+    static func outline(isLanding: Bool, contrast: ColorSchemeContrast) -> (color: Color, style: StrokeStyle) {
+        if contrast == .increased { return (NotebookTheme.glyph.color, NotebookTheme.dockSlotLandingOutline) }
+        return (
+            NotebookTheme.glyph.color.opacity(NotebookTheme.dockSlotOutlineOpacity),
+            isLanding ? NotebookTheme.dockSlotLandingOutline : NotebookTheme.dockSlotOutline
+        )
+    }
+}
+
+/// The drag region of the grip column, kept apart from the scrolling strips: two raised
+/// ridges, as on hardware.
 private struct NotebookToolbarGrip: View {
     var body: some View {
         HStack(spacing: NotebookTheme.gripRidgeSpacing) {
@@ -459,30 +722,130 @@ private struct NotebookToolbarGrip: View {
             }
         }
         .foregroundStyle(NotebookTheme.glyphSecondary.color)
-        .frame(width: NotebookTheme.dragHandleHitSize.width)
-        .frame(maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
     }
 }
 
-/// What remains of a collapsed floating toolbar; always inside the canvas area.
-private struct NotebookToolbarRevealHandle: View {
-    let actions: NotebookToolbarActions
+/// The tab a docked rail leaves where it folded away while the writing view hides the tools.
+/// It is faint only because it is small: the chevron on it keeps full contrast.
+private struct NotebookToolsRevealTab: View {
+    /// The tab's touch area, hanging from the top of the rail it stands in for: inset from the
+    /// rail's leading or trailing end at those docks, centred otherwise.
+    static func frame(hangingFrom rail: CGRect, dock: EditorToolbarDock) -> CGRect {
+        let hit = NotebookTheme.revealTabHitSize
+        let inset = (hit.width - NotebookTheme.revealTabSize.width) / 2
+        let tabInset = NotebookTheme.stripInsets.left
+        let x = switch dock {
+        case .topLeading: rail.minX + tabInset - inset
+        case .topCenter: rail.midX - hit.width / 2
+        case .topTrailing: rail.maxX - tabInset + inset - hit.width
+        }
+        return CGRect(x: x, y: rail.minY, width: hit.width, height: hit.height)
+    }
+
     let reveal: () -> Void
 
     var body: some View {
+        let symbol = "chevron.compact.down"
         Button(action: reveal) {
-            // Only the glyph dims while writing is paused; the shell stays opaque over the page.
-            NotebookToolGlyph(symbol: "pencil.tip.crop.circle", isSelected: false)
-                .opacity(actions.contentOpacity)
+            // The secondary glyph tone reads as the full glyph under Increase Contrast.
+            Image(systemName: symbol)
+                .font(.system(size: NotebookTheme.chevronSize, weight: .semibold))
+                .foregroundStyle(NotebookTheme.glyphSecondary.color)
         }
-        .buttonStyle(NotebookRevealHandleStyle())
-        .disabled(!actions.isEnabled)
-        .accessibilityLabel("Show tools")
+        .buttonStyle(NotebookRevealTabStyle())
+        .accessibilityLabel("Show tools and title")
+        .accessibilityShowsLargeContentViewer {
+            Label("Show tools and title", systemImage: symbol)
+        }
     }
 }
 
-/// Draws the collapsed handle as the toolbar's opaque shell with the reveal control inside it,
+/// Draws the reveal tab's capsule at the top of its larger touch area, pressed and focused like
+/// every key: the capsule sinks and the chevron drops a point.
+private struct NotebookRevealTabStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        let face = NotebookTheme.revealTabSize
+        let hit = NotebookTheme.revealTabHitSize
+        NotebookKey(
+            label: configuration.label.frame(width: face.width, height: face.height),
+            isSelected: false, isPressed: configuration.isPressed, shape: .capsule
+        )
+        .background { NotebookRevealTabFace() }
+        .frame(width: hit.width, height: hit.height, alignment: .top)
+        .contentShape(Rectangle())
+    }
+}
+
+/// The tab's capsule, a little translucent over the paper unless the system asks for opaque
+/// chrome.
+private struct NotebookRevealTabFace: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        let shadow = NotebookTheme.contactShadow
+        let opaque = reduceTransparency || contrast == .increased
+        Capsule()
+            .fill(NotebookTheme.panelSurface.color.opacity(opaque ? 1 : NotebookTheme.revealTabOpacity))
+            .overlay {
+                Capsule().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
+            }
+            .shadow(color: shadow.color, radius: shadow.radius, x: shadow.offset.width, y: shadow.offset.height)
+            .accessibilityHidden(true)
+    }
+}
+
+/// What remains of a collapsed floating toolbar, or of a floating rail the writing view hides:
+/// the tool in use, with a bead of its ink. Always inside the canvas area.
+private struct NotebookToolbarRevealHandle: View {
+    @ObservedObject var store: NotebookSceneToolStore
+    let label: String
+    let reveal: () -> Void
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        let tool = store.tool
+        Button(action: reveal) {
+            // Only the content dims while writing is paused; the shell stays opaque over the page.
+            Image(systemName: tool.kind.symbol)
+                .font(.system(size: NotebookTheme.handleGlyphSize))
+                .modifier(NotebookKeyForeground())
+                .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
+                .overlay {
+                    if tool.inkFamily != nil {
+                        Circle()
+                            .fill(tool.color.swiftUIColor)
+                            .padding(NotebookTheme.shellBorderWidth)
+                            .background { Circle().fill(NotebookTheme.panelTop.color) }
+                            .frame(
+                                width: NotebookTheme.handleBeadDiameter + 2 * NotebookTheme.shellBorderWidth,
+                                height: NotebookTheme.handleBeadDiameter + 2 * NotebookTheme.shellBorderWidth
+                            )
+                            .offset(x: NotebookTheme.handleBeadOffset, y: NotebookTheme.handleBeadOffset)
+                    }
+                }
+                .opacity(NotebookToolbarActions(store: store).contentOpacity(for: contrast))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NotebookRevealHandleStyle())
+        .accessibilityLabel(label)
+        .accessibilityValue(toolDescription)
+        .accessibilityShowsLargeContentViewer {
+            Label(label, systemImage: tool.kind.symbol)
+        }
+    }
+
+    /// The tool in use, and its colour when it inks.
+    private var toolDescription: String {
+        let tool = store.tool
+        guard tool.inkFamily != nil else { return tool.kind.title }
+        return "\(tool.kind.title), \(tool.color.accessibilityName)"
+    }
+}
+
+/// Draws the collapsed handle as a small opaque shell with the reveal control inside it,
 /// pressed and focused the same way as every control in the expanded toolbar.
 struct NotebookRevealHandleStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -497,6 +860,7 @@ struct NotebookRevealHandleBody<Label: View>: View {
     @Environment(\.isFocused) private var isFocused
 
     var body: some View {
+        let radius = NotebookTheme.compactPanelCornerRadius
         label
             .frame(width: NotebookTheme.collapsedHandleSize.width, height: NotebookTheme.collapsedHandleSize.height)
             .background {
@@ -506,8 +870,8 @@ struct NotebookRevealHandleBody<Label: View>: View {
                 // Inset as controls are in a strip, which keeps the well's corners inside the shell's.
                 .padding(NotebookTheme.stripInsets.top)
             }
-            .background { NotebookToolbarShell() }
-            .contentShape(RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous))
+            .background { NotebookPanelShell(cornerRadius: radius) }
+            .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
     }
 }
 

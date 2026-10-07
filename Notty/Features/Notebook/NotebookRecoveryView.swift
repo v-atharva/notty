@@ -9,62 +9,85 @@ struct NotebookRecoveryView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                if session.isLoadingRecoveryCopies { ProgressView("Opening recovery copies") }
-                if let failure = session.recoveryListFailure {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(failure.title).font(.headline)
-                        Text(failure.message)
-                        Button("Try again") { Task { await session.refreshRecoveryCopies() } }
+            ScrollView {
+                VStack(alignment: .leading, spacing: NotebookTheme.sectionSpacing) {
+                    if session.isLoadingRecoveryCopies {
+                        NotebookStatusCard(loading: "Opening recovery copies")
+                            .frame(maxWidth: .infinity)
                     }
-                }
-                if !session.isLoadingRecoveryCopies && session.recoveryListFailure == nil
-                    && session.recoveryCopies.isEmpty && session.recoveryIssues.isEmpty
-                    && session.unavailableRecoveryCopyIDs.isEmpty && session.unattributedRecoveryIssues.isEmpty {
-                    Text("No recovery copies have been preserved for this notebook.")
-                }
-                if !session.recoveryIssues.isEmpty {
-                    Section("Copies needing attention") {
+                    if let failure = session.recoveryListFailure {
+                        NotebookStatusCard(title: failure.title, message: failure.message) {
+                            Button("Try again") { Task { await session.refreshRecoveryCopies() } }
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    if !session.isLoadingRecoveryCopies && session.recoveryListFailure == nil
+                        && session.recoveryCopies.isEmpty && session.recoveryIssues.isEmpty
+                        && session.unavailableRecoveryCopyIDs.isEmpty && session.unattributedRecoveryIssues.isEmpty {
+                        NotebookRecoveryCard {
+                            NotebookRecoveryCardText("No recovery copies have been preserved for this notebook.")
+                        }
+                    }
+                    if !session.recoveryIssues.isEmpty {
+                        NotebookSectionLabel("Copies needing attention")
                         ForEach(session.recoveryIssues, id: \.copyID) { issue in
-                            if issue.kind == .damagedData {
-                                NavigationLink {
-                                    NotebookRecoveryInspector(
-                                        session: session, copyID: issue.copyID, close: { dismiss() }
-                                    )
-                                } label: { recoveryIssue(issue) }
-                            } else {
+                            NotebookRecoveryCard {
                                 recoveryIssue(issue)
+                                if issue.kind == .damagedData {
+                                    NavigationLink("Inspect preserved edits") {
+                                        NotebookRecoveryInspector(
+                                            session: session, copyID: issue.copyID, close: { dismiss() }
+                                        )
+                                    }
+                                    .buttonStyle(NotebookActionKeyStyle(kind: .secondary))
+                                    .accessibilityLabel("Inspect preserved edits of copy \(issue.copyID.uuidString.prefix(8))")
+                                }
+                            }
+                        }
+                    } else if !session.unavailableRecoveryCopyIDs.isEmpty {
+                        NotebookSectionLabel("Unavailable copies")
+                        NotebookRecoveryCard {
+                            NotebookRecoveryCardText("These copies could not be verified. Their files remain stored.")
+                            ForEach(session.unavailableRecoveryCopyIDs, id: \.self) { identity in
+                                Label("Unavailable copy \(identity.uuidString.prefix(8))", systemImage: "exclamationmark.triangle")
+                                    .font(.footnote)
+                                    .foregroundStyle(NotebookTheme.alertGlyph.color)
                             }
                         }
                     }
-                } else if !session.unavailableRecoveryCopyIDs.isEmpty {
-                    Section("Unavailable copies") {
-                        Text("These copies could not be verified. Their files remain stored.")
-                        ForEach(session.unavailableRecoveryCopyIDs, id: \.self) { identity in
-                            Label("Unavailable copy \(identity.uuidString.prefix(8))", systemImage: "exclamationmark.triangle")
+                    if !session.unattributedRecoveryIssues.isEmpty {
+                        NotebookSectionLabel("Unattributed records")
+                        NotebookRecoveryCard {
+                            NotebookRecoveryCardText("These records could not be assigned to a notebook. They remain stored and do not mark this notebook's copies as damaged.")
                         }
-                    }
-                }
-                if !session.unattributedRecoveryIssues.isEmpty {
-                    Section("Unattributed records") {
-                        Text("These records could not be assigned to a notebook. They remain stored and do not mark this notebook's copies as damaged.")
                         ForEach(session.unattributedRecoveryIssues, id: \.copyID) { issue in
-                            recoveryIssue(issue)
+                            NotebookRecoveryCard { recoveryIssue(issue) }
+                        }
+                    }
+                    ForEach(session.recoveryCopies, id: \.id) { receipt in
+                        let savedAt = receipt.savedAt.formatted(date: .abbreviated, time: .shortened)
+                        // Copies preserved in the same minute differ by the second.
+                        let preciseSavedAt = receipt.savedAt.formatted(date: .abbreviated, time: .standard)
+                        NotebookRecoveryCard {
+                            Text(savedAt)
+                                .notebookTypeface(NotebookTheme.noteTitle)
+                                .foregroundStyle(NotebookTheme.glyph.color)
+                            NotebookRecoveryCardText("\(receipt.editCount) ordered edits")
+                            NavigationLink("Inspect preserved edits") {
+                                NotebookRecoveryInspector(
+                                    session: session, copyID: receipt.id, expectedReceipt: receipt, close: { dismiss() }
+                                )
+                            }
+                            .buttonStyle(NotebookActionKeyStyle(kind: .secondary))
+                            // Every card has this key, so its name says which copy it opens while
+                            // keeping the visible words Voice Control users speak.
+                            .accessibilityLabel("Inspect preserved edits from \(preciseSavedAt)")
                         }
                     }
                 }
-                ForEach(session.recoveryCopies, id: \.id) { receipt in
-                    NavigationLink {
-                        NotebookRecoveryInspector(session: session, copyID: receipt.id, expectedReceipt: receipt, close: { dismiss() })
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(receipt.savedAt.formatted(date: .abbreviated, time: .shortened))
-                            Text("\(receipt.editCount) ordered edits")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
+                .padding(NotebookTheme.popoverPadding)
             }
+            .background { NotebookTheme.backdropStone.color.ignoresSafeArea() }
             .navigationTitle("Recovery copies")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -72,6 +95,8 @@ struct NotebookRecoveryView: View {
                 }
             }
         }
+        .tint(NotebookTheme.controlTint.color)
+        .presentationBackground(NotebookTheme.backdropStone.color)
         .task { await session.refreshRecoveryCopies() }
     }
 
@@ -83,10 +108,41 @@ struct NotebookRecoveryView: View {
         case .unsafePath: explanation = "The storage path cannot be used safely."
         case .ioFailure: explanation = "Storage is temporarily unavailable. Try again."
         }
-        return VStack(alignment: .leading, spacing: 4) {
+        return VStack(alignment: .leading, spacing: NotebookTheme.recoveryCardTitleSpacing) {
             Text("Copy \(issue.copyID.uuidString.prefix(8))")
-            Text(explanation).font(.caption).foregroundStyle(.secondary)
+                .notebookTypeface(NotebookTheme.noteTitle)
+                .foregroundStyle(NotebookTheme.glyph.color)
+            NotebookRecoveryCardText(explanation)
         }
+    }
+}
+
+/// A preserved copy or a notice about the copies, as a card on the stone of the sheet.
+private struct NotebookRecoveryCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: NotebookTheme.sectionSpacing) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(NotebookTheme.popoverPadding)
+        .background { NotebookPanelShell(cornerRadius: NotebookTheme.compactPanelCornerRadius) }
+    }
+}
+
+private struct NotebookRecoveryCardText: View {
+    let text: String
+
+    init(_ text: String) {
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.footnote)
+            .foregroundStyle(NotebookTheme.glyphSecondary.color)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -154,16 +210,20 @@ private struct NotebookRecoveryInspector: View {
         VStack(spacing: 10) {
             HStack(spacing: 16) {
                 Button("Previous") { Task { await select(index - 1) } }
+                    .buttonStyle(NotebookActionKeyStyle(kind: .secondary))
+                    .fixedSize()
                     .disabled(isOpening || index == 0)
                 Spacer()
                 VStack(spacing: 3) {
                     Text("Edit \(index + 1) of \(edits.count)")
                     Text(edits[index].stamp.capturedAt.formatted(date: .abbreviated, time: .standard))
                         .font(.caption)
-                    Text("Read only").font(.caption).foregroundStyle(.secondary)
+                    Text("Read only").font(.caption).foregroundStyle(NotebookTheme.glyphSecondary.color)
                 }
                 Spacer()
                 Button("Next") { Task { await select(index + 1) } }
+                    .buttonStyle(NotebookActionKeyStyle(kind: .secondary))
+                    .fixedSize()
                     .disabled(isOpening || index == edits.count - 1)
             }
             NotebookRecoveryRestoreButton(
@@ -171,7 +231,14 @@ private struct NotebookRecoveryInspector: View {
                 copyID: copyID, editID: edits[index].id, isOpening: isOpening || failure != nil, close: close
             )
         }
-        .font(.footnote).padding().background(.regularMaterial)
+        .font(.footnote)
+        .foregroundStyle(NotebookTheme.glyph.color)
+        .padding(NotebookTheme.popoverPadding)
+        .background {
+            NotebookTheme.panelSurface.color
+                .overlay(alignment: .top) { NotebookTheme.divider.color.frame(height: NotebookTheme.dividerThickness) }
+                .ignoresSafeArea(edges: .bottom)
+        }
     }
 
     private func select(_ requested: Int) async {
@@ -211,9 +278,14 @@ private struct NotebookRecoveryRestoreButton: View {
                     if await session.restoreRecoveryEdit(copyID: copyID, editID: editID) { close() }
                 }
             }
+            .buttonStyle(NotebookActionKeyStyle(kind: .primary))
             .disabled(isOpening || !session.canRestoreRecovery)
-            if let message = status.state.recoveryMessage { Text(message).foregroundStyle(.secondary) }
-            if let failure = status.state.recoveryFailure { Text(failure.message).foregroundStyle(.secondary) }
+            if let message = status.state.recoveryMessage {
+                Text(message).foregroundStyle(NotebookTheme.glyphSecondary.color)
+            }
+            if let failure = status.state.recoveryFailure {
+                Text(failure.message).foregroundStyle(NotebookTheme.glyphSecondary.color)
+            }
         }
     }
 }

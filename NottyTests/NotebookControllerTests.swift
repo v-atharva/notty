@@ -1334,6 +1334,185 @@ final class NotebookControllerTests: XCTestCase {
         }
     }
 
+    // MARK: - Writing view
+
+    func testOnlyTheUsersOwnScrollingReachesTheWritingView() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 0, "a programmatic offset is not the user's scrolling")
+
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 320), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 20)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 330), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 30, "the deceleration a drag starts still counts")
+        controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertEqual(rig.chrome.travel, NotebookWritingChrome.fullTravel, "a header past hiding settles away")
+        XCTAssertTrue(store.areToolsHidden)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 100), animated: false)
+        XCTAssertFalse(rig.chrome.state.showsHeader, "once the drag has ended, offsets do not count")
+        controller.scrollViewDidScrollToTop(canvas)
+        XCTAssertTrue(rig.chrome.state.showsHeader, "the status-bar tap is the user's own arrival at the top")
+        XCTAssertEqual(rig.chrome.travel, 0)
+    }
+
+    func testSpringingBackFromPastTheLastPageIsNotAnUpwardScroll() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let end = maximumOffsetY(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end - 200), animated: false)
+        controller.scrollViewWillBeginDragging(canvas)
+        for y in [end - 100, end, end + 60, end + 90] {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        for y in [end + 60, end + 20, end] {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertFalse(rig.chrome.state.showsHeader, "the spring back reports no movement")
+        XCTAssertTrue(store.areToolsHidden)
+    }
+
+    /// A deceleration can stop without reporting its end, as when a stroke halts it. Offsets the
+    /// user no longer drives then end the scroll instead of moving the header.
+    func testOffsetsAfterAnUnreportedStopDoNotMoveTheHeader() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 310), animated: false)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        XCTAssertEqual(rig.chrome.travel, 10)
+
+        rig.chrome.scrollIsUserDriven = { _ in false }
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 360), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 0, "the scroll ends there and the part-way header settles back")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 500), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 0, "later offsets belong to layout or code")
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        XCTAssertFalse(store.areToolsHidden)
+
+        // The real test reads the scroll view itself, which reports no touches here.
+        XCTAssertFalse(NotebookWritingChrome.isUserDriven(canvas))
+        rig.chrome.scrollIsUserDriven = NotebookWritingChrome.isUserDriven
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 600), animated: false)
+        XCTAssertEqual(rig.chrome.travel, 0, "a canvas neither tracking, dragging nor decelerating is not the user's")
+    }
+
+    func testToolUseReachesTheWritingViewAndTearDownCancelsIt() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 200), animated: false)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        XCTAssertEqual(rig.chrome.travel, 0, "the header holds still under the pen")
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertFalse(rig.chrome.state.showsHeader, "focus clears the page once the stroke ends")
+        XCTAssertTrue(store.areToolsHidden)
+
+        rig.chrome.reveal(.sticky)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.tearDown()
+        XCTAssertNil(controller.writingChrome)
+        XCTAssertTrue(rig.chrome.state.showsHeader, "a stroke cut short hides nothing")
+        rig.drag(by: 100)
+        XCTAssertFalse(rig.chrome.state.showsHeader, "scrolling counts again once the stroke is cancelled")
+    }
+
+    func testPencilToolSwitchShowsTheToolsBrieflyAndPaletteRequestsKeepThem() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertTrue(store.areToolsHidden)
+
+        controller.handlePencilPreference(.switchEraser)
+        XCTAssertFalse(store.areToolsHidden, "the switched tool shows")
+        XCTAssertFalse(rig.chrome.state.showsHeader, "a tool switch leaves the page clear of the header")
+        try await NotebookTestFixtures.waitUntil { store.areToolsHidden }
+
+        controller.handlePencilPreference(.showColorPalette)
+        XCTAssertFalse(store.areToolsHidden)
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(store.areToolsHidden, "a palette request keeps the tools up")
+    }
+
+    /// A toolbar re-measured for a new control area claims the page rested at its top. When no resize
+    /// follows and the user then scrolls into the page, a later resize must not move it back to its top.
+    func testUserScrollEndsAnUnconfirmedClaimThatThePageRestedAtItsTop() {
+        let portrait = CGSize(width: 1_024, height: 1_366)
+        let landscape = CGSize(width: 1_366, height: 1_024)
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        defer { controller.tearDown() }
+        controller.loadViewIfNeeded()
+        controller.placeUnderToolbar(of: store)
+        let canvas = controller.canvasView
+        controller.view.frame = CGRect(origin: .zero, size: portrait)
+        controller.view.layoutIfNeeded()
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: portrait))
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 75, left: 0, bottom: 0, right: 0), followingResize: true)
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 600), animated: false)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+
+        controller.view.frame = CGRect(origin: .zero, size: landscape)
+        controller.view.layoutIfNeeded()
+        XCTAssertGreaterThan(canvas.contentOffset.y, -canvas.contentInset.top + 0.5,
+            "a page the user scrolled into keeps its place through a later resize")
+    }
+
     private func maximumOffsetY(_ canvas: PKCanvasView) -> CGFloat {
         canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
     }

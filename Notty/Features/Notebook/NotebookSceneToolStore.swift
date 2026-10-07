@@ -34,6 +34,8 @@ final class NotebookSceneToolStore: ObservableObject {
 
     let toolDefaultsKey: String
     private let defaults: UserDefaults
+    /// The writing view of the notebook shown in this scene, which decides when the tools show.
+    private weak var writingChrome: NotebookWritingChrome?
     private weak var activeController: NotebookViewController?
     /// The canvas the toolbar is drawn over. A paused canvas never owns the tools, yet the
     /// toolbar still covers its first lines.
@@ -147,9 +149,35 @@ final class NotebookSceneToolStore: ObservableObject {
         areToolsHidden = hidden
     }
 
-    /// Brings hidden tools back, as a tap on the reveal tab or a Pencil gesture asks.
+    /// Brings hidden tools back to stay, with the header, as the reveal tab asks. Without a writing
+    /// view only the tools return.
     func revealTools() {
-        setToolsHidden(false)
+        guard let writingChrome else {
+            setToolsHidden(false)
+            return
+        }
+        writingChrome.reveal(.sticky)
+    }
+
+    /// Hands the writing view of the notebook now shown in this scene its reveal requests.
+    func adoptWritingChrome(_ chrome: NotebookWritingChrome) {
+        writingChrome = chrome
+    }
+
+    /// Whether `chrome` is the writing view this scene's tools follow.
+    func isWritingChrome(_ chrome: NotebookWritingChrome) -> Bool {
+        writingChrome === chrome
+    }
+
+    /// Reported by the toolbar while it is dragged, so it and the header never hide mid-drag.
+    func setToolbarDragging(_ dragging: Bool) {
+        writingChrome?.setToolbarDragging(dragging)
+    }
+
+    /// Reported by the toolbar while one of its popovers or sheets, identified by `id`, is open,
+    /// so the tools and header stay in sight and Escape is left to close it.
+    func setToolbarPresentation(_ id: UUID, isPresented: Bool) {
+        writingChrome?.setPresentation(id, isPresented: isPresented)
     }
 
     /// Stores settled toolbar preferences. Callers pass final drag results, not every frame.
@@ -159,10 +187,18 @@ final class NotebookSceneToolStore: ObservableObject {
         defaults.set(preferences.encoded(), forKey: Self.toolbarDefaultsKey)
     }
 
+    /// A gesture that asks for the palette brings the tools up to stay. One that switches the tool
+    /// shows them briefly, so the change is seen while the writing view keeps the page clear.
     func handlePencil(_ preference: EditorPencilTapPreference, from controller: NotebookViewController) {
         guard activeController === controller, isToolbarAvailable else { return }
         var reveal = false
+        let before = tool
         update { reveal = $0.handlePencilDoubleTap(preference) }
-        if reveal { revealRequest &+= 1 }
+        if reveal {
+            revealRequest &+= 1
+            writingChrome?.reveal(.sticky)
+        } else if tool != before {
+            writingChrome?.reveal(.transient)
+        }
     }
 }

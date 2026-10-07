@@ -15,9 +15,8 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         XCTAssertEqual(
             NotebookUpcomingFeature.placed(.toolStrip).map(\.title), ["Text", "Insert", "Record audio", "Bookmark"]
         )
-        XCTAssertEqual(NotebookUpcomingFeature.placed(.navigationLeading).map(\.title), ["Notebooks"])
         XCTAssertEqual(
-            NotebookUpcomingFeature.placed(.navigationTrailing).map(\.title), ["Search", "Summarize", "Export", "Backup"]
+            NotebookUpcomingFeature.placed(.menu).map(\.title), ["Notebooks", "Search", "Summarize", "Export", "Backup"]
         )
         let placed = NotebookUpcomingFeature.Placement.allCases.flatMap(NotebookUpcomingFeature.placed)
         XCTAssertEqual(placed.count, catalogue.count, "Every feature has exactly one placement.")
@@ -34,93 +33,91 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
 
     // MARK: - Toolbar strip
 
-    func testEveryExpandedToolbarEndsItsToolRowWithTheStripPlaceholdersOnce() {
+    /// The planned tools close the tool row as one group, only where the rail fits all of them.
+    /// The single compact row scrolls on to them, as it always has.
+    func testToolRowEndsWithEveryPlaceholderOnlyWhereTheWholeGroupFits() {
         let floating = EditorToolbarPreferences(
             placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: false, customSwatches: []
         )
-        var collapsed = floating
-        collapsed.setCollapsed(true)
+        let expected: [(CGFloat, UserInterfaceSizeClass?, Bool)] = [
+            (1_366, .regular, true), (1_024, .regular, true), (1_032, nil, true),
+            (1_194, .regular, false), (834, .regular, false), (678, .regular, false), (507, .compact, true),
+        ]
         for preferences in [EditorToolbarPreferences.standard, floating] {
-            for sizeClass in [UserInterfaceSizeClass.regular, .compact, nil] {
-                let composition = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass)
-                XCTAssertEqual(
-                    composition.upcomingTools.map(\.title), ["Text", "Insert", "Record audio", "Bookmark"], "\(preferences)"
-                )
+            for (width, sizeClass, shows) in expected {
+                let rail = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass)
+                    .rail(forHostWidth: width)
+                let label = "\(width) \(String(describing: sizeClass)) \(preferences.placement)"
+                XCTAssertEqual(rail.showsUpcoming, shows, label)
+                let tail = rail.toolRow.slots.suffix(NotebookUpcomingFeature.placed(.toolStrip).count + 1).map(\.item)
+                if shows {
+                    XCTAssertEqual(rail.upcomingTools.map(\.title), ["Text", "Insert", "Record audio", "Bookmark"], label)
+                    XCTAssertEqual(
+                        tail, [.upcomingLabel] + NotebookUpcomingFeature.placed(.toolStrip).map { .upcoming($0) }, label
+                    )
+                } else {
+                    XCTAssertTrue(rail.upcomingTools.isEmpty, label)
+                    XCTAssertFalse(rail.toolRow.slots.contains { $0.item == .upcomingLabel }, label)
+                }
             }
         }
-        let handle = NotebookToolbarComposition(preferences: collapsed, horizontalSizeClass: .regular)
-        XCTAssertTrue(handle.upcomingTools.isEmpty, "A collapsed toolbar is only its reveal handle.")
     }
 
     /// SwiftUI frames are not readable from a hosted test, so a tool row that needs no scrolling
-    /// stands in for "every placeholder and the mark are on screen before any paging".
+    /// stands in for "every placeholder and the caption are on screen before any paging".
     func testWideToolRowShowsEveryPlaceholderWithoutScrolling() async throws {
-        // A full-screen 12.9-inch iPad in landscape.
-        for placement in [EditorToolbarPlacement.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))] {
-            let fixture = try await NotebookTestFixtures.mountToolbarHost(store: toolStore(placedAt: placement), width: 1_366)
-            defer { fixture.close() }
-            let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
-            XCTAssertLessThanOrEqual(
-                strip.contentSize.width, strip.bounds.width + 0.5,
-                "\(placement): the working tools, the mark and every placeholder fit without paging."
-            )
-            XCTAssertEqual(strip.contentOffset.x, 0)
-            assertPlaceholderTouchesStayInTheStrip(strip, fixture: fixture)
-        }
-    }
-
-    /// In portrait the toolbar keeps the docks apart, so the placeholders page into view after
-    /// the working tools, which all show at rest.
-    func testPortraitToolRowShowsTheWorkingToolsAndPagesToThePlaceholders() async throws {
-        // The 12.9-inch and 11-inch iPads in portrait.
-        let placements: [EditorToolbarPlacement] = [.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))]
-        let layouts: [(CGFloat, EditorToolbarPlacement)] = [1_024, 834].flatMap { width in
-            placements.map { (width, $0) }
-        }
-        for (width, placement) in layouts {
-            let fixture = try await NotebookTestFixtures.mountToolbarHost(
-                store: toolStore(placedAt: placement), width: width
-            )
-            defer { fixture.close() }
-            let state = Snapshot(fixture)
-            let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
-            // The divider, the mark and the placeholders that close the row.
-            let upcoming = CGFloat(NotebookUpcomingFeature.placed(.toolStrip).count + 1)
-                * (NotebookTheme.controlSize + NotebookTheme.itemSpacing)
-                + NotebookTheme.dividerThickness + NotebookTheme.itemSpacing
-            XCTAssertGreaterThan(strip.contentSize.width, strip.bounds.width, "\(width) \(placement): the placeholders page.")
-            XCTAssertLessThanOrEqual(
-                strip.contentSize.width - upcoming,
-                strip.bounds.width - NotebookTheme.controlSize - NotebookStripOverflow.fadeLength + 0.5,
-                "\(width) \(placement): every working tool shows clear of the chevron and its fade, without paging."
-            )
-
-            strip.setContentOffset(CGPoint(x: strip.contentSize.width - strip.bounds.width, y: 0), animated: false)
-            fixture.host.layoutIfNeeded()
-            assertPlaceholderTouchesStayInTheStrip(strip, fixture: fixture)
-            try await Task.sleep(for: .milliseconds(200))
-            state.assertUnchanged(fixture)
-        }
-    }
-
-    /// Moving between docks is plainly visible wherever the window leaves room for it: in
-    /// portrait and landscape, full screen and in regular-width Split View.
-    func testNeighbouringDocksStayApartAndTheirMarkersNeverOverlap() {
-        let composition = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
-        for width in [1_366.0, 1_194, 1_024, 981, 834] as [CGFloat] {
-            let usable = CGRect(x: 0, y: 0, width: width, height: 1_000)
-            let size = composition.toolbarSize(forHostWidth: width)
-            let spare = usable.width - 2 * EditorToolbarLayout.margin - composition.workingToolsWidth
-            let origins = EditorToolbarDock.allCases.map {
-                EditorToolbarLayout.frame(for: .docked($0), size: size, in: usable).minX
+        // A full-screen 12.9-inch iPad in landscape and in portrait.
+        for width in [1_366.0, 1_024] as [CGFloat] {
+            for placement in [EditorToolbarPlacement.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))] {
+                let fixture = try await NotebookTestFixtures.mountToolbarHost(store: toolStore(placedAt: placement), width: width)
+                defer { fixture.close() }
+                let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
+                XCTAssertLessThanOrEqual(
+                    strip.contentSize.width, strip.bounds.width + 0.5,
+                    "\(width) \(placement): the working tools, the caption and every placeholder fit without paging."
+                )
+                XCTAssertEqual(strip.contentOffset.x, 0)
+                assertPlaceholderTouchesStayInTheStrip(strip, fixture: fixture, width: width)
             }
-            for (leading, trailing) in zip(origins, origins.dropFirst()) {
-                XCTAssertGreaterThanOrEqual(
-                    trailing - leading, min(NotebookToolbarComposition.minimumDockTravel, spare / 2) - 0.5, "\(width)"
+        }
+    }
+
+    /// Where the window cannot fit the whole group, the planned tools stay out of the rail, so
+    /// every working tool shows at rest and nothing pages in part.
+    func testNarrowerToolRowShowsEveryWorkingToolWithoutPlaceholders() async throws {
+        // The 11-inch iPad in portrait and in landscape.
+        for width in [834.0, 1_194] as [CGFloat] {
+            for placement in [EditorToolbarPlacement.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))] {
+                let fixture = try await NotebookTestFixtures.mountToolbarHost(store: toolStore(placedAt: placement), width: width)
+                defer { fixture.close() }
+                let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
+                let rail = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
+                    .rail(forHostWidth: width)
+                XCTAssertFalse(rail.showsUpcoming)
+                XCTAssertEqual(strip.contentSize.width, rail.toolRow.contentWidth, accuracy: 0.5)
+                XCTAssertLessThanOrEqual(
+                    strip.contentSize.width, strip.bounds.width + 0.5, "\(width) \(placement): every working tool shows."
                 )
             }
+        }
+    }
+
+    /// Moving between docks is plainly visible wherever the window leaves room for it; where it
+    /// does not, one centred slot stands for every dock.
+    func testNeighbouringDocksStayApartOrShareOneSlot() {
+        let composition = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
+        for width in [1_366.0, 1_376, 1_194] as [CGFloat] {
+            let usable = CGRect(x: 0, y: 0, width: width, height: 1_000)
+            let rail = composition.rail(forHostWidth: width)
+            XCTAssertFalse(rail.docksShared, "\(width)")
+            let origins = EditorToolbarDock.allCases.map {
+                EditorToolbarLayout.frame(for: .docked($0), size: rail.size, in: usable).minX
+            }
+            for (leading, trailing) in zip(origins, origins.dropFirst()) {
+                XCTAssertGreaterThanOrEqual(trailing - leading, NotebookToolbarComposition.minimumDockTravel - 0.5, "\(width)")
+            }
             let markers = EditorToolbarDock.allCases.compactMap {
-                NotebookDockMarkers.frames(slotSize: size, in: usable)[$0]
+                NotebookDockMarkers.frames(slotSize: rail.size, in: usable, docksShared: rail.docksShared)[$0]
             }
             XCTAssertEqual(markers.count, 3, "\(width)")
             for (index, marker) in markers.enumerated() {
@@ -129,24 +126,33 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
                 }
             }
         }
-        let portrait = composition.toolbarSize(forHostWidth: 1_024)
-        XCTAssertGreaterThanOrEqual(
-            (1_024 - 2 * EditorToolbarLayout.margin - portrait.width) / 2, NotebookToolbarComposition.minimumDockTravel,
-            "On the 12.9-inch iPad in portrait the docks sit a clear distance apart."
-        )
+        for width in [1_032.0, 1_024, 834, 678] as [CGFloat] {
+            let usable = CGRect(x: 0, y: 0, width: width, height: 1_000)
+            let rail = composition.rail(forHostWidth: width)
+            XCTAssertTrue(rail.docksShared, "\(width)")
+            let markers = NotebookDockMarkers.frames(slotSize: rail.size, in: usable, docksShared: true)
+            XCTAssertEqual(markers.count, 1, "\(width)")
+            XCTAssertEqual(markers[.topCenter]?.midX ?? 0, usable.midX, accuracy: 0.5, "\(width): the slot is centred.")
+        }
     }
 
-    func testCompactWidthToolRowPagesToThePlaceholdersAndKeepsTheirTouches() async throws {
+    func testCompactWidthToolRowPagesToItsEndAndKeepsItsTouches() async throws {
         // Half of a 12.9-inch iPad in Split View.
         let fixture = try await NotebookTestFixtures.mountToolbarHost(horizontalSizeClass: .compact, width: 507)
         defer { fixture.close() }
         let state = Snapshot(fixture)
         let strip = try XCTUnwrap(fixture.strips.first)
+        XCTAssertEqual(fixture.strips.count, 1)
         XCTAssertGreaterThan(strip.contentSize.width, strip.bounds.width, "The ink chip leaves less room at compact width.")
 
         strip.setContentOffset(CGPoint(x: strip.contentSize.width - strip.bounds.width, y: 0), animated: false)
         fixture.host.layoutIfNeeded()
-        assertPlaceholderTouchesStayInTheStrip(strip, fixture: fixture)
+        let frame = fixture.frame(of: strip)
+        for x in stride(from: frame.maxX - 2 * NotebookTheme.controlSize, to: frame.maxX, by: 20) {
+            let target = fixture.hit(CGPoint(x: x, y: frame.midY))
+            XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "x \(x)")
+            XCTAssertTrue(target.isDescendant(of: strip), "x \(x)")
+        }
 
         try await Task.sleep(for: .milliseconds(200))
         state.assertUnchanged(fixture)
@@ -161,82 +167,84 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         XCTAssertLessThan(enabled, placeholder - 0.1, "A working tool is drawn darker than a placeholder.")
     }
 
-    func testSoonMarkIsAQuietCaptionThatDimsWithTheToolbar() throws {
-        let enabled = try darkestLuminance(of: NotebookUpcomingMark())
-        let paused = try darkestLuminance(of: NotebookUpcomingMark().environment(\.isEnabled, false))
-        XCTAssertEqual(enabled, luminance(NotebookTheme.controlTint.uiColor), accuracy: 0.03)
-        XCTAssertGreaterThan(enabled, luminance(NotebookTheme.glyph.uiColor) + 0.05, "Lighter than a working tool glyph.")
-        XCTAssertEqual(paused, luminance(NotebookTheme.disabledGlyph.uiColor), accuracy: 0.03)
+    func testSoonCaptionIsAQuietSectionLabel() throws {
+        let caption = try darkestLuminance(of: NotebookUpcomingMark())
+        XCTAssertEqual(caption, luminance(NotebookTheme.glyphSecondary.uiColor), accuracy: 0.03)
+        XCTAssertGreaterThan(caption, luminance(NotebookTheme.glyph.uiColor) + 0.01, "Quieter than a working tool glyph.")
+        let size = UIHostingController(rootView: NotebookUpcomingMark()).sizeThatFits(in: CGSize(width: 500, height: 500))
+        XCTAssertEqual(size, CGSize(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize),
+            "One control wide, so the rail can count it.")
     }
 
-    // MARK: - Navigation bar
+    // MARK: - Header and notebook menu
 
-    func testNavigationPlaceholdersAreDisabledAndCarryNoAction() async throws {
+    /// The system bar is gone, so no planned feature sits in it; every one is listed, disabled,
+    /// under the notebook menu's "Coming later".
+    func testHeaderReplacesTheNavigationBarAndOffersNoPlaceholderButtons() async throws {
         let screen = try await mountScreen(width: 1_024)
         defer { screen.close() }
-        let canvas = screen.controller.canvasView
-        let tool = screen.store.tool
-        let toolbar = screen.store.toolbar
-        let drawing = canvas.drawing.dataRepresentation()
-        let saveCalls = await screen.probe.saveCalls
-
-        for feature in NotebookUpcomingFeature.placed(.navigationLeading) {
-            let matches = screen.leading.filter { $0.title == feature.accessibilityLabel }
-            XCTAssertEqual(matches.count, 1, feature.title)
-            let button = try XCTUnwrap(matches.first)
-            XCTAssertFalse(button.isEnabled, "\(feature.title) is disabled.")
-            XCTAssertNil(button.menu)
-            XCTAssertNil(button.customView, "A native bar button, which VoiceOver reads by its title.")
-            XCTAssertNil(button.primaryAction, "\(feature.title) has no action to perform.")
-            XCTAssertNil(button.action, "\(feature.title) sends nothing.")
-        }
-
-        // The menu builds its entries when opened, so its contents are checked through the entries it lists.
-        let menus = screen.trailing.filter { $0.menu != nil }
-        XCTAssertEqual(menus.count, 1, "The trailing placeholders share one menu.")
-        let menuItem = try XCTUnwrap(menus.first)
-        XCTAssertEqual(menuItem.title, NotebookUpcomingMenu.title)
-        XCTAssertTrue(menuItem.isEnabled, "The menu opens to show the disabled entries.")
-        XCTAssertEqual(NotebookUpcomingMenu.entries, NotebookUpcomingFeature.placed(.navigationTrailing))
-        let barTitles = (screen.leading + screen.trailing).compactMap(\.title)
-        for feature in NotebookUpcomingFeature.catalogue where feature.placement != .navigationLeading {
-            XCTAssertFalse(
-                barTitles.contains { $0.hasPrefix(feature.title) }, "\(feature.title) is not a bar button of its own."
-            )
-        }
-        for title in ["Undo", "Recovery copies", "Extend paper"] {
-            XCTAssertTrue(barTitles.contains(title), "\(title) is still in the bar.")
-        }
-
-        try await Task.sleep(for: .milliseconds(300))
-        XCTAssertEqual(screen.store.tool, tool)
-        XCTAssertEqual(screen.store.toolbar, toolbar)
-        XCTAssertEqual(canvas.drawing.dataRepresentation(), drawing)
-        let savesAfter = await screen.probe.saveCalls
-        XCTAssertEqual(savesAfter, saveCalls)
-        XCTAssertNil(screen.hosting.presentedViewController)
+        let navigation = try XCTUnwrap(NotebookTestFixtures.navigationController(in: screen.hosting))
+        XCTAssertTrue(navigation.isNavigationBarHidden, "The editor draws its own header.")
+        let item = navigation.navigationBar.topItem
+        XCTAssertTrue(item?.leadingItemGroups.flatMap(\.barButtonItems).isEmpty ?? true)
+        XCTAssertTrue(item?.trailingItemGroups.flatMap(\.barButtonItems).isEmpty ?? true)
+        XCTAssertNotNil(NotebookHeaderTests.headerHost(in: screen.hosting))
         XCTAssertEqual(screen.session.loadState, .ready)
+
+        XCTAssertEqual(
+            NotebookMenu.comingLater.map(\.title),
+            ["Notebooks", "Search", "Summarize", "Export", "Backup", "Text", "Insert", "Record audio", "Bookmark"]
+        )
+        XCTAssertEqual(Set(NotebookMenu.comingLater.map(\.title)), Set(NotebookUpcomingFeature.catalogue.map(\.title)))
     }
 
-    /// Split View and Slide Over: the bar keeps every existing item and every placeholder,
-    /// whether it shows them inline or folds some into its overflow.
-    func testCompactWidthNavigationBarKeepsEveryItemAndPlaceholder() async throws {
-        let screen = try await mountScreen(width: 420, horizontalSizeClass: .compact)
-        defer { screen.close() }
-        XCTAssertEqual(screen.hosting.traitCollection.horizontalSizeClass, .compact)
-        let titles = (screen.leading + screen.trailing).compactMap(\.title)
-        for title in ["Undo", "Recovery copies", "Extend paper", NotebookUpcomingMenu.title]
-            + NotebookUpcomingFeature.placed(.navigationLeading).map(\.accessibilityLabel) {
-            XCTAssertEqual(titles.filter { $0 == title }.count, 1, "\(title) is still in the bar once.")
+    /// The header and menu symbols say what they do: a page with a plus for adding a page, a
+    /// lifebuoy for recovery, a seal for verified history and a dotted circle while saving.
+    func testHeaderAndMenuSymbolsResolve() {
+        let symbols = [
+            "rectangle.portrait.badge.plus", "lifepreserver", "checkmark.seal", "xmark.seal", "questionmark.circle",
+            "circle.dotted", "doc", "checkmark.circle", "exclamationmark.triangle.fill", "lock",
+            "gauge.with.dots.needle.67percent", "line.3.horizontal", "arrow.uturn.backward", "arrow.uturn.forward",
+            "rectangle.inset.topleading.filled", "rectangle.topthird.inset.filled",
+            "rectangle.inset.toptrailing.filled", "rectangle.center.inset.filled",
+        ] + EditorChromeMode.allCases.map(\.symbol)
+        for symbol in symbols {
+            XCTAssertNotNil(UIImage(systemName: symbol), symbol)
         }
-        let notebooks = screen.leading.filter { $0.title?.hasPrefix("Notebooks") == true }
-        XCTAssertTrue(notebooks.allSatisfy { !$0.isEnabled })
-        XCTAssertEqual(screen.session.loadState, .ready)
+        XCTAssertEqual(EditorChromeMode.allCases.map(\.title), ["Focus", "Pinned", "Always-on tools"])
+        XCTAssertEqual(EditorChromeMode.allCases.map(\.shortcutHint), ["⌃⌘1", "⌃⌘2", "⌃⌘3"])
+    }
+
+    func testAddPageFollowsTheWritingGateAndThePageLimit() {
+        typealias State = NotebookCanvasGateModel.State
+        XCTAssertTrue(NotebookMenu.canAddPage(State(pageCount: 3, inputGate: .open)))
+        XCTAssertTrue(NotebookMenu.canAddPage(State(pageCount: NotebookViewController.maximumPageCount - 1, inputGate: .open)))
+        XCTAssertFalse(NotebookMenu.canAddPage(State(pageCount: NotebookViewController.maximumPageCount, inputGate: .open)))
+        for gate in [NotebookInputGate.capacity, .failed, .recovering, .readOnly] {
+            XCTAssertFalse(NotebookMenu.canAddPage(State(pageCount: 3, inputGate: gate)), "\(gate)")
+        }
+    }
+
+    /// Split View and narrower windows show the docks as one centred slot; the menu says so.
+    func testToolbarPositionNotesWhenTheDocksShareOneSlot() {
+        let standard = EditorToolbarPreferences.standard
+        for width in [678.0, 834] as [CGFloat] {
+            XCTAssertTrue(
+                NotebookToolbarPositionPicker.docksShared(preferences: standard, hostWidth: width, sizeClass: .regular),
+                "\(width)"
+            )
+        }
+        for width in [1_194.0, 1_366] as [CGFloat] {
+            XCTAssertFalse(
+                NotebookToolbarPositionPicker.docksShared(preferences: standard, hostWidth: width, sizeClass: .regular),
+                "\(width)"
+            )
+        }
     }
 
     // MARK: - Fixtures
 
-    /// The full notebook screen inside a navigation bar, as the app shows it.
+    /// The full notebook screen, as the app shows it.
     private struct MountedScreen {
         let hosting: UIViewController
         let window: UIWindow
@@ -244,8 +252,6 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         let probe: NotebookStorageProbe
         let store: NotebookSceneToolStore
         let controller: NotebookViewController
-        let leading: [UIBarButtonItem]
-        let trailing: [UIBarButtonItem]
 
         @MainActor
         func close() {
@@ -255,9 +261,7 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         }
     }
 
-    private func mountScreen(
-        width: CGFloat, horizontalSizeClass: UIUserInterfaceSizeClass? = nil
-    ) async throws -> MountedScreen {
+    private func mountScreen(width: CGFloat) async throws -> MountedScreen {
         let id = UUID()
         let root = NotebookTestFixtures.root()
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -270,7 +274,6 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: width, height: 1_366)
         let hosting = AppearanceTrackingHostingController(rootView: NotebookScreen(session: session))
-        if let horizontalSizeClass { hosting.traitOverrides.horizontalSizeClass = horizontalSizeClass }
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         do {
@@ -280,12 +283,9 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
                 controller = NotebookTestFixtures.notebookController(in: hosting)
                 return controller?.isCanvasVisible == true && store.isToolbarAvailable
             }
-            let item = try XCTUnwrap(NotebookTestFixtures.navigationController(in: hosting)?.navigationBar.topItem)
             return MountedScreen(
                 hosting: hosting, window: window, session: session, probe: probe, store: store,
-                controller: try XCTUnwrap(controller),
-                leading: item.leadingItemGroups.flatMap(\.barButtonItems),
-                trailing: item.trailingItemGroups.flatMap(\.barButtonItems)
+                controller: try XCTUnwrap(controller)
             )
         } catch {
             session.flush()
@@ -333,16 +333,19 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
     /// Touches on the placeholder span stay in the tool strip and never reach the canvas. That a
     /// placeholder then does nothing is a design guarantee: its button receives only a catalogue entry.
     private func assertPlaceholderTouchesStayInTheStrip(
-        _ strip: UIScrollView, fixture: NotebookToolbarHostFixture, file: StaticString = #filePath, line: UInt = #line
+        _ strip: UIScrollView, fixture: NotebookToolbarHostFixture, width: CGFloat,
+        file: StaticString = #filePath, line: UInt = #line
     ) {
         let frame = fixture.frame(of: strip)
-        let placeholders = CGFloat(NotebookUpcomingFeature.placed(.toolStrip).count)
-        let span = placeholders * (NotebookTheme.controlSize + NotebookTheme.itemSpacing)
-        let trailing = frame.maxX - NotebookTheme.stripInsets.right
-        for x in stride(from: trailing - span + NotebookTheme.controlSize / 2, to: trailing, by: 25) {
+        let rail = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
+            .rail(forHostWidth: width)
+        let placeholders = rail.toolRow.slots.filter { if case .upcoming = $0.item { true } else { false } }
+        XCTAssertEqual(placeholders.count, NotebookUpcomingFeature.placed(.toolStrip).count, file: file, line: line)
+        for slot in placeholders {
+            let x = frame.minX + slot.minX + slot.width / 2 - strip.contentOffset.x
             let target = fixture.hit(CGPoint(x: x, y: frame.midY))
-            XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "x \(x)", file: file, line: line)
-            XCTAssertTrue(target.isDescendant(of: strip), "x \(x)", file: file, line: line)
+            XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "\(slot.id)", file: file, line: line)
+            XCTAssertTrue(target.isDescendant(of: strip), "\(slot.id)", file: file, line: line)
         }
     }
 

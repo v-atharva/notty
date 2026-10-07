@@ -409,6 +409,122 @@ final class NotebookChromeTests: XCTestCase {
         XCTAssertGreaterThan(luminance(secondary), 0.7, "A secondary action is a light key: \(secondary)")
     }
 
+    // MARK: - Action keys
+
+    func testActionKeysDropTheirLabelAndShadeTheirFaceWhilePressed() throws {
+        func render(_ kind: NotebookActionKeyStyle.Kind, pressed: Bool) throws -> RenderedPixels {
+            let key = NotebookActionKey(label: Self.keyLabel, kind: kind, isPressed: pressed)
+                .frame(width: 200)
+                .background(NotebookTheme.panelSurface.color)
+            return try RenderedPixels(rendering: key)
+        }
+        /// The first row of the label's mark down the key's centre.
+        func markTop(_ pixels: RenderedPixels, light: Bool) throws -> CGFloat {
+            let row = stride(from: CGFloat(0.25), to: pixels.size.height, by: 0.5).first {
+                let value = luminance(pixels.rgba(at: CGPoint(x: 100, y: $0)))
+                return light ? value > 0.8 : value < 0.1
+            }
+            return try XCTUnwrap(row, "The label was not drawn.")
+        }
+        let surface = color(NotebookTheme.panelSurface)
+        let glyph = color(NotebookTheme.glyph)
+        let face = CGPoint(x: 20, y: NotebookTheme.actionKeyHeight / 2)
+
+        let primary = try render(.primary, pressed: false)
+        let pressedPrimary = try render(.primary, pressed: true)
+        XCTAssertEqual(NotebookTheme.actionKeyPressedOpacity, 0.85)
+        assertPixel(primary.rgba(at: face), equals: components(glyph), "a resting primary key")
+        assertPixel(
+            pressedPrimary.rgba(at: face), equals: components(blend(glyph, 0.85, over: surface)),
+            "a pressed primary key"
+        )
+        let primaryTravel = try markTop(pressedPrimary, light: true) - markTop(primary, light: true)
+        XCTAssertEqual(primaryTravel, NotebookTheme.pressTravel, accuracy: 0.01)
+
+        let secondary = try render(.secondary, pressed: false)
+        let pressedSecondary = try render(.secondary, pressed: true)
+        let middle = shell(at: 0.5)
+        assertPixel(secondary.rgba(at: face), equals: components(middle), "a resting secondary key shows the shell")
+        let well = color(NotebookTheme.selectedWell)
+        assertPixel(
+            pressedSecondary.rgba(at: face), equals: components(blend(well, 0.5, over: middle)),
+            "a pressed secondary key sinks into the pressed well"
+        )
+        let secondaryTravel = try markTop(pressedSecondary, light: false) - markTop(secondary, light: false)
+        XCTAssertEqual(secondaryTravel, NotebookTheme.pressTravel, accuracy: 0.01)
+    }
+
+    /// A disabled key dims to 0.55, or 0.70 under Increase Contrast, and the secondary key turns
+    /// flat with an outline under Increase Contrast.
+    func testActionKeysDimWhenDisabledAndTurnFlatUnderIncreaseContrast() async throws {
+        func key(_ kind: NotebookActionKeyStyle.Kind, disabled: Bool) -> some View {
+            NotebookActionKey(label: Self.keyLabel, kind: kind, isPressed: false)
+                .disabled(disabled)
+                .frame(width: Self.renderSize.width)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(NotebookTheme.panelSurface.color)
+                .ignoresSafeArea()
+        }
+        let surface = color(NotebookTheme.panelSurface)
+        let glyph = color(NotebookTheme.glyph)
+        let face = CGPoint(x: 20, y: Self.renderSize.height / 2)
+        let border = CGPoint(x: 0.25, y: Self.renderSize.height / 2)
+
+        for (contrast, opacity) in [(UIAccessibilityContrast.normal, 0.55), (.high, 0.70)] {
+            let name = contrast == .high ? "increased contrast" : "standard contrast"
+            let disabled = try await rendered(key(.primary, disabled: true), contrast: contrast, at: [face])
+            assertPixel(
+                disabled[0], equals: components(blend(glyph, opacity, over: surface)), "\(name): a disabled primary key"
+            )
+        }
+        XCTAssertEqual(NotebookTheme.disabledOpacity, 0.55)
+        XCTAssertEqual(NotebookTheme.disabledOpacityIncreased, 0.70)
+
+        let flat = try await rendered(key(.secondary, disabled: false), contrast: .high, at: [face, border])
+        assertPixel(flat[0], equals: components(surface), "a flat secondary face")
+        assertPixel(flat[1], equals: components(color(NotebookTheme.panelLowerEdge, .high)), "its dark outline")
+        let shaded = try await rendered(key(.secondary, disabled: false), contrast: .normal, at: [face])
+        assertPixel(shaded[0], equals: components(shell(at: 0.5)), "the shaded face at standard contrast")
+    }
+
+    // MARK: - Shell shadow in place
+
+    /// The shell draws its baked shadow outside its own bounds, falling below it, and keeps it
+    /// under Increase Contrast.
+    func testPanelShellCastsItsBakedShadowOutsideItsBoundsUnderEveryContrast() async throws {
+        // A 120 x 60 shell centred in the render: x 40...160, y 30...90.
+        let shell = NotebookPanelShell()
+            .frame(width: 120, height: 60)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(NotebookTheme.paperIvory.color)
+            .ignoresSafeArea()
+        let below = CGPoint(x: 100, y: 93)
+        let above = CGPoint(x: 100, y: 27)
+        let beyond = CGPoint(x: 100, y: 90 + NotebookTheme.shellShadowBleed + 4)
+        for contrast in [UIAccessibilityContrast.normal, .high] {
+            let pixels = try await rendered(shell, contrast: contrast, at: [below, above, beyond])
+            let name = contrast == .high ? "increased contrast" : "standard contrast"
+            assertPixel(pixels[2], equals: [0.98, 0.96, 0.91], "\(name): paper beyond the bleed")
+            XCTAssertLessThan(
+                luminance(pixels[0]), luminance(pixels[2]) - 0.02, "\(name): shadow below the shell \(pixels[0])"
+            )
+            XCTAssertLessThan(luminance(pixels[0]), luminance(pixels[1]), "\(name): the shadow falls below the shell")
+        }
+    }
+
+    // MARK: - Status veil
+
+    /// Black status-bar text over the veil above charcoal ink, the one section 8.1 pair that
+    /// depends on the veil's opacity.
+    func testStatusBarTextOnTheVeilOverCharcoalInkMeetsItsContrast() throws {
+        let charcoal = try XCTUnwrap(EditorInkCatalog.presets.first { $0.id == "charcoal-monoline" }).color
+        let veil = blend(color(NotebookTheme.paperIvory), Double(NotebookTheme.statusVeilOpacity), over: charcoal)
+        let black = EditorInkColor(red: 0, green: 0, blue: 0)
+        XCTAssertEqual(NotebookTheme.statusVeilOpacity, 0.94)
+        XCTAssertEqual(black.contrastRatio(against: veil), 17.33, accuracy: 0.01)
+        assertContrast(black, veil, atLeast: 4.5, "status-bar text on the veil over charcoal ink")
+    }
+
     // MARK: - Seams
 
     func testToolsHiddenPublishesOnlyRealChanges() {

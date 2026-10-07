@@ -93,6 +93,10 @@ final class NotebookSession: ObservableObject {
     private var auditID = UUID()
     private var auditTask: Task<Void, Never>?
     let renderDiagnostics = NotebookRenderDiagnostics()
+    /// Shows and hides the header and tools for the writing view, from these presentation models.
+    private(set) lazy var writingChrome = NotebookWritingChrome(
+        gate: gateModel, saves: statusModel, integrity: integrityModel
+    )
     private var presentationObservation: AnyCancellable?
     private var preservedState: PreservedState?
     private var preservationTask: Task<Void, Never>?
@@ -1426,6 +1430,7 @@ final class NotebookCanvasCommandModel: ObservableObject {
 @MainActor
 final class NotebookRenderDiagnostics {
     var screenBodyCount = 0
+    var headerBodyCount = 0
     var canvasUpdateCount = 0
     var observationWork = NotebookObservationWork()
 }

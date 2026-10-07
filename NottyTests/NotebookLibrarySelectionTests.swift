@@ -61,6 +61,8 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         }
         XCTAssertNotNil(model.creationFailure)
         XCTAssertFalse(model.isCreating)
+        model.dismissCreationFailure()
+        XCTAssertNotNil(model.creationFailure, "Only the banner over an open notebook can be dismissed.")
         await model.retry()
         guard case .recoveryRequired = model.state else {
             return XCTFail("An unselected published note must require recovery, not promotion.")
@@ -109,7 +111,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
             try await NotebookTestFixtures.waitUntilAppeared(hosting)
             try await NotebookTestFixtures.waitUntil { await gate.entered }
             guard case .loading = model.state else { throw FixtureFailure.unexpectedState }
-            try await assertLightPaper(hosting)
+            try await assertLightPaper(hosting, card: NotebookTheme.statusCardWidth)
         } catch {
             await gate.release()
             throw error
@@ -119,7 +121,151 @@ final class NotebookLibrarySelectionTests: XCTestCase {
             if case .failed = model.state { return true }
             return false
         }
-        try await assertLightPaper(hosting)
+        try await assertLightPaper(hosting, card: NotebookTheme.statusCardMaxWidth, primaryKey: true)
+    }
+
+    /// While the first notebook is created, the host shows a light loading card on the paper,
+    /// whatever the window's appearance.
+    func testCreatingTheFirstNotebookShowsALightLoadingCardInADarkWindow() async throws {
+        let fixture = try LibraryFixture()
+        defer { fixture.remove() }
+        let gate = LibrarySelectionGate()
+        let model = NotebookLibraryModel(
+            openLibrary: { fixture.library }, beforeSelection: { await gate.suspend() }
+        )
+        // Creation is held before the host appears, so the host's own load call finds it started.
+        let task = Task { await model.load() }
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.overrideUserInterfaceStyle = .dark
+        do {
+            try await NotebookTestFixtures.waitUntil { await gate.entered }
+            guard case .creatingFirstNotebook = model.state, model.creationFailure == nil else {
+                throw FixtureFailure.unexpectedState
+            }
+            let hosting = AppearanceTrackingHostingController(rootView: NotebookLibraryHost(model: model))
+            window.rootViewController = hosting
+            window.makeKeyAndVisible()
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            try await assertLightPaper(hosting, card: NotebookTheme.statusCardWidth)
+        } catch {
+            window.isHidden = true
+            window.rootViewController = nil
+            await gate.release()
+            await task.value
+            throw error
+        }
+        window.isHidden = true
+        window.rootViewController = nil
+        await gate.release()
+        await task.value
+        XCTAssertNotNil(try? selectedSession(model), "The first notebook is created once released.")
+    }
+
+    /// The first-notebook failure and the recovery-required screens are light cards with a
+    /// dark primary key on the paper, whatever the window's appearance.
+    func testLibraryFailureAndRecoveryCardsStayLightInADarkWindow() async throws {
+        let fixture = try LibraryFixture(selectionFailure: true)
+        defer { fixture.remove() }
+        let model = NotebookLibraryModel(openLibrary: { fixture.library })
+        await model.load()
+        guard case .creatingFirstNotebook = model.state, model.creationFailure != nil else {
+            return XCTFail("The first creation must fail.")
+        }
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.overrideUserInterfaceStyle = .dark
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookLibraryHost(model: model))
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        try await assertLightPaper(hosting, card: NotebookTheme.statusCardMaxWidth, primaryKey: true)
+
+        await model.retry()
+        guard case .recoveryRequired = model.state else { return XCTFail("An unselected note must require recovery.") }
+        try await assertLightPaper(hosting, card: NotebookTheme.statusCardMaxWidth, primaryKey: true)
+    }
+
+    /// The banner shown when a new notebook could not be selected is a light card at the top of
+    /// the screen, inset from the safe area, whatever the window's appearance. Its dismiss key
+    /// clears the notice and leaves the open notebook as it was.
+    func testSelectionFailureBannerIsALightCardInADarkWindow() async throws {
+        let fixture = try LibraryFixture(selectionFailure: true)
+        defer { fixture.remove() }
+        let oldID = NotebookSession.defaultNotebookID
+        _ = try await fixture.seed(oldID)
+        try Data("damaged".utf8).write(to: fixture.noteURL(oldID).appendingPathComponent("HEAD.json"))
+        let model = NotebookLibraryModel(openLibrary: { fixture.library })
+        await model.load()
+        let session = try selectedSession(model)
+        NotebookTestFixtures.restoreSceneToolDefaults(for: try NotebookTestFixtures.windowScene(), after: self)
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.overrideUserInterfaceStyle = .dark
+        let hosting = AppearanceTrackingHostingController(rootView: NotebookLibraryHost(model: model))
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer {
+            session.flush()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        // The screen opens the note itself; the new notebook is offered once that has failed.
+        try await NotebookTestFixtures.waitUntil {
+            if case .failed = session.loadState { return true }
+            return false
+        }
+        await model.startNewNotebook()
+        XCTAssertNotNil(model.creationFailure)
+        let view = try XCTUnwrap(hosting.view)
+        try await NotebookTestFixtures.waitUntil { view.traitCollection.userInterfaceStyle == .light }
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        let pixels = try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 1)
+        let paper = components(of: NotebookTheme.paperIvory.uiColor).map { Int(($0 * 255).rounded()) }
+        // Down the middle of the banner's top half, from the safe area to the bleed below it.
+        let top = view.safeAreaInsets.top
+        let rows = (Int(top)..<Int(top) + 80).map {
+            pixels.rgba(at: CGPoint(x: view.bounds.midX + 60, y: CGFloat($0))).map(Int.init)
+        }
+        let firstShell = rows.firstIndex { pixel in
+            luminance(pixel) > 0.7 && zip(pixel, paper).contains { abs($0 - $1) > 4 }
+        }
+        let inset = try XCTUnwrap(firstShell, "A light card lies at the top.")
+        XCTAssertEqual(
+            CGFloat(inset), NotebookTheme.sectionSpacing, accuracy: 3, "The banner sits 12 points below the safe area."
+        )
+        let light = rows[inset...].prefix(30).filter { luminance($0) > 0.7 }
+        XCTAssertGreaterThan(light.count, 20, "The banner is light: \(rows[inset])")
+
+        // The dismiss key's glyph sits at the banner's trailing end, on a row inside its top padding.
+        let edgeRow = top + CGFloat(inset) + 3
+        let maximumHalfWidth = NotebookTheme.statusCardMaxWidth / 2
+        let trailing = try XCTUnwrap(
+            stride(from: view.bounds.midX + maximumHalfWidth, to: view.bounds.midX, by: -1).first { x in
+                let pixel = pixels.rgba(at: CGPoint(x: x, y: edgeRow)).map(Int.init)
+                return luminance(pixel) > 0.7 && zip(pixel, paper).contains { abs($0 - $1) > 4 }
+            },
+            "The banner's trailing edge."
+        )
+        let key = NotebookTheme.controlSize
+        let glyph = (Int(trailing - key * 3 / 4)..<Int(trailing - key / 4)).flatMap { x in
+            (Int(top) + inset..<Int(top) + inset + 60).map { pixels.rgba(at: CGPoint(x: x, y: $0)).map(Int.init) }
+        }
+        XCTAssertGreaterThan(glyph.filter { luminance($0) < 0.3 }.count, 5, "The banner has a dismiss key.")
+
+        model.dismissCreationFailure()
+        XCTAssertNil(model.creationFailure, "The dismiss key clears the notice.")
+        XCTAssertTrue(try selectedSession(model) === session, "The open notebook stays.")
     }
 
     func testExistingLegacyNoteIsOpenedWithoutCreatingAnotherNotebook() async throws {
@@ -324,14 +470,18 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         return session
     }
 
-    /// Waits for the light appearance, then checks opposite corners of the window show the paper.
+    /// Waits for the light appearance, then checks that opposite corners of the window show the
+    /// paper and that a light status card of width `card` lies centred on it, with a dark primary
+    /// key when `primaryKey` is set.
     private func assertLightPaper(
-        _ hosting: UIViewController, file: StaticString = #filePath, line: UInt = #line
+        _ hosting: UIViewController, card: CGFloat, primaryKey: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
     ) async throws {
         try await NotebookTestFixtures.waitUntil(file: file, line: line) {
             hosting.traitCollection.userInterfaceStyle == .light
         }
         let view = try XCTUnwrap(hosting.view)
+        view.layoutIfNeeded()
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
@@ -345,6 +495,28 @@ final class NotebookLibrarySelectionTests: XCTestCase {
                 XCTAssertEqual(actual, expected, accuracy: 2, "\(rendered) at \(point)", file: file, line: line)
             }
         }
+        // A column just inside the card's leading padding, clear of centred text.
+        let x = view.bounds.midX - card / 2 + NotebookTheme.detailPadding / 2
+        let column = (0..<Int(view.bounds.height)).map { pixels.rgba(at: CGPoint(x: x, y: CGFloat($0))).map(Int.init) }
+        let shell = column.filter { pixel in
+            luminance(pixel) > 0.7 && zip(pixel, paper).contains { abs($0 - $1) > 4 }
+        }
+        XCTAssertGreaterThan(shell.count, 40, "A light card lies on the paper.", file: file, line: line)
+        guard primaryKey else { return }
+        let keyX = view.bounds.midX - card / 2 + NotebookTheme.detailPadding + NotebookTheme.actionKeyPadding / 2
+        var run = 0, longest = 0
+        for y in 0..<Int(view.bounds.height) {
+            run = luminance(pixels.rgba(at: CGPoint(x: keyX, y: CGFloat(y))).map(Int.init)) < 0.1 ? run + 1 : 0
+            longest = max(longest, run)
+        }
+        XCTAssertGreaterThanOrEqual(
+            longest, Int(NotebookTheme.actionKeyHeight) - 4, "The primary action is a dark key.", file: file, line: line
+        )
+    }
+
+    private func luminance(_ pixel: [Int]) -> Double {
+        EditorInkColor(red: Double(pixel[0]) / 255, green: Double(pixel[1]) / 255, blue: Double(pixel[2]) / 255)
+            .relativeLuminance
     }
 
     private func components(of color: UIColor) -> [CGFloat] {

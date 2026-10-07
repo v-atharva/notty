@@ -124,18 +124,96 @@ final class EditorChromeStateTests: XCTestCase {
         XCTAssertFalse(state.userScrolled(by: -300, isAtTop: false), "already shown")
     }
 
-    func testTravelAccumulatesInOneDirectionAndRestartsOnReversal() {
-        var state = EditorChromeState()
-        XCTAssertFalse(state.userScrolled(by: 10, isAtTop: false))
-        XCTAssertFalse(state.userScrolled(by: 10, isAtTop: false))
-        XCTAssertFalse(state.userScrolled(by: -5, isAtTop: false))
-        XCTAssertFalse(state.userScrolled(by: 10, isAtTop: false), "the reversal discarded the earlier 20")
-        XCTAssertTrue(state.userScrolled(by: hide - 10, isAtTop: false))
+    /// The spec's Reduce Motion rows fade the header out after 28 pt down and in after 28 pt up.
+    func testBothThresholdsAreTwentyEightPoints() {
+        XCTAssertEqual(EditorChromeState.hideTravel, 28)
+        XCTAssertEqual(EditorChromeState.revealTravel, 28)
+    }
 
-        XCTAssertFalse(state.userScrolled(by: -20, isAtTop: false))
-        XCTAssertFalse(state.userScrolled(by: 1, isAtTop: false))
-        XCTAssertFalse(state.userScrolled(by: -20, isAtTop: false), "the reversal discarded the earlier 20")
-        XCTAssertTrue(state.userScrolled(by: -(reveal - 20), isAtTop: false))
+    /// A slow drag reverses by a point now and then; its whole net distance still counts, in
+    /// either direction.
+    func testASlowDragsSmallReversalsStillCountItsWholeDistance() {
+        var state = EditorChromeState()
+        var travelled: [CGFloat] = []
+        for delta in [9, 9, 9, -1] as [CGFloat] {
+            XCTAssertFalse(state.userScrolled(by: delta, isAtTop: false), "\(delta)")
+            travelled.append(state.headerTravel)
+        }
+        XCTAssertEqual(travelled, [9, 18, 27, 26])
+        XCTAssertTrue(state.userScrolled(by: 9, isAtTop: false), "35 pt net hides")
+        assertShows(state, header: false, tools: false, handle: true)
+
+        var revealing = scrolledDown(in: .focus)
+        for delta in [-9, -9, -9, 1] as [CGFloat] {
+            XCTAssertFalse(revealing.userScrolled(by: delta, isAtTop: false), "\(delta)")
+        }
+        XCTAssertTrue(revealing.userScrolled(by: -9, isAtTop: false), "35 pt net back up reveals")
+    }
+
+    /// Scrolling back takes from the distance counted, so reading on after a small correction
+    /// reveals nothing, and scrolling back up before the threshold cancels a hide in progress.
+    func testTravelIsNetOfScrollingBack() {
+        var hidden = scrolledDown(in: .focus)
+        for delta in [-(reveal - 8), 50, -(reveal - 8)] as [CGFloat] {
+            XCTAssertFalse(hidden.userScrolled(by: delta, isAtTop: false), "\(delta)")
+        }
+        assertShows(hidden, header: false, tools: false, handle: true, "each correction alone is short")
+
+        var shown = EditorChromeState()
+        XCTAssertFalse(shown.userScrolled(by: 20, isAtTop: false))
+        XCTAssertEqual(shown.headerTravel, 20)
+        XCTAssertFalse(shown.userScrolled(by: -30, isAtTop: false))
+        XCTAssertEqual(shown.headerTravel, 0, "never below zero")
+        XCTAssertFalse(shown.userScrolled(by: hide - 1, isAtTop: false), "the earlier 20 was scrolled back")
+        XCTAssertTrue(shown.userScrolled(by: 1, isAtTop: false))
+    }
+
+    /// A header left part-way settles back when the scroll stops, so the next scroll starts from
+    /// nothing, in either direction.
+    func testAScrollComingToRestDropsTravelShortOfAThreshold() {
+        var state = EditorChromeState()
+        state.userScrolled(by: hide - 1, isAtTop: false)
+        state.userScrollEnded()
+        XCTAssertEqual(state.headerTravel, 0)
+        XCTAssertFalse(state.userScrolled(by: hide - 1, isAtTop: false))
+        XCTAssertTrue(state.userScrolled(by: 1, isAtTop: false))
+
+        state.userScrolled(by: -(reveal - 1), isAtTop: false)
+        state.userScrollEnded()
+        XCTAssertFalse(state.userScrolled(by: -(reveal - 1), isAtTop: false))
+        XCTAssertTrue(state.userScrolled(by: -1, isAtTop: false))
+    }
+
+    /// The travel a following header shows: the net descent while it is shown and free to move.
+    func testHeaderTravelIsTheNetDescentWhileTheHeaderCanFollow() {
+        var state = EditorChromeState(mode: .overlay)
+        state.userScrolled(by: 12, isAtTop: false)
+        XCTAssertEqual(state.headerTravel, 12)
+        state.userScrolled(by: -5, isAtTop: false)
+        XCTAssertEqual(state.headerTravel, 7)
+        state.userScrolled(by: 30, isAtTop: false)
+        XCTAssertFalse(state.showsHeader)
+        XCTAssertEqual(state.headerTravel, 0, "a hidden header has left")
+
+        var pinned = EditorChromeState(mode: .pinned)
+        pinned.userScrolled(by: 12, isAtTop: false)
+        XCTAssertEqual(pinned.headerTravel, 0, "pinned keeps the header in place")
+
+        var forced = EditorChromeState()
+        forced.setPins([.presentation])
+        forced.userScrolled(by: 12, isAtTop: false)
+        XCTAssertEqual(forced.headerTravel, 0, "a pin keeps the header in place")
+    }
+
+    /// The bounce back from a pull past the top is not reading on, so a header following the
+    /// page stays where it is.
+    func testSettlingBackAtTheTopNeverMovesAFollowingHeader() {
+        var state = EditorChromeState()
+        for delta in [-20, -20, 10, 10, 10, 10] as [CGFloat] {
+            state.userScrolled(by: delta, isAtTop: true)
+            XCTAssertEqual(state.headerTravel, 0, "\(delta)")
+        }
+        assertShows(state, header: true, tools: true, handle: false)
     }
 
     func testArrivingAtTheTopRevealsButStayingThereDoesNot() {
