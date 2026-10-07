@@ -11,21 +11,28 @@ final class PageUnfoldTimelineTests: XCTestCase {
     private static let frame60 = 1_000.0 / 60
     private static let frame120 = 1_000.0 / 120
 
-    /// The source's model over the default page at the page's own height: at the web's density,
-    /// and at the density its darkening is authored at.
+    /// The source's model over the default page at the page's own height and the source's own
+    /// pace: at the web's density, and at the density its darkening is authored at.
     private var web: Timeline {
-        Timeline(pageHeight: Self.pageHeight, extent: Self.pageHeight, pointsPerMillimetre: Self.webPointsPerMillimetre)
+        Timeline(
+            pageHeight: Self.pageHeight, extent: Self.pageHeight, pointsPerMillimetre: Self.webPointsPerMillimetre,
+            timeScale: Timeline.sourceTimeScale
+        )
     }
     private var authored: Timeline {
         Timeline(
             pageHeight: Self.pageHeight, extent: Self.pageHeight,
-            pointsPerMillimetre: Timeline.referencePointsPerMillimetre
+            pointsPerMillimetre: Timeline.referencePointsPerMillimetre, timeScale: Timeline.sourceTimeScale
         )
     }
     /// The frost Notty draws over the default page.
     private var page: Timeline { Timeline(pageHeight: Self.pageHeight) }
-    /// The default page frosted as the source's opening frosts its half screen.
-    private var halfScreen: Timeline { Timeline(pageHeight: Self.pageHeight, extent: Timeline.sourceHalfScreen) }
+    /// The same frost at the source's own pace.
+    private var pageAtSourcePace: Timeline { Timeline(pageHeight: Self.pageHeight, timeScale: Timeline.sourceTimeScale) }
+    /// The default page frosted as the source's opening frosts its half screen, at its pace.
+    private var halfScreen: Timeline {
+        Timeline(pageHeight: Self.pageHeight, extent: Timeline.sourceHalfScreen, timeScale: Timeline.sourceTimeScale)
+    }
 
     // MARK: Hinge script
 
@@ -270,11 +277,11 @@ final class PageUnfoldTimelineTests: XCTestCase {
     }
 
     func testTheNewPageClearsWithinAFrameOfTheSourceOpeningAtTheSameExtent() {
-        let at60 = clear(page, intervals: [Self.frame60])
+        let at60 = clear(pageAtSourcePace, intervals: [Self.frame60])
         XCTAssertEqual(at60.outcome, .finished)
         XCTAssertEqual(at60.frames.count, 34)
         XCTAssertEqual(at60.elapsed, 550, accuracy: 1e-9)
-        let at120 = clear(page, intervals: [Self.frame120])
+        let at120 = clear(pageAtSourcePace, intervals: [Self.frame120])
         XCTAssertEqual(at120.outcome, .finished)
         XCTAssertEqual(at120.frames.count, 66)
         XCTAssertEqual(at120.elapsed, 1_625.0 / 3, accuracy: 1e-9)
@@ -283,6 +290,56 @@ final class PageUnfoldTimelineTests: XCTestCase {
         assertClose(at120.frames.map(\.tilt), Array(Source.web120Tilt.prefix(66)), "120 Hz tilt")
         for (clearing, interval) in [(at60, Self.frame60), (at120, Self.frame120)] {
             XCTAssertEqual(clearing.elapsed, Source.frostClearedAfterSwap, accuracy: interval)
+        }
+        XCTAssertEqual(Timeline.sourceClearingDuration, Source.frostClearedAfterSwap)
+    }
+
+    // MARK: The app's pace
+
+    /// The source's clearing is over before the eye finds it on light paper; Notty's takes about
+    /// 0.95 s and never a second, at any common display rate.
+    func testTheNewPageClearsInAboutNineHundredFiftyMillisecondsAndNeverASecond() {
+        XCTAssertEqual(Timeline.appTimeScale, 1.7378, accuracy: 1e-4)
+        XCTAssertEqual(page.timeScale, Timeline.appTimeScale, "Notty's frost runs at the app's pace by default")
+        for rate in [60.0, 120.0, 80.0, 90.0, 100.0] {
+            let interval = 1_000 / rate
+            let clearing = clear(page, intervals: [interval])
+            XCTAssertEqual(clearing.outcome, .finished, "\(rate) Hz")
+            XCTAssertEqual(clearing.elapsed, Timeline.clearingDuration, accuracy: interval, "\(rate) Hz")
+            XCTAssertLessThan(clearing.elapsed, 1_000, "\(rate) Hz")
+            XCTAssertTrue(clearing.frames.allSatisfy { $0.taps == Timeline.maximumTaps }, "\(rate) Hz")
+        }
+        XCTAssertEqual(clear(page, intervals: [Self.frame60]).elapsed, 950, accuracy: 1e-9)
+        XCTAssertEqual(clear(page, intervals: [Self.frame120]).elapsed, 2_825.0 / 3, accuracy: 1e-9)
+    }
+
+    /// Only the pace changes: each frame is the source's frame at the same point of its script,
+    /// so the frost blurs, dims and hands off exactly as the source's, only slower.
+    func testTheAppsClearingIsTheSourcesSlowedDown() {
+        for interval in [Self.frame60, Self.frame120] {
+            let slowed = clear(page, intervals: [interval])
+            let source = clear(pageAtSourcePace, intervals: [interval / Timeline.appTimeScale])
+            XCTAssertEqual(slowed.frames.count, source.frames.count, "\(interval) ms")
+            XCTAssertEqual(slowed.elapsed, source.elapsed * Timeline.appTimeScale, accuracy: 1e-6)
+            for (index, (frame, reference)) in zip(slowed.frames, source.frames).enumerated() {
+                XCTAssertEqual(frame.tilt, reference.tilt, accuracy: 1e-9, "tilt [\(index)]")
+                XCTAssertEqual(frame.farEdgeRadius, reference.farEdgeRadius, accuracy: 1e-9, "radius [\(index)]")
+                XCTAssertEqual(frame.fade, reference.fade, accuracy: 1e-9, "fade [\(index)]")
+            }
+        }
+    }
+
+    /// The frame-rate guard protects real frames, so it keeps to real time at any pace: two
+    /// frames over 50 ms in a row after the grace frames end the frost at once.
+    func testTheSlowFrameGuardKeepsToRealTimeAtTheAppsPace() {
+        let clearing = clear(page, intervals: [0, 80, 80, 30, 60, 60, 16])
+        XCTAssertEqual(clearing.outcome, .abandoned)
+        XCTAssertEqual(clearing.frames.count, 5)
+    }
+
+    func testAPaceThatIsNoPositiveNumberIsTheSources() {
+        for scale in [0, -1, Double.nan, .infinity] {
+            XCTAssertEqual(Timeline(pageHeight: Self.pageHeight, timeScale: scale).timeScale, Timeline.sourceTimeScale)
         }
     }
 
@@ -299,6 +356,63 @@ final class PageUnfoldTimelineTests: XCTestCase {
         XCTAssertLessThanOrEqual(frame.farEdgeRadius, Timeline.unseenRadius, "what is left can no longer be seen")
         let later = timeline.advance(elapsed: 5_000, interval: 80, gpuTime: 90)
         XCTAssertEqual(later, frame)
+    }
+
+    // MARK: Arrival
+
+    func testTheArrivalEasesOffAndEasesToRestWithoutOvershoot() {
+        XCTAssertEqual(Timeline.arrivalProgress(at: 0), 0)
+        XCTAssertEqual(Timeline.arrivalProgress(at: -20), 0)
+        XCTAssertEqual(Timeline.arrivalProgress(at: Timeline.arrivalDuration), 1)
+        XCTAssertEqual(Timeline.arrivalProgress(at: Timeline.arrivalDuration + 500), 1)
+        var previous = 0.0
+        var steps: [Double] = []
+        for elapsed in stride(from: Self.frame120, through: Timeline.arrivalDuration + 100, by: Self.frame120) {
+            let progress = Timeline.arrivalProgress(at: elapsed)
+            XCTAssertGreaterThanOrEqual(progress, previous, "never turns back at \(elapsed) ms")
+            XCTAssertLessThanOrEqual(progress, 1, "never overshoots at \(elapsed) ms")
+            steps.append(progress - previous)
+            previous = progress
+        }
+        // Fastest within the first eighth of a second, then only slowing.
+        let fastest = steps.indices.max { steps[$0] < steps[$1] } ?? steps.count
+        XCTAssertLessThan(Double(fastest + 1) * Self.frame120, 125)
+        XCTAssertLessThan(steps[0], steps[fastest], "it eases off from rest")
+        // Landing it at the clearing's end exactly shows no stop: the last frame moves a full
+        // page by a fraction of a point.
+        let lastFrame = 1 - Timeline.arrivalProgress(at: Timeline.arrivalDuration - Self.frame120)
+        XCTAssertLessThan(1_448 * lastFrame, 0.3)
+    }
+
+    /// The scroll finishes in step with the clearing: the new page reaches the last half point of
+    /// its way only as the last of the frost leaves, and has arrived when it has gone.
+    func testTheArrivalFinishesAsTheFrostClears() {
+        let page = 1_448.0
+        XCTAssertEqual(Timeline.arrivalDuration, Timeline.clearingDuration)
+        for interval in [Self.frame60, Self.frame120] {
+            let cleared = clear(self.page, intervals: [interval]).elapsed
+            XCTAssertEqual(Timeline.arrivalProgress(at: cleared), 1, accuracy: 0.5 / page, "\(interval) ms")
+            let nearlyThere = stride(from: 0.0, through: 2_000, by: interval).first {
+                page * (1 - Timeline.arrivalProgress(at: $0)) < 0.5
+            }
+            XCTAssertGreaterThan(try XCTUnwrap(nearlyThere), cleared * 0.85, "\(interval) ms")
+            XCTAssertLessThanOrEqual(try XCTUnwrap(nearlyThere), cleared + interval, "\(interval) ms")
+        }
+    }
+
+    func testTheNewPageIsMostlyInViewWhileItsFrostStillClears() {
+        var timeline = page
+        var elapsed = 0.0
+        var frame = timeline.currentFrame
+        let startRadius = frame.farEdgeRadius
+        while frame.farEdgeRadius > startRadius / 2 {
+            elapsed += Self.frame120
+            frame = timeline.advance(elapsed: elapsed, interval: Self.frame120)
+        }
+        // By the time half the frost's blur at the foot of the page has cleared, the page has
+        // nearly arrived, so the rest of its clearing is seen in place.
+        XCTAssertGreaterThan(Timeline.arrivalProgress(at: elapsed), 0.9, "\(elapsed) ms")
+        XCTAssertEqual(frame.phase, .clearing)
     }
 
     // MARK: Frame rate

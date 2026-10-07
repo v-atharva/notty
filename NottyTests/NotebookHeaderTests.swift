@@ -452,9 +452,10 @@ final class NotebookHeaderTests: XCTestCase {
         let shellCentre = CGPoint(x: editor.shellFrame.midX, y: editor.shellFrame.midY)
         let reserved = window.safeAreaInsets.top + NotebookScreen.headerReservation
         let rail = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
-            .frame(for: store.toolbar.placement, in: CGRect(x: 0, y: reserved, width: window.bounds.width, height: 800))
+            .frame(in: CGRect(x: 0, y: reserved, width: window.bounds.width, height: 800))
         let tab = CGPoint(x: rail.midX, y: rail.minY + 10)
-        let besideTab = CGPoint(x: rail.midX + 120, y: rail.midY)
+        // On the rail's first row, which shows whether or not its second row does.
+        let besideTab = CGPoint(x: rail.midX + 120, y: rail.minY + NotebookTheme.rowHeight / 2)
         func hit(_ point: CGPoint) -> UIView { NotebookTestFixtures.hit(point, in: window) }
         func assertPageHeldStill(_ offset: CGPoint, _ phase: String, line: UInt = #line) {
             XCTAssertEqual(canvas.contentInset, insets, "\(phase): insets", line: line)
@@ -1340,7 +1341,7 @@ final class NotebookHeaderTests: XCTestCase {
 
         // Moving the toolbar, which stores a copy of the preferences, keeps the mode.
         var moved = store.toolbar
-        moved.place(.docked(.topLeading))
+        moved.place(.docked(.leftEdge))
         store.updateToolbar(moved)
         XCTAssertEqual(store.toolbar.chromeMode, .pinned)
         XCTAssertEqual(rig.chrome.mode, .pinned)
@@ -1709,9 +1710,20 @@ final class NotebookHeaderTests: XCTestCase {
         store.attach(owner)
         store.setToolbarAvailable(true, for: owner)
         defer { store.detach(owner) }
-        let picker = NotebookToolbarPositionPicker(store: store, hostWidth: 1_366, sizeClass: .regular)
+        let picker = NotebookToolbarPositionPicker(store: store, sizeClass: .regular)
         let segments = NotebookToolbarPositionPicker.segments
         XCTAssertEqual(segments.map(\.label), ["Left", "Center", "Right", "Float"])
+        XCTAssertEqual(
+            segments.map(\.placement),
+            [.docked(.leftEdge), .docked(.topCenter), .docked(.rightEdge), NotebookToolbarActions.floatingPlacement],
+            "Left and Right are the side docks, which stand the rail on end."
+        )
+        XCTAssertEqual(
+            segments.map(\.actionName), ["Dock at left edge", "Dock top center", "Dock at right edge", "Float"]
+        )
+        for segment in segments {
+            XCTAssertNotNil(UIImage(systemName: segment.symbol), segment.symbol)
+        }
         for segment in segments {
             picker.choose(segment.placement)
             XCTAssertEqual(NotebookToolbarPositionPicker.segment(for: store.toolbar.placement)?.label, segment.label)
@@ -1728,11 +1740,11 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertFalse(store.toolbar.isCollapsed, "and shows it in full.")
         XCTAssertEqual(NotebookToolbarPositionPicker.segment(for: store.toolbar.placement)?.label, "Float")
 
-        picker.choose(.docked(.topLeading))
-        XCTAssertEqual(store.toolbar.placement, .docked(.topLeading))
+        picker.choose(.docked(.leftEdge))
+        XCTAssertEqual(store.toolbar.placement, .docked(.leftEdge))
         store.setToolbarAvailable(false, for: owner)
-        picker.choose(.docked(.topTrailing))
-        XCTAssertEqual(store.toolbar.placement, .docked(.topLeading), "A paused toolbar keeps its place.")
+        picker.choose(.docked(.rightEdge))
+        XCTAssertEqual(store.toolbar.placement, .docked(.leftEdge), "A paused toolbar keeps its place.")
     }
 
     /// Voice Control users name a control by the word they see. A position segment answers to its
@@ -1741,7 +1753,7 @@ final class NotebookHeaderTests: XCTestCase {
     func testControlsAnswerToTheWordsTheyShow() {
         for segment in NotebookToolbarPositionPicker.segments {
             XCTAssertEqual(segment.inputLabels.first, segment.label)
-            XCTAssertTrue(segment.inputLabels.contains(segment.accessibilityLabel), segment.label)
+            XCTAssertTrue(segment.inputLabels.contains(segment.actionName), segment.label)
         }
         for preset in EditorInkCatalog.presets {
             let spoken = NotebookPresetChip.inputLabels(for: preset)

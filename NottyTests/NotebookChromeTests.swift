@@ -108,11 +108,22 @@ final class NotebookChromeTests: XCTestCase {
         }
     }
 
+    // MARK: - Glass
+
+    /// The rail is the system's regular glass, the material of its own toolbars, under every display
+    /// setting: the system itself adapts it to Increase Contrast and Reduce Transparency.
+    func testRailTakesTheRegularGlassOfTheSystemsToolbars() {
+        XCTAssertEqual(NotebookTheme.railGlass, .regular)
+        XCTAssertEqual(NotebookTheme.selectionGlass, .regular)
+    }
+
     // MARK: - Contrast
 
     /// Every pair of text and its background reaches 4.5:1, and every glyph and essential mark
     /// reaches 3:1 against what lies behind it (WCAG 1.4.3 and 1.4.11), computed from the theme's
-    /// own values.
+    /// own values. The rail's swatches are measured against the paper, which its glass lifts toward
+    /// white; its keys take the system's foreground on the glass, measured from the drawn rail with
+    /// the toolbar host's tests.
     func testChromePairsMeetTheirContrastMinimums() {
         let paper = color(NotebookTheme.paperIvory)
         let stone = color(NotebookTheme.backdropStone)
@@ -126,9 +137,7 @@ final class NotebookChromeTests: XCTestCase {
         let caution = color(NotebookTheme.cautionGlyph)
         let alert = color(NotebookTheme.alertGlyph)
         let accent = color(NotebookTheme.accentFill)
-        // Reference points on the shell gradient: the centres of the rail's rows, and the middle.
-        let firstRow = shell(at: 0.24)
-        let secondRow = shell(at: 0.76)
+        // Reference point on the shell gradient: the middle of the header.
         let centre = shell(at: 0.5)
         let pressedTray = blend(well, NotebookTheme.pressedTrayOpacity, over: tray)
 
@@ -143,8 +152,6 @@ final class NotebookChromeTests: XCTestCase {
             ("pressed alert caption", alert, pressedTray),
             ("nameplate", secondary, centre),
             ("nameplate at the shell's bottom", secondary, bottom),
-            ("SOON label", secondary, firstRow),
-            ("preset label", glyph, secondRow),
             ("label in a selected well", glyph, well),
             ("secondary text in a selected well", secondary, well),
             ("popover headline", glyph, surface),
@@ -161,27 +168,23 @@ final class NotebookChromeTests: XCTestCase {
         }
 
         var marks: [(String, EditorInkColor, EditorInkColor)] = [
-            ("tool glyph", glyph, firstRow),
-            ("tool glyph at the shell's bottom", glyph, bottom),
+            ("header glyph", glyph, centre),
+            ("header glyph at the shell's bottom", glyph, bottom),
             ("glyph and mark bar in a well", glyph, well),
             ("accent glyph", color(NotebookTheme.accentGlyph), accent),
             ("accent key on the header", accent, centre),
             ("accent key at the shell's bottom", accent, bottom),
-            ("grip ridges", secondary, centre),
             ("near-limit gauge", caution, tray),
-            ("reveal-tab chevron", secondary, blend(surface, NotebookTheme.revealTabOpacity, over: paper)),
-            ("paused glyph", blend(glyph, NotebookTheme.disabledOpacity, over: bottom), bottom),
             ("dock outline on paper", blend(glyph, NotebookTheme.dockSlotOutlineOpacity, over: paper), paper),
             ("dock outline on stone", blend(glyph, NotebookTheme.dockSlotOutlineOpacity, over: stone), stone),
-            ("placeholder on the rail", color(NotebookTheme.disabledGlyph), firstRow),
             ("placeholder on a popover", color(NotebookTheme.disabledGlyph), surface),
         ]
+        for ink in EditorInkCatalog.swatches + EditorInkCatalog.presets.map(\.color) {
+            marks.append(("swatch \(ink) on the rail", ink, paper))
+        }
         for fill in [NotebookTheme.dockSlotOpaqueFill, NotebookTheme.dockSlotTargetedOpaqueFill, NotebookTheme.dockSlotLandingOpaqueFill] {
             let opaque = color(fill)
             marks.append(("dock outline on an opaque fill", blend(glyph, NotebookTheme.dockSlotOutlineOpacity, over: opaque), opaque))
-        }
-        for ink in EditorInkCatalog.swatches + EditorInkCatalog.presets.map(\.color) {
-            marks.append(("swatch \(ink)", ink, secondRow))
         }
         for (name, foreground, background) in marks {
             assertContrast(foreground, background, atLeast: 3, name)
@@ -376,21 +379,18 @@ final class NotebookChromeTests: XCTestCase {
         assertPixel(pressedDisabled, equals: surface, "no press while disabled")
     }
 
-    /// While writing is paused the rail draws its keys in the glyph tone at its content opacity:
-    /// 3.18:1 where the shell is darkest and 4.93:1 on the flat Increase Contrast shell, so they stay
-    /// above the 3:1 a glyph needs. The opacity is recovered from the rendered glyph against the
-    /// shell right beside it, so the ratios hold to the rounding of an 8-bit render.
+    /// While writing is paused the rail draws its keys as live keys at its content opacity, so the
+    /// system's label colour on its glass keeps 3:1 even over the black below the last page, where the
+    /// glass measures 134 of 255 on screen, and 4.5:1 over the paper. The opacity is recovered from the
+    /// paused glyph against a live render of the same key, each beside the rail's own glass, so it
+    /// holds to the rounding of an 8-bit render.
     func testPausedRailGlyphsKeepTheirSpecifiedContrast() async throws {
-        let store = NotebookTestFixtures.toolStore()
-        XCTAssertFalse(store.isToolbarAvailable, "A store no canvas owns is paused.")
-        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
-        let rail = composition.rail(forHostWidth: Self.renderSize.width)
-        let toolbar = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
-            .frame(width: rail.size.width, height: rail.size.height)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .ignoresSafeArea()
+        let paused = NotebookTestFixtures.toolStore()
+        XCTAssertFalse(paused.isToolbarAvailable, "A store no canvas owns is paused.")
+        let (live, owner) = availableStore()
+        defer { live.detach(owner) }
         // The first ink family's key, after the grip column and the strip's leading inset, and the
-        // plain shell in that inset beside it.
+        // plain glass in that inset beside it.
         let key = CGRect(
             x: NotebookToolbarComposition.gripColumnWidth + NotebookTheme.stripInsets.left, y: NotebookTheme.stripInsets.top,
             width: NotebookTheme.controlSize, height: NotebookTheme.controlSize
@@ -400,39 +400,43 @@ final class NotebookChromeTests: XCTestCase {
             rows.map { CGPoint(x: x, y: $0) }
         }
         let shellPoints = rows.map { CGPoint(x: key.minX - NotebookTheme.stripInsets.left / 2, y: $0) }
-        let glyph = color(NotebookTheme.glyph)
-        let cases: [(String, UIAccessibilityContrast, Double, Double, NotebookTheme.Tone)] = [
-            ("standard", .normal, NotebookTheme.disabledOpacity, 3.18, NotebookTheme.panelBottom),
-            ("Increase Contrast", .high, NotebookTheme.disabledOpacityIncreased, 4.93, NotebookTheme.panelSurface),
+        let cases: [(String, UIAccessibilityContrast, Double)] = [
+            ("standard", .normal, NotebookTheme.disabledOpacity),
+            ("Increase Contrast", .high, NotebookTheme.disabledOpacityIncreased),
         ]
-        for (name, contrast, opacity, specified, darkestShell) in cases {
-            let pixels = try await rendered(toolbar, contrast: contrast, at: glyphPoints + shellPoints)
-            let glyphPixels = pixels.prefix(glyphPoints.count)
-            let darkest = try XCTUnwrap(glyphPixels.indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
-            let drawn = pixels[darkest].prefix(3).map { Double($0) / 255 }
-            let row = try XCTUnwrap(rows.firstIndex(of: glyphPoints[darkest].y))
-            let shell = pixels[glyphPoints.count + row].prefix(3).map { Double($0) / 255 }
-            let glyphComponents = [glyph.red, glyph.green, glyph.blue]
-            let alpha = (0..<3).map { (shell[$0] - drawn[$0]) / (shell[$0] - glyphComponents[$0]) }.reduce(0, +) / 3
-            XCTAssertEqual(alpha, opacity, accuracy: 0.02, "\(name): the glyph tone at the paused opacity")
-            let background = color(darkestShell, contrast)
-            let ratio = blend(glyph, alpha, over: background).contrastRatio(against: background)
-            XCTAssertGreaterThanOrEqual(ratio, specified - 0.03, "\(name): \(ratio):1, specified \(specified):1")
+        for (name, contrast, opacity) in cases {
+            func glyphAndShell(_ store: NotebookSceneToolStore) async throws -> (glyph: [Double], shell: [Double]) {
+                let pixels = try await rendered(toolbar(for: store), contrast: contrast, at: glyphPoints + shellPoints)
+                let darkest = try XCTUnwrap(pixels.prefix(glyphPoints.count).indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
+                let row = try XCTUnwrap(rows.firstIndex(of: glyphPoints[darkest].y))
+                return (
+                    pixels[darkest].prefix(3).map { Double($0) / 255 },
+                    pixels[glyphPoints.count + row].prefix(3).map { Double($0) / 255 }
+                )
+            }
+            let shown = try await glyphAndShell(live)
+            let dimmed = try await glyphAndShell(paused)
+            let alpha = (0..<3).map { (dimmed.shell[$0] - dimmed.glyph[$0]) / (shown.shell[$0] - shown.glyph[$0]) }
+                .reduce(0, +) / 3
+            XCTAssertEqual(alpha, opacity, accuracy: 0.02, "\(name): the live glyph at the paused opacity")
+            let label = color(NotebookKeyForeground.glassMarkColor(isLive: true), contrast)
+            for (ground, specified) in [(Self.glassOverBlack, 3.0), (Self.glassOverPaper, 4.5)] {
+                let ratio = blend(label, opacity, over: ground).contrastRatio(against: ground)
+                XCTAssertGreaterThanOrEqual(ratio, specified, "\(name): \(ratio):1 over \(ground)")
+            }
         }
     }
 
     /// A paused rail dims its working keys, but the planned tools' placeholders are unavailable
-    /// either way and keep their disabled tone at full strength, whatever the contrast setting.
+    /// either way and keep their disabled look at full strength, whatever the contrast setting.
     func testPausedRailLeavesItsPlaceholdersInTheirDisabledTone() async throws {
-        let store = NotebookTestFixtures.toolStore()
-        XCTAssertFalse(store.isToolbarAvailable, "A store no canvas owns is paused.")
+        let paused = NotebookTestFixtures.toolStore()
+        XCTAssertFalse(paused.isToolbarAvailable, "A store no canvas owns is paused.")
+        let (live, owner) = availableStore()
+        defer { live.detach(owner) }
         let size = CGSize(width: 1_024, height: 120)
-        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
-        let rail = composition.rail(forHostWidth: size.width)
-        let toolbar = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
-            .frame(width: rail.size.width, height: rail.size.height)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .ignoresSafeArea()
+        let rail = NotebookToolbarComposition(preferences: paused.toolbar, horizontalSizeClass: .regular)
+            .rail(forHostWidth: size.width)
         func key(_ item: NotebookStripItem) throws -> CGRect {
             let slot = try XCTUnwrap(rail.toolRow.slots.first { $0.item == item })
             return CGRect(
@@ -441,15 +445,12 @@ final class NotebookChromeTests: XCTestCase {
             )
         }
         let placeholder = try XCTUnwrap(NotebookUpcomingFeature.placed(.toolStrip).first)
-        let keys = [
-            (try key(.upcoming(placeholder)), NotebookTheme.disabledGlyph),
-            (try key(.eraser), NotebookTheme.glyph),
-        ]
-        let rows = Array(stride(from: keys[0].0.minY + 4, to: keys[0].0.maxY - 4, by: 0.5))
-        // The plain shell in the strip's leading inset, level with the keys; it shades only from top to bottom.
+        let keys = [try key(.upcoming(placeholder)), try key(.eraser)]
+        let rows = Array(stride(from: keys[0].minY + 4, to: keys[0].maxY - 4, by: 0.5))
+        // The plain glass in the strip's leading inset, level with the keys.
         let shellX = NotebookToolbarComposition.gripColumnWidth + NotebookTheme.stripInsets.left / 2
         let shellPoints = rows.map { CGPoint(x: shellX, y: $0) }
-        let keyPoints = keys.map { key, _ in
+        let keyPoints = keys.map { key in
             stride(from: key.minX + 4, to: key.maxX - 4, by: 0.5).flatMap { x in rows.map { CGPoint(x: x, y: $0) } }
         }
         let cases: [(String, UIAccessibilityContrast, Double)] = [
@@ -457,22 +458,48 @@ final class NotebookChromeTests: XCTestCase {
             ("Increase Contrast", .high, NotebookTheme.disabledOpacityIncreased),
         ]
         for (name, contrast, pausedOpacity) in cases {
-            let pixels = try await rendered(toolbar, contrast: contrast, size: size, at: shellPoints + keyPoints.joined())
-            var start = shellPoints.count
-            var opacities: [Double] = []
-            for ((_, tone), points) in zip(keys, keyPoints) {
-                let drawn = pixels[start..<(start + points.count)]
-                let darkest = try XCTUnwrap(drawn.indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
-                let row = try XCTUnwrap(rows.firstIndex(of: points[darkest - start].y))
-                let shell = pixels[row].prefix(3).map { Double($0) / 255 }
-                let glyph = pixels[darkest].prefix(3).map { Double($0) / 255 }
-                let toneComponents = components(color(tone, contrast)).map(Double.init)
-                opacities.append((0..<3).map { (shell[$0] - glyph[$0]) / (shell[$0] - toneComponents[$0]) }.reduce(0, +) / 3)
-                start += points.count
+            /// The darkest point of each key and the glass level with it.
+            func marks(_ store: NotebookSceneToolStore) async throws -> [(glyph: [Double], shell: [Double])] {
+                let pixels = try await rendered(toolbar(for: store, width: size.width), contrast: contrast, size: size,
+                    at: shellPoints + keyPoints.joined())
+                var start = shellPoints.count
+                var found: [(glyph: [Double], shell: [Double])] = []
+                for points in keyPoints {
+                    let drawn = pixels[start..<(start + points.count)]
+                    let darkest = try XCTUnwrap(drawn.indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
+                    let row = try XCTUnwrap(rows.firstIndex(of: points[darkest - start].y))
+                    found.append((pixels[darkest].prefix(3).map { Double($0) / 255 }, pixels[row].prefix(3).map { Double($0) / 255 }))
+                    start += points.count
+                }
+                return found
             }
-            XCTAssertEqual(opacities[0], 1, accuracy: 0.03, "\(name): the placeholder in its full disabled tone")
+            let shown = try await marks(live)
+            let dimmed = try await marks(paused)
+            let opacities = zip(shown, dimmed).map { shown, dimmed in
+                (0..<3).map { (dimmed.shell[$0] - dimmed.glyph[$0]) / (shown.shell[$0] - shown.glyph[$0]) }.reduce(0, +) / 3
+            }
+            XCTAssertEqual(opacities[0], 1, accuracy: 0.03, "\(name): the placeholder as it is when writing is live")
             XCTAssertEqual(opacities[1], pausedOpacity, accuracy: 0.02, "\(name): the working keys beside it dim")
         }
+    }
+
+    /// The rail alone, as a canvas shows it, for `store`.
+    private func toolbar(for store: NotebookSceneToolStore, width: CGFloat = NotebookChromeTests.renderSize.width) -> some View {
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let rail = composition.rail(forHostWidth: width)
+        return NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
+            .frame(width: rail.size.width, height: rail.size.height)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .ignoresSafeArea()
+    }
+
+    /// A store that admits toolbar actions, as one a canvas owns, without mounting the canvas.
+    private func availableStore() -> (NotebookSceneToolStore, NotebookViewController) {
+        let store = NotebookTestFixtures.toolStore()
+        let owner = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        store.attach(owner)
+        store.setToolbarAvailable(true, for: owner)
+        return (store, owner)
     }
 
     // MARK: - Status card
@@ -806,6 +833,10 @@ final class NotebookChromeTests: XCTestCase {
     }
 
     private static let renderSize = CGSize(width: 200, height: 120)
+    /// The rail's regular glass as the simulator's screen and a drawn window show it over the ivory
+    /// paper and over the black below the last page; an offscreen render draws glass flat.
+    private static let glassOverPaper = EditorInkColor(red: 253.0 / 255, green: 248.0 / 255, blue: 236.0 / 255)
+    private static let glassOverBlack = EditorInkColor(red: 134.0 / 255, green: 134.0 / 255, blue: 134.0 / 255)
 
     /// A 44 point key face with a small dark mark at its centre in the key's glyph colour.
     private static var keyLabel: some View {
@@ -877,9 +908,17 @@ final class NotebookChromeTests: XCTestCase {
 
     /// The tone as it resolves under `contrast`, kept with its alpha.
     private func color(_ tone: NotebookTheme.Tone, _ contrast: UIAccessibilityContrast = .normal) -> EditorInkColor {
+        color(tone.uiColor, contrast)
+    }
+
+    /// The colour as it resolves in the editor's light appearance under `contrast`, kept with its alpha.
+    private func color(_ uiColor: UIColor, _ contrast: UIAccessibilityContrast = .normal) -> EditorInkColor {
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-        tone.uiColor.resolvedColor(with: UITraitCollection(accessibilityContrast: contrast))
-            .getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        let traits = UITraitCollection { traits in
+            traits.userInterfaceStyle = .light
+            traits.accessibilityContrast = contrast
+        }
+        uiColor.resolvedColor(with: traits).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return EditorInkColor(red: red, green: green, blue: blue, alpha: alpha)
     }
 

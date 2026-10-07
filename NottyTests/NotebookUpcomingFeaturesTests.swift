@@ -33,18 +33,22 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
 
     // MARK: - Toolbar strip
 
-    /// The planned tools close the tool row as one group, only where the rail fits all of them.
-    /// The single compact row scrolls on to them, as it always has.
+    /// The planned tools close the tool row as one group, only where the rail fits all of them; a
+    /// floating rail's first row also ends with its collapse key, so in portrait on the 12.9-inch
+    /// iPad the group yields to the key. The single compact row scrolls on to them, as it always has.
     func testToolRowEndsWithEveryPlaceholderOnlyWhereTheWholeGroupFits() {
         let floating = EditorToolbarPreferences(
             placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: false, customSwatches: []
         )
-        let expected: [(CGFloat, UserInterfaceSizeClass?, Bool)] = [
-            (1_366, .regular, true), (1_024, .regular, true), (1_032, nil, true),
-            (1_194, .regular, false), (834, .regular, false), (678, .regular, false), (507, .compact, true),
+        // Width, size class, shown docked, shown floating.
+        let expected: [(CGFloat, UserInterfaceSizeClass?, Bool, Bool)] = [
+            (1_366, .regular, true, true), (1_024, .regular, true, false), (1_032, nil, true, false),
+            (1_194, .regular, true, true), (834, .regular, false, false), (678, .regular, false, false),
+            (507, .compact, true, true),
         ]
         for preferences in [EditorToolbarPreferences.standard, floating] {
-            for (width, sizeClass, shows) in expected {
+            for (width, sizeClass, showsDocked, showsFloating) in expected {
+                let shows = preferences == floating ? showsFloating : showsDocked
                 let rail = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass)
                     .rail(forHostWidth: width)
                 let label = "\(width) \(String(describing: sizeClass)) \(preferences.placement)"
@@ -69,9 +73,12 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
     /// SwiftUI frames are not readable from a hosted test, so a tool row that needs no scrolling
     /// stands in for "every placeholder and the caption are on screen before any paging".
     func testWideToolRowShowsEveryPlaceholderWithoutScrolling() async throws {
-        // A full-screen 12.9-inch iPad in landscape and in portrait.
-        for width in [1_366.0, 1_024] as [CGFloat] {
-            for placement in [EditorToolbarPlacement.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))] {
+        // A full-screen 12.9-inch iPad in landscape and in portrait, and the 11-inch in landscape;
+        // floating, the portrait rail gives the group's room to its collapse key.
+        for width in [1_366.0, 1_024, 1_194] as [CGFloat] {
+            let placements: [EditorToolbarPlacement] = width == 1_024
+                ? [.docked(.topCenter)] : [.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))]
+            for placement in placements {
                 let fixture = try await NotebookTestFixtures.mountToolbarHost(store: toolStore(placedAt: placement), width: width)
                 defer { fixture.close() }
                 let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
@@ -88,9 +95,12 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
     /// Where the window cannot fit the whole group, the planned tools stay out of the rail, so
     /// every working tool shows at rest and nothing pages in part.
     func testNarrowerToolRowShowsEveryWorkingToolWithoutPlaceholders() async throws {
-        // The 11-inch iPad in portrait and in landscape.
-        for width in [834.0, 1_194] as [CGFloat] {
-            for placement in [EditorToolbarPlacement.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))] {
+        // The 11-inch iPad in portrait, and a floating rail in portrait on the 12.9-inch, whose
+        // collapse key takes the group's room.
+        for width in [834.0, 1_024] as [CGFloat] {
+            let placements: [EditorToolbarPlacement] = width == 1_024
+                ? [.floating(CGPoint(x: 0.5, y: 0.5))] : [.docked(.topCenter), .floating(CGPoint(x: 0.5, y: 0.5))]
+            for placement in placements {
                 let fixture = try await NotebookTestFixtures.mountToolbarHost(store: toolStore(placedAt: placement), width: width)
                 defer { fixture.close() }
                 let strip = try XCTUnwrap(fixture.strips.first, "\(placement)")
@@ -105,38 +115,27 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         }
     }
 
-    /// Moving between docks is plainly visible wherever the window leaves room for it; where it
-    /// does not, one centred slot stands for every dock.
-    func testNeighbouringDocksStayApartOrShareOneSlot() {
+    /// The three docks lie along different edges, so their markers never overlap in any regular
+    /// window; at compact width only the top is a dock.
+    func testDockMarkersStayApartAndCompactWidthMarksOnlyTheTop() {
         let composition = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
-        for width in [1_366.0, 1_376, 1_194] as [CGFloat] {
-            let usable = CGRect(x: 0, y: 0, width: width, height: 1_000)
-            let rail = composition.rail(forHostWidth: width)
-            XCTAssertFalse(rail.docksShared, "\(width)")
-            let origins = EditorToolbarDock.allCases.map {
-                EditorToolbarLayout.frame(for: .docked($0), size: rail.size, in: usable).minX
-            }
-            for (leading, trailing) in zip(origins, origins.dropFirst()) {
-                XCTAssertGreaterThanOrEqual(trailing - leading, NotebookToolbarComposition.minimumDockTravel - 0.5, "\(width)")
-            }
-            let markers = EditorToolbarDock.allCases.compactMap {
-                NotebookDockMarkers.frames(slotSize: rail.size, in: usable, docksShared: rail.docksShared)[$0]
-            }
-            XCTAssertEqual(markers.count, 3, "\(width)")
-            for (index, marker) in markers.enumerated() {
-                for other in markers[(index + 1)...] {
-                    XCTAssertFalse(marker.intersects(other), "\(width): \(marker) overlaps \(other)")
+        for size in [CGSize(width: 1_366, height: 950), CGSize(width: 1_024, height: 1_290), CGSize(width: 834, height: 1_104),
+                     CGSize(width: 1_194, height: 728), CGSize(width: 678, height: 1_290)] {
+            let usable = CGRect(origin: .zero, size: size)
+            let markers = NotebookDockMarkers.frames(dockSizes: composition.dockSizes(in: size), in: usable, sideDocks: true)
+            XCTAssertEqual(Set(markers.keys), Set(EditorToolbarDock.allCases), "\(size)")
+            let frames = Array(markers.values)
+            for (index, marker) in frames.enumerated() {
+                for other in frames[(index + 1)...] {
+                    XCTAssertFalse(marker.intersects(other), "\(size): \(marker) overlaps \(other)")
                 }
             }
         }
-        for width in [1_032.0, 1_024, 834, 678] as [CGFloat] {
-            let usable = CGRect(x: 0, y: 0, width: width, height: 1_000)
-            let rail = composition.rail(forHostWidth: width)
-            XCTAssertTrue(rail.docksShared, "\(width)")
-            let markers = NotebookDockMarkers.frames(slotSize: rail.size, in: usable, docksShared: true)
-            XCTAssertEqual(markers.count, 1, "\(width)")
-            XCTAssertEqual(markers[.topCenter]?.midX ?? 0, usable.midX, accuracy: 0.5, "\(width): the slot is centred.")
-        }
+        let compact = NotebookDockMarkers.frames(
+            dockSizes: composition.dockSizes(in: CGSize(width: 507, height: 1_290)),
+            in: CGRect(x: 0, y: 0, width: 507, height: 1_290), sideDocks: false
+        )
+        XCTAssertEqual(Array(compact.keys), [.topCenter])
     }
 
     func testCompactWidthToolRowPagesToItsEndAndKeepsItsTouches() async throws {
@@ -220,8 +219,8 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
             "rectangle.portrait.badge.plus", "lifepreserver", "checkmark.seal", "xmark.seal", "questionmark.circle",
             "circle.dotted", "doc", "checkmark.circle", "exclamationmark.triangle.fill", "lock",
             "gauge.with.dots.needle.67percent", "line.3.horizontal", "arrow.uturn.backward", "arrow.uturn.forward",
-            "rectangle.inset.topleading.filled", "rectangle.topthird.inset.filled",
-            "rectangle.inset.toptrailing.filled", "rectangle.center.inset.filled",
+            "rectangle.leadingthird.inset.filled", "rectangle.topthird.inset.filled",
+            "rectangle.trailingthird.inset.filled", "rectangle.center.inset.filled",
         ] + EditorChromeMode.allCases.map(\.symbol)
         for symbol in symbols {
             XCTAssertNotNil(UIImage(systemName: symbol), symbol)
@@ -240,38 +239,22 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         }
     }
 
-    /// Split View and narrower windows show the docks as one centred slot; the menu says so exactly
-    /// where the rail shares its slot, whichever dock or floating spot is stored.
-    func testToolbarPositionNotesWhenTheDocksShareOneSlot() {
-        let stored: [EditorToolbarPreferences] = [
-            .standard,
-            EditorToolbarPreferences(placement: .docked(.topLeading), isCollapsed: false, customSwatches: []),
-            EditorToolbarPreferences(placement: .floating(CGPoint(x: 0.3, y: 0.7)), isCollapsed: true, customSwatches: []),
+    /// A compact window has no side docks, so a toolbar stored at a side rests at the top; the menu
+    /// says so exactly then, whatever the width.
+    func testToolbarPositionNotesWhenASideDockRestsAtTheTop() {
+        let stored: [(EditorToolbarPreferences, Bool)] = [
+            (.standard, false),
+            (EditorToolbarPreferences(placement: .docked(.leftEdge), isCollapsed: false, customSwatches: []), true),
+            (EditorToolbarPreferences(placement: .docked(.rightEdge), isCollapsed: false, customSwatches: []), true),
+            (EditorToolbarPreferences(placement: .floating(CGPoint(x: 0.3, y: 0.7)), isCollapsed: true, customSwatches: []), false),
         ]
-        let expected: [(CGFloat, Bool)] = [(834, true), (1_024, true), (678, true), (1_194, false), (1_366, false)]
-        for preferences in stored {
-            for (width, shared) in expected {
-                for typeSize in [DynamicTypeSize.large, .xxLarge] {
-                    let label = "\(width) \(typeSize) \(preferences.placement)"
-                    let noted = NotebookToolbarPositionPicker.docksShared(
-                        preferences: preferences, hostWidth: width, sizeClass: .regular, dynamicTypeSize: typeSize
-                    )
-                    var docked = preferences
-                    docked.place(.docked(.topTrailing))
-                    let rail = NotebookToolbarComposition(
-                        preferences: docked, horizontalSizeClass: .regular, dynamicTypeSize: typeSize
-                    ).rail(forHostWidth: width)
-                    XCTAssertEqual(noted, rail.docksShared, "\(label): the note follows the rail.")
-                    if typeSize == .large { XCTAssertEqual(noted, shared, label) }
-                }
-                let compact = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .compact)
-                    .rail(forHostWidth: width)
-                XCTAssertEqual(
-                    NotebookToolbarPositionPicker.docksShared(
-                        preferences: preferences, hostWidth: width, sizeClass: .compact, dynamicTypeSize: .large
-                    ),
-                    compact.docksShared, "\(width) compact"
-                )
+        for (preferences, isSide) in stored {
+            for sizeClass in [UserInterfaceSizeClass.regular, .compact] {
+                let label = "\(preferences.placement) \(sizeClass)"
+                let noted = NotebookToolbarPositionPicker.restsAtTopInstead(preferences: preferences, sizeClass: sizeClass)
+                XCTAssertEqual(noted, isSide && sizeClass == .compact, label)
+                let composition = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass)
+                XCTAssertEqual(noted, composition.storedDock != composition.shownDock, "\(label): the note follows the rail.")
             }
         }
     }

@@ -90,8 +90,11 @@ final class NotebookViewController: UIViewController {
     let pageUnfold: NotebookPageUnfold?
     /// Hears the last finger leave the page, which ends a scroll the user stopped with a tap.
     let fingerLiftObserver = NotebookFingerLiftObserver()
-    /// Adds a page at the end of the notebook. Only a canvas given this offers the end of
-    /// notebook card.
+    /// How long after the canvas appears the card is first built, clear of the work of opening
+    /// the notebook; replaceable in tests before the canvas appears.
+    var endCardPreparationDelay: TimeInterval = 0.5
+    /// Adds a page at the end of the notebook for the card's Add page, as a page the user asked
+    /// for. Only a canvas given this offers the end of notebook card.
     var onAddPage: (() -> Void)? {
         didSet {
             guard isViewLoaded else { return }
@@ -105,30 +108,62 @@ final class NotebookViewController: UIViewController {
     private var endCardRoom: CGFloat = 0
     /// A drag that began with the page resting at its end, which may pull the card into view.
     private var endPull: EndPull?
-    /// Whether the drag under way began above the end of the scroll range, so a fling it starts
-    /// stops at the end.
-    private var dragBeganAboveEnd = false
-    /// A fling the controller aimed at the end, which stops there should UIKit carry it on.
-    private var isStoppingFlingAtEnd = false
+    /// A fling bound to overshoot the end of the paper far enough to reveal the card.
+    private var endMomentum: EndMomentum?
+    /// The scroll that brings a page added at the user's request into view.
+    private var arrival: PageArrival?
 
-    /// How far past the end of the paper a pull must be when released to reveal the card. Under
-    /// UIKit's rubber band that takes roughly 140 points of finger travel on a 1,366-point canvas,
-    /// well past the overshoot a stray nudge leaves, while the card still shows most of itself
-    /// before the release.
+    /// How far past the end of the paper a pull must be when released, or UIKit's rubber band
+    /// would carry a fling, to reveal the card; both feel alike because both are measured as the
+    /// same overshoot. Under the rubber band a pull takes roughly 140 points of finger travel on a
+    /// 1,366-point canvas, and a fling overshoots this far arriving at the end at a little over
+    /// 2,000 points a second, a deliberate fling, while one that merely runs out at the end
+    /// bounces back well short.
     static let endRevealPull: CGFloat = 72
+    /// How far UIKit's rubber band carries a fling past the end of the paper, in milliseconds of
+    /// the speed it arrives at: 31 to 37 measured for arrivals from 1.9 to 7 points a millisecond.
+    static let flingOvershootTime: CGFloat = 34
     /// How fast, in points per millisecond, a pull may still be heading back toward the page when
     /// released and reveal the card. A finger held at its depth lifts with a little drift either
     /// way; one already pushing the page back has taken the pull back.
     static let endPullReturnSpeed: CGFloat = 0.1
-    /// How close to its end the page must rest for a drag to count as a pull past it.
+    /// How close to its end the page must rest for a drag to count as a pull past it, and how
+    /// close to the end UIKit must aim a fling for it to head past the end.
     static let endRestTolerance: CGFloat = 1
     static let endCardActionName = "End of notebook options"
+    /// The shortest the scroll on to an added page may take, in seconds, however late it sets off.
+    private static let shortestArrival: CFTimeInterval = PageUnfoldTimeline.arrivalDuration / 2_000
 
     /// A pull past the end of the paper, from the drag that began it until the page settles.
     private struct EndPull {
         /// Prepared as the drag begins, so the tick plays on time when the card is revealed.
         let feedback: UIImpactFeedbackGenerator
         var isReleased = false
+    }
+
+    /// A fling let go short of the end of the paper and bound to overshoot it by `endRevealPull`,
+    /// from the release until it comes to rest.
+    private struct EndMomentum {
+        /// Prepared as the drag ends, so the tick plays on time when the card is revealed.
+        let feedback: UIImpactFeedbackGenerator
+        /// Where the latest frame of the fling left the page.
+        var offset: CGFloat
+        /// How far the latest frame that moved the page moved it.
+        var step: CGFloat = 0
+        /// The card was revealed, so a deceleration cut short finishes the lift.
+        var hasRevealed = false
+    }
+
+    /// The scroll that follows a page added at the user's request, from where the paper rested
+    /// until the new page's top reaches the top of the visible area.
+    private struct PageArrival {
+        let link: CADisplayLink
+        let from: CGFloat
+        let to: CGFloat
+        /// When the page comes to rest: as its frost finishes clearing.
+        let end: CFTimeInterval
+        /// The frame the scroll sets off from: the first the display link is asked for.
+        var start: CFTimeInterval?
     }
 
     /// Whether the page rested at its revealed top when a resize began. It is taken at the first
@@ -253,6 +288,8 @@ final class NotebookViewController: UIViewController {
         }
 
         let hadViewport = previousViewportSize.width > 0
+        // A scroll on to an added page aims at the end it had before the resize.
+        stopArrival()
         // A resize the toolbar or chrome measurement announced was captured before it changed
         // the insets; otherwise this layout is its first sign.
         var capture = resizeCapture.flatMap { $0.from == previousViewportSize ? $0 : nil }
@@ -324,12 +361,16 @@ final class NotebookViewController: UIViewController {
         acquireToolStore()
         applyToolbarGate(force: true)
         updatePaperViewport()
+        DispatchQueue.main.asyncAfter(deadline: .now() + endCardPreparationDelay) { [weak self] in
+            self?.prepareEndCard()
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         isAppearing = false
         isCanvasVisible = false
+        stopArrival()
         _ = captureBarrier()
         onInteractionInterrupted?()
         resetActiveTool()
@@ -481,6 +522,7 @@ final class NotebookViewController: UIViewController {
         toolBeginGeneration = nil
         canvas.hasActiveTool = false
         if let pendingTool { applyTool(pendingTool) }
+        endHaltedFling()
         releaseHeldInsets()
         publishUndoAvailability()
     }
@@ -527,7 +569,13 @@ final class NotebookViewController: UIViewController {
     /// Grows the paper; every way of adding a page ends here. The page stays where it is, a card
     /// shown beneath the old last page gives way to the new one, and a single page added where
     /// the user can see it clears in with the frost.
-    func setPageCount(_ requestedCount: Int) {
+    ///
+    /// - Parameter bringingIntoView: true when the user asked for the page, with Add page on the
+    ///   end of notebook card or in the Notebook menu. If its top shows, the paper then scrolls on
+    ///   until that top rests at the top of the visible area, below the room kept for the header
+    ///   and the toolbar, so the frost is seen clearing down from it. Pages the notebook adds on
+    ///   its own, as when writing reaches the foot of the last page, never move the paper.
+    func setPageCount(_ requestedCount: Int, bringingIntoView: Bool = false) {
         let boundedCount = min(max(requestedCount, 1), Self.maximumPageCount)
         // Reducing the paper extent could hide existing ink.
         guard boundedCount > pageCount else { return }
@@ -535,6 +583,8 @@ final class NotebookViewController: UIViewController {
         let added = boundedCount - pageCount
         pageCount = boundedCount
         guard isViewLoaded else { return }
+        stopArrival()
+        endMomentum = nil
         let offset = canvas.contentOffset
         updatePaperGeometry()
         adjustingLayout {
@@ -545,15 +595,16 @@ final class NotebookViewController: UIViewController {
         // where the whole notebook still fits on screen and the card would otherwise stay.
         dismissEndCard()
         updatePaperViewport()
-        if added == 1 { unfoldPage(below: previousHeight) }
+        let page = CGRect(x: 0, y: previousHeight, width: logicalWidth, height: logicalHeight - previousHeight)
+        guard added == 1, !isTornDown, isAppearing || isCanvasVisible, view.window != nil,
+              NotebookPageUnfold.isVisible(page: page, in: canvas) else { return }
+        unfold(page)
+        if bringingIntoView { bringIntoView(page) }
     }
 
-    /// Plays the frost over the page added below `top`, in page points, if the user can see
-    /// where it lands; elsewhere it is simply there.
-    private func unfoldPage(below top: CGFloat) {
-        guard let pageUnfold, !isTornDown, isAppearing || isCanvasVisible, view.window != nil else { return }
-        let page = CGRect(x: 0, y: top, width: logicalWidth, height: logicalHeight - top)
-        guard NotebookPageUnfold.isVisible(page: page, in: canvas) else { return }
+    /// Plays the frost over `page`, the added page in page points, which the user can see.
+    private func unfold(_ page: CGRect) {
+        guard let pageUnfold else { return }
         let source = pageUnfold.needsSource
             ? paperView.blankPageImage(page, screenPixelsPerPoint: traitCollection.displayScale * canvas.zoomScale)
             : nil
@@ -561,6 +612,80 @@ final class NotebookViewController: UIViewController {
         // zooms with the page and the canvas above keeps its ink and its touches.
         pageUnfold.play(page: page, source: source, in: paperView.contentLayer, above: paperView.grainLayer) {}
     }
+
+    // MARK: - Bringing an added page into view
+
+    /// Scrolls on from a glimpse of `page`, just added, until its top rests at the top of the
+    /// visible area, as the frost clears down it; on a page taller than that area the clearing
+    /// finishes below the screen. A deliberate move the user asked for, never made while a stroke,
+    /// a touch, a drag or a pinch is under way, as the page must not move under the pen or the
+    /// finger. Under Reduce Motion the paper is set there at once while the page fades in. Only a
+    /// read-only canvas lacks the frost, and it never adds a page.
+    private func bringIntoView(_ page: CGRect) {
+        guard let pageUnfold, arrivalMayContinue else { return }
+        let from = canvas.contentOffset.y
+        let to = min(endOffsetY, page.minY * canvas.zoomScale - canvas.contentInset.top)
+        guard to > from + 0.5 else { return }
+        if pageUnfold.prefersReducedMotion {
+            adjustingLayout {
+                canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: to), animated: false)
+            }
+            updatePaperViewport()
+            prepareEndCardSoon()
+            return
+        }
+        let link = CADisplayLink(target: ArrivalLinkTarget(self), selector: #selector(ArrivalLinkTarget.tick(_:)))
+        // The common modes keep it running through tracking, as the frost's own link does.
+        link.add(to: .main, forMode: .common)
+        // Without Metal, or before its shaders are ready, no frost plays, and the scroll keeps its
+        // own time.
+        let end = pageUnfold.clearingEnd ?? CACurrentMediaTime() + PageUnfoldTimeline.arrivalDuration / 1_000
+        arrival = PageArrival(link: link, from: from, to: to, end: end)
+    }
+
+    /// Whether the scroll on to an added page may move the paper now.
+    private var arrivalMayContinue: Bool {
+        !isTornDown && view.window != nil && !canvas.hasActiveTool && !canvas.isTracking && !canvas.isDragging
+            && !canvas.isZooming && !canvas.isZoomBouncing
+    }
+
+    fileprivate func advanceArrival(_ link: CADisplayLink) {
+        guard let arrival, arrival.link === link else {
+            link.invalidate()
+            return
+        }
+        guard arrivalMayContinue else {
+            stopArrival()
+            return
+        }
+        // Setting off from the first frame the link is asked for, once the work of adding the page
+        // is done, the page eases off from rest instead of jumping by however long that work took.
+        // It still lands as the frost clears, unless that leaves too little time for a smooth scroll.
+        let start = arrival.start ?? link.targetTimestamp
+        self.arrival?.start = start
+        let span = max(arrival.end - start, Self.shortestArrival)
+        let elapsed = (link.targetTimestamp - start) / span * PageUnfoldTimeline.arrivalDuration
+        let progress = PageUnfoldTimeline.arrivalProgress(at: elapsed)
+        var y = arrival.from + (arrival.to - arrival.from) * CGFloat(progress)
+        let isDone = progress >= 1 || abs(arrival.to - y) < 0.5
+        if isDone { y = arrival.to }
+        adjustingLayout {
+            canvas.setContentOffset(clampedOffset(CGPoint(x: canvas.contentOffset.x, y: y)), animated: false)
+        }
+        updatePaperViewport()
+        guard isDone else { return }
+        stopArrival()
+        prepareEndCardSoon()
+    }
+
+    /// Ends the scroll on to an added page where it is.
+    private func stopArrival() {
+        arrival?.link.invalidate()
+        arrival = nil
+    }
+
+    /// Whether the paper is scrolling on to a page added at the user's request.
+    var isBringingAddedPageIntoView: Bool { arrival != nil }
 
     func tearDown() {
         guard !isTornDown else { return }
@@ -594,8 +719,9 @@ final class NotebookViewController: UIViewController {
         overlayStore?.uncover(self)
         overlayStore = nil
         pageUnfold?.finish()
+        stopArrival()
         endPull = nil
-        isStoppingFlingAtEnd = false
+        endMomentum = nil
         endOfNotebookCard.onAddPage = nil
         canvas.accessibilityCustomActions = nil
         withoutAnimations { endOfNotebookCard.isHidden = true }
@@ -659,6 +785,12 @@ final class NotebookViewController: UIViewController {
         max(-canvas.contentInset.top, canvas.contentSize.height - canvas.bounds.height + chromeBottomInset)
     }
 
+    /// Whether a pull or an overshoot has lifted the page past its resting end, opening space
+    /// below it. A pinch near the end is no lift: the card would not zoom with the page.
+    private var isPastRestingEnd: Bool {
+        canvas.contentOffset.y > restingEndOffsetY + 0.5 && !canvas.isZooming && !canvas.isZoomBouncing
+    }
+
     /// Offers the card's VoiceOver action to a canvas that can add pages: it reveals the card for
     /// anyone who cannot pull the page past its end.
     private func updateEndOfNotebookAccess() {
@@ -671,13 +803,13 @@ final class NotebookViewController: UIViewController {
     }
 
     /// Places the card centred under the visible part of the last page, its top `endCardGap`
-    /// below it on screen, while it is revealed or a pull from the end is lifting the page. It
-    /// only moves as the paper scrolls; its content changes with the gate, the page limit, the
-    /// width and the text size.
+    /// below it on screen, while it is revealed or the page is lifted past its end, by a pull or
+    /// by a fling's overshoot and bounce. It only moves as the paper scrolls; its content changes
+    /// with the gate, the page limit, the width and the text size.
     private func updateEndOfNotebookCard() {
         guard isViewLoaded else { return }
         let card = endOfNotebookCard
-        guard offersEndCard, isEndCardRevealed || endPull != nil else {
+        guard offersEndCard, isEndCardRevealed || isPastRestingEnd else {
             if !card.isHidden { withoutAnimations { card.isHidden = true } }
             return
         }
@@ -726,6 +858,23 @@ final class NotebookViewController: UIViewController {
         logicalHeight * canvas.zoomScale - canvas.contentOffset.y + NotebookTheme.endCardGap
     }
 
+    /// Builds the card for the gate, the page limit, the width and the text size as they stand,
+    /// while the canvas is at rest. Building it costs a frame or more; paid beneath a moving page,
+    /// it would stall the page just as a pull or a fling reaches the end. A stroke, a scroll, a zoom
+    /// or the scroll on to an added page puts it off until that ends, and a card already built for
+    /// them costs nothing.
+    private func prepareEndCard() {
+        guard offersEndCard, isCanvasVisible, view.window != nil, !canvas.hasActiveTool, !canvas.isTracking,
+              !canvas.isDecelerating, !canvas.isZooming, !canvas.isZoomBouncing, arrival == nil else { return }
+        configureEndCard()
+    }
+
+    /// Prepares the card on the next turn of the main queue, outside the callback of the stroke or
+    /// the scroll that has just ended.
+    private func prepareEndCardSoon() {
+        DispatchQueue.main.async { [weak self] in self?.prepareEndCard() }
+    }
+
     /// Keeps room below the last page for the card and shows it there.
     @discardableResult
     private func revealEndCard() -> Bool {
@@ -742,6 +891,7 @@ final class NotebookViewController: UIViewController {
     /// moves VoiceOver to the card.
     private func revealEndCardForAssistiveTechnology() -> Bool {
         guard revealEndCard() else { return false }
+        stopArrival()
         adjustingLayout {
             canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: false)
         }
@@ -754,7 +904,9 @@ final class NotebookViewController: UIViewController {
     /// bottom chrome leaves clear. Where the whole notebook fits on screen the page cannot leave
     /// its resting end, so the card stays while it is in view.
     private func releaseEndCardOnceLeftView() {
-        guard isEndCardRevealed, endCardTop >= view.bounds.height - chromeBottomInset - 0.5 else { return }
+        // A fling that adopted the room ahead of the end carries the page on to the card.
+        guard isEndCardRevealed, endMomentum?.hasRevealed != true,
+              endCardTop >= view.bounds.height - chromeBottomInset - 0.5 else { return }
         dismissEndCard()
     }
 
@@ -770,21 +922,94 @@ final class NotebookViewController: UIViewController {
         updateEndOfNotebookCard()
     }
 
-    /// The pull from the end has run its course: the card stays if it was revealed and leaves
-    /// with the page otherwise.
-    private func settleEndPull() {
-        guard let endPull, endPull.isReleased else { return }
-        self.endPull = nil
-        // A release with no speed left can leave the lifted page short of its new end. Animated, it
-        // eases there; its frames are neither a drag nor a deceleration, so the writing view does
-        // not count them as the user's scrolling.
+    /// The pull or the fling past the end has run its course: the card stays if it was revealed
+    /// and leaves with the page otherwise, as it does when a tap stops a fling short of the end.
+    private func settleEnd() {
+        let pulled = endPull?.isReleased ?? false
+        let flung = endMomentum?.hasRevealed ?? false
+        if pulled { endPull = nil }
+        let withdrawn = withdrawFlingRevealShortOfEnd()
+        endMomentum = nil
+        guard pulled || flung, !withdrawn else { return }
+        // A release with no speed left, or a tap that stops the bounce, can leave the lifted page
+        // short of its new end. Animated, it eases there; its frames are neither a drag nor a
+        // deceleration, so the writing view does not count them as the user's scrolling.
         if isEndCardRevealed, canvas.contentOffset.y < endOffsetY - 0.5, !canvas.isDecelerating {
-            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: true)
+            adjustingLayout {
+                canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: true)
+            }
         }
         updateEndOfNotebookCard()
     }
 
-    /// The card's Add page key, which the card offers only while a page can be added.
+    /// How far past `end` UIKit's rubber band would carry a fling let go at `offset` at `speed`
+    /// points a millisecond: `flingOvershootTime` of the speed it has left on reaching the end.
+    static func flingOvershoot(
+        from offset: CGFloat, speed: CGFloat, end: CGFloat, decelerationRate: UIScrollView.DecelerationRate
+    ) -> CGFloat {
+        // Decaying by the rate every millisecond, a deceleration sheds speed in proportion to the
+        // distance it covers.
+        let arrival = speed + log(decelerationRate.rawValue) * max(end - offset, 0)
+        return max(arrival, 0) * flingOvershootTime
+    }
+
+    /// Reveals the card for a fling bound to overshoot the threshold, adopting its room within two
+    /// frames of the page reaching the end. Only the room is adopted, never an offset. Adopted
+    /// while the page is still short of the end, it lets UIKit's deceleration run on into the room
+    /// untouched and bounce at the lifted end, as for a page that ended with the card; two frames
+    /// ahead, a frame the display drops still finds it in place.
+    ///
+    /// Should dropped frames carry the page past the end first, the room is adopted only while the
+    /// page heads out within the lifted end. Beyond it UIKit pulls the page straight back to the
+    /// grown range's end, and adopted on the way back the room turns the page round again, so such
+    /// a fling bounces back without the card, as one short of the threshold does.
+    private func continueEndMomentum() {
+        guard var momentum = endMomentum, !momentum.hasRevealed, offersEndCard, !isEndCardRevealed,
+              !canvas.isZooming, !canvas.isZoomBouncing else { return }
+        let y = canvas.contentOffset.y
+        if y != momentum.offset {
+            momentum.step = y - momentum.offset
+            momentum.offset = y
+            endMomentum = momentum
+        }
+        guard momentum.step > 0, y + 2 * momentum.step > restingEndOffsetY + 0.5 else { return }
+        configureEndCard()
+        let pixel = 1 / max(traitCollection.displayScale, 1)
+        let liftedEnd = max(
+            -canvas.contentInset.top,
+            canvas.contentSize.height - canvas.bounds.height + chromeBottomInset + endCardRoomNeeded
+        )
+        guard y <= liftedEnd + pixel / 2, revealEndCard() else { return }
+        endMomentum?.hasRevealed = true
+        momentum.feedback.impactOccurred(at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.maxY))
+    }
+
+    /// Whether a fling adopted the card's room ahead of the end and has stopped short of it, so it
+    /// never lifted the page.
+    private var isFlingRevealShortOfEnd: Bool {
+        endMomentum?.hasRevealed == true && isEndCardRevealed && canvas.contentOffset.y <= restingEndOffsetY
+    }
+
+    /// Gives back the room a fling adopted ahead of the end when a tap or a stroke stops the page
+    /// short of it: the fling never lifted the page, and giving the room back leaves the page where
+    /// it stopped.
+    @discardableResult
+    private func withdrawFlingRevealShortOfEnd() -> Bool {
+        guard isFlingRevealShortOfEnd else { return false }
+        dismissEndCard()
+        return true
+    }
+
+    /// Ends a fling that a stroke, or the canvas leaving the screen, has halted, giving back the
+    /// room it adopted if it stopped short of the end.
+    private func endHaltedFling() {
+        guard !isTornDown else { return }
+        withdrawFlingRevealShortOfEnd()
+        endMomentum = nil
+    }
+
+    /// The card's Add page key, which the card offers only while a page can be added. The host
+    /// adds the page as one the user asked for, so it is brought into view.
     private func addPageFromEndCard() {
         guard isEndCardRevealed else { return }
         onAddPage?()
@@ -948,6 +1173,11 @@ final class NotebookViewController: UIViewController {
 extension NotebookViewController: PKCanvasViewDelegate {
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
         guard !isTornDown else { return }
+        // A stroke halts a deceleration without reporting its end, and the page holds still under
+        // the pen. A fling it stops short of the end keeps the room it adopted ahead of the end
+        // until the stroke ends, as no inset shrinks under the pen; any other claim ends here.
+        if !isFlingRevealShortOfEnd { endMomentum = nil }
+        stopArrival()
         toolBeginGeneration = observedGeneration
         toolBeginSignature = try? InkDrawingSignature(canvas.drawing)
         if let toolBeginSignature { observationWork.add(toolBeginSignature.constructionWork) }
@@ -970,8 +1200,10 @@ extension NotebookViewController: PKCanvasViewDelegate {
         canvas.hasActiveTool = false
         writingChrome?.toolEnded()
         if let pendingTool { applyTool(pendingTool) }
+        endHaltedFling()
         releaseHeldInsets()
         publishUndoAvailability()
+        prepareEndCardSoon()
         if let begin, let end = lastDeliveredSignature, let beginGeneration,
            begin.constructionWork.nativeDrawingFallbackSnapshots == 0,
            begin.constructionWork.uncacheableStrokeSignatures == 0,
@@ -993,13 +1225,12 @@ extension NotebookViewController: PKCanvasViewDelegate {
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
         paperView.finishZoom()
+        prepareEndCardSoon()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard !isAdjustingLayout else { return }
-        if isStoppingFlingAtEnd, canvas.contentOffset.y > endOffsetY {
-            stopFlingAtEnd()
-        }
+        continueEndMomentum()
         updatePaperViewport()
         writingChrome?.userScrollMoved(in: scrollView)
         releaseEndCardOnceLeftView()
@@ -1008,12 +1239,12 @@ extension NotebookViewController: PKCanvasViewDelegate {
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         // The user moving the page ends any claim that it rested at its top when a resize began.
         resizeCapture = nil
-        isStoppingFlingAtEnd = false
+        endMomentum = nil
+        stopArrival()
         let offset = canvas.contentOffset.y
         let end = endOffsetY
-        dragBeganAboveEnd = offset < end - Self.endRestTolerance
-        // Only a new drag from a page resting at its end pulls past it; a fling arriving there,
-        // or a drag carried on past it, never does.
+        // Only a new drag from a page resting at its end pulls past it; a drag carried on past it
+        // never does, though a fling let go short of the end may reveal the card.
         if offersEndCard, !isEndCardRevealed, abs(offset - end) <= Self.endRestTolerance {
             let feedback = UIImpactFeedbackGenerator(style: .light, view: canvas)
             feedback.prepare()
@@ -1025,9 +1256,9 @@ extension NotebookViewController: PKCanvasViewDelegate {
         updateEndOfNotebookCard()
     }
 
-    /// Stops a fling at the end of the paper, and reveals the card for a pull from the end
-    /// released far enough past it and not already heading back. Native scrolling is otherwise
-    /// untouched.
+    /// Reveals the card for a pull from the end released far enough past it and not already
+    /// heading back, and readies the tick for a fling let go short of the end that UIKit's rubber
+    /// band would carry the threshold past it. The deceleration and its bounce are UIKit's own.
     func scrollViewWillEndDragging(
         _ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>
     ) {
@@ -1037,54 +1268,61 @@ extension NotebookViewController: PKCanvasViewDelegate {
             endPull?.isReleased = true
             // UIKit holds the offset to whole device pixels, so the threshold allows one.
             let pixel = 1 / max(traitCollection.displayScale, 1)
-            guard offset - end >= Self.endRevealPull - pixel, velocity.y >= -Self.endPullReturnSpeed,
-                  let feedback = endPull?.feedback, revealEndCard() else { return }
-            targetContentOffset.pointee.y = endOffsetY
-            feedback.impactOccurred(at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.maxY))
-            return
+            if offset - end >= Self.endRevealPull - pixel, velocity.y >= -Self.endPullReturnSpeed,
+               let feedback = endPull?.feedback, revealEndCard() {
+                targetContentOffset.pointee.y = endOffsetY
+                feedback.impactOccurred(at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.maxY))
+                return
+            }
         }
-        // A drag carried past the end by the finger springs back on its own.
-        guard dragBeganAboveEnd, offset <= end + 0.5, targetContentOffset.pointee.y >= end - 0.5 else { return }
-        targetContentOffset.pointee.y = end
-        isStoppingFlingAtEnd = true
+        // UIKit aims a fling that would run past the end at the end itself. A page let go already
+        // past the end only springs back.
+        guard offersEndCard, !isEndCardRevealed, offset < end,
+              targetContentOffset.pointee.y >= end - Self.endRestTolerance,
+              Self.flingOvershoot(from: offset, speed: velocity.y, end: end, decelerationRate: canvas.decelerationRate)
+                >= Self.endRevealPull else { return }
+        let feedback = endPull?.feedback ?? UIImpactFeedbackGenerator(style: .light, view: canvas)
+        feedback.prepare()
+        endMomentum = EndMomentum(feedback: feedback, offset: offset)
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         guard !decelerate else { return }
         writingChrome?.userScrollEnded()
-        settleEndPull()
+        settleEnd()
+        prepareEndCardSoon()
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        isStoppingFlingAtEnd = false
         writingChrome?.userScrollEnded()
-        settleEndPull()
-    }
-
-    /// Halts a fling aimed at the end of the paper that UIKit would carry past it to bounce.
-    private func stopFlingAtEnd() {
-        isStoppingFlingAtEnd = false
-        adjustingLayout {
-            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: endOffsetY), animated: false)
-        }
+        settleEnd()
+        prepareEndCardSoon()
     }
 
     /// A drag still under way, or the deceleration it started, reports its own end. A tap that
-    /// stops a fling short of the end reports neither, so the fling's stop ends here too.
+    /// stops a fling reports neither, so the fling ends here.
     private func fingersLifted() {
         guard !canvas.isDragging, !canvas.isDecelerating else { return }
-        isStoppingFlingAtEnd = false
         writingChrome?.fingersLifted()
-        settleEndPull()
+        settleEnd()
+        prepareEndCardSoon()
     }
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
         // A pinch takes over from any fling, so its bounce at the foot of the paper is its own.
-        isStoppingFlingAtEnd = false
+        endMomentum = nil
+        stopArrival()
+    }
+
+    func scrollViewShouldScrollToTop(_ scrollView: UIScrollView) -> Bool {
+        // The status-bar tap's own scroll takes over from the scroll on to an added page.
+        stopArrival()
+        return true
     }
 
     func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
         writingChrome?.scrolledToTop()
+        prepareEndCardSoon()
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
@@ -1135,6 +1373,25 @@ extension EditorPencilTapPreference {
         case .runSystemShortcut: self = .runSystemShortcut
         @unknown default: self = .ignore
         }
+    }
+}
+
+/// Holds the controller weakly: a display link retains its target, and the scroll on to an added
+/// page must not outlive its canvas.
+@MainActor
+private final class ArrivalLinkTarget: NSObject {
+    private weak var controller: NotebookViewController?
+
+    init(_ controller: NotebookViewController) {
+        self.controller = controller
+    }
+
+    @objc func tick(_ link: CADisplayLink) {
+        guard let controller else {
+            link.invalidate()
+            return
+        }
+        controller.advanceArrival(link)
     }
 }
 

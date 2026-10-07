@@ -8,7 +8,7 @@ import UIKit
 struct NotebookToolbarActions {
     /// Where Float, from the grip's actions or the notebook menu, places a docked toolbar: centred,
     /// near the top of the page.
-    static let floatingPlacement = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.25))
+    nonisolated static let floatingPlacement = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.25))
 
     let store: NotebookSceneToolStore
 
@@ -24,18 +24,46 @@ struct NotebookToolbarActions {
     /// A paused toolbar cannot be dragged, so no drag preview starts that could never be stored.
     var dragGestureMask: GestureMask { isEnabled ? .all : .none }
 
+    /// Selects a tool. The eraser and lasso have no settings on the rail's second row, so choosing
+    /// either closes it; an ink chosen here leaves the row as it is.
     func select(_ kind: EditorToolKind) {
-        change { $0.select(kind) }
+        guard isEnabled else { return }
+        store.update { $0.select(kind) }
+        if case .ink = kind { return }
+        store.setInkRowOpen(false)
     }
 
-    /// Selects the eraser in the mode used last. The tool state keeps that mode privately
-    /// and restores it through the same switch the Apple Pencil gesture uses.
+    /// What an ink's key does. On a rail with a second row, which holds the ink's presets and
+    /// colours, it selects the ink and opens the row; the key of the ink in use closes an open row
+    /// instead, so the same key shows and hides its settings. Without that row, as at compact width
+    /// where the current-ink chip holds them, it only selects the ink.
+    func chooseInk(_ family: EditorInkFamily, opensSettings: Bool = true) {
+        guard isEnabled else { return }
+        let closes = store.isInkRowOpen && store.tool.kind == .ink(family)
+        store.update { $0.select(.ink(family)) }
+        if opensSettings { store.setInkRowOpen(!closes) }
+    }
+
+    /// Opens the second row, as an Apple Pencil gesture asking for the colours does.
+    func openInkRow() {
+        guard isEnabled else { return }
+        store.setInkRowOpen(true)
+    }
+
+    /// Selects the eraser in the mode used last, and closes the second row. The tool state keeps
+    /// that mode privately and restores it through the same switch the Apple Pencil gesture uses.
     func selectEraser() {
-        change { $0.selectEraser() }
+        guard isEnabled else { return }
+        store.update { $0.selectEraser() }
+        store.setInkRowOpen(false)
     }
 
+    /// The ruler is a tool key of the first row without settings on the second, so it closes the
+    /// row like the eraser and lasso: only the ink keys keep it open.
     func toggleRuler() {
-        change { $0.isRulerActive.toggle() }
+        guard isEnabled else { return }
+        store.update { $0.isRulerActive.toggle() }
+        store.setInkRowOpen(false)
     }
 
     func apply(_ preset: EditorInkPreset) {
@@ -182,47 +210,82 @@ enum NotebookToolbarRevealResponse: Equatable {
 // MARK: - Composition
 
 /// Which parts of the toolbar show and how much room it takes, decided from the stored
-/// preferences, the text size and the window width.
+/// preferences, the text size and the window size.
 struct NotebookToolbarComposition: Equatable {
-    /// The least distance a toolbar keeps between neighbouring docks. A window too narrow for
-    /// that and every working control shares one dock slot instead.
-    static let minimumDockTravel: CGFloat = 150
     /// The rail stops growing with the text size here and shows the Large Content Viewer instead.
     static let textSizeLimit = DynamicTypeSize.xxLarge
     /// A divider with its padding, laid out like a control.
     static let dividerWidth = NotebookTheme.dividerThickness + 2 * NotebookTheme.dividerPadding
-    /// The grip column at the rail's leading edge. Floating, it holds the collapse key under the
-    /// grip, so the rail keeps its docked width.
+    /// The grip column at the rail's leading edge, or at the screen edge of a vertical rail.
     static let gripColumnWidth = NotebookTheme.controlSize
     /// Key edge to key edge across a divider.
     static let groupGap = dividerWidth + 2 * NotebookTheme.itemSpacing
 
     /// At compact width the colour and width row folds into one current-ink chip.
     let foldsInkOptions: Bool
+    /// Where the preferences keep the toolbar.
+    let placement: EditorToolbarPlacement
     let isFloating: Bool
     let isCollapsed: Bool
+    /// The dock stored in the preferences, nil while the toolbar floats.
+    let storedDock: EditorToolbarDock?
     /// The colours on the shelf, quick swatches first.
     let swatches: [EditorInkColor]
     /// The text size the preset labels are set at, never above `textSizeLimit`.
     let dynamicTypeSize: DynamicTypeSize
     /// True under Bold Text, which sets the preset labels heavier and so wider.
     let isBoldText: Bool
+    /// Whether the rail shows its second row. Only a rail with an ink row has one; at compact
+    /// width the ink folds into the current-ink chip instead.
+    let showsInkRow: Bool
 
     init(
         preferences: EditorToolbarPreferences, horizontalSizeClass: UserInterfaceSizeClass?,
-        dynamicTypeSize: DynamicTypeSize = .large, legibilityWeight: LegibilityWeight? = nil
+        dynamicTypeSize: DynamicTypeSize = .large, legibilityWeight: LegibilityWeight? = nil, isInkRowOpen: Bool = false
     ) {
         foldsInkOptions = horizontalSizeClass == .compact
-        if case .floating = preferences.placement { isFloating = true } else { isFloating = false }
+        showsInkRow = isInkRowOpen && !foldsInkOptions
+        placement = preferences.placement
+        switch preferences.placement {
+        case let .docked(dock):
+            isFloating = false
+            storedDock = dock
+        case .floating:
+            isFloating = true
+            storedDock = nil
+        }
         isCollapsed = preferences.isCollapsed
         swatches = NotebookSwatchShelf.displayed(custom: preferences.customSwatches)
         self.dynamicTypeSize = min(dynamicTypeSize, Self.textSizeLimit)
         isBoldText = legibilityWeight == .bold
     }
 
+    /// The side docks stand the rail on end in two full columns. At compact width the ink folds
+    /// into one chip that a column cannot hold, so there a rail stored at a side rests at the top
+    /// until the window widens, and the stored dock is kept.
+    var offersSideDocks: Bool { !foldsInkOptions }
+
+    /// Where a docked rail rests in this window; nil while floating.
+    var shownDock: EditorToolbarDock? {
+        guard let storedDock else { return nil }
+        return storedDock.axis == .vertical && !offersSideDocks ? .topCenter : storedDock
+    }
+
+    /// Which way the rail's rows run where it rests.
+    var axis: EditorToolbarAxis { shownDock?.axis ?? .horizontal }
+
+    /// How the rail lays out where it rests: on end against a side dock, in rows otherwise.
+    var orientation: NotebookRailOrientation {
+        switch shownDock {
+        case .leftEdge: .leftEdge
+        case .rightEdge: .rightEdge
+        case .topCenter, nil: .horizontal
+        }
+    }
+
     var showsRevealHandle: Bool { isCollapsed }
-    /// A floating rail offers its collapse key: in the grip column under two rows, and after the
-    /// current-ink chip on the single compact row.
+    /// A floating rail ends its first row with its collapse key, after the current-ink chip on the
+    /// single compact row, so the key shows whether or not the second row does.
     var showsCollapseControl: Bool { isFloating && !isCollapsed }
     var rowCount: Int { foldsInkOptions ? 1 : 2 }
 
@@ -231,11 +294,13 @@ struct NotebookToolbarComposition: Equatable {
         return foldsInkOptions ? .openInkPanel : .showInkRow
     }
 
+    /// The rail's depth across its rows: two rows and the seam between them.
     var expandedHeight: CGFloat {
         CGFloat(rowCount) * NotebookTheme.rowHeight + CGFloat(rowCount - 1) * NotebookTheme.rowSpacing
     }
 
-    /// The size the toolbar takes: the collapsed handle, or the expanded rail.
+    /// The size the toolbar keeps for itself: the collapsed handle, or the expanded rail with its
+    /// second row whether or not that row shows, so opening it never moves the page or the rail.
     func toolbarSize(forHostWidth width: CGFloat) -> CGSize {
         toolbarSize(of: rail(forHostWidth: width))
     }
@@ -244,62 +309,139 @@ struct NotebookToolbarComposition: Equatable {
         showsRevealHandle ? NotebookTheme.collapsedHandleSize : rail.size
     }
 
-    /// Where the toolbar rests for `placement`. Docks the window cannot tell apart all rest in
-    /// the centre, whichever is stored.
-    func frame(for placement: EditorToolbarPlacement, in usable: CGRect) -> CGRect {
-        frame(for: placement, rail: rail(forHostWidth: usable.width), in: usable)
+    /// Where the collapsed handle, and the stand-in a hidden floating rail leaves, centre from the
+    /// rail's stored point: up by half the second row's room, across the middle of the first row,
+    /// so collapsing or hiding the rail and bringing it back move nothing that stays in sight.
+    var handleOffset: CGSize {
+        CGSize(width: 0, height: (NotebookTheme.rowHeight - expandedHeight) / 2)
+    }
+
+    /// Where the toolbar as shown centres from a floating rail's stored point.
+    var centreOffset: CGSize { showsRevealHandle ? handleOffset : .zero }
+
+    /// The collapsed handle, or the stand-in a hidden floating rail leaves, in `usable`. It keeps
+    /// inside the margins at its own size, so it can rest wherever the user leaves it.
+    func handleFrame(in usable: CGRect) -> CGRect {
+        EditorToolbarLayout.frame(
+            for: placement, size: NotebookTheme.collapsedHandleSize, in: usable, centreOffset: handleOffset
+        )
+    }
+
+    /// The rail laid out for where it rests in `usable`.
+    func rail(in usable: CGSize) -> NotebookToolbarRail {
+        switch orientation {
+        case .horizontal: rail(forHostWidth: usable.width)
+        case let side: verticalRail(forHostHeight: usable.height, orientation: side)
+        }
+    }
+
+    /// The sizes the expanded rail takes at the top dock and at the side docks of `usable`, which
+    /// place the dock slots a drag measures against. A docked rail has no collapse key, so a
+    /// floating rail measures them without its own.
+    func dockSizes(in usable: CGSize) -> EditorToolbarLayout.DockSizes {
+        EditorToolbarLayout.DockSizes(
+            horizontal: rail(forHostWidth: usable.width, endsWithCollapseKey: false).size,
+            vertical: verticalRail(forHostHeight: usable.height, orientation: .leftEdge).size
+        )
+    }
+
+    /// The sizes the docked rail is drawn at in those docks, with its second row as it is now,
+    /// which the dock targets outline.
+    func shownDockSizes(in usable: CGSize) -> EditorToolbarLayout.DockSizes {
+        EditorToolbarLayout.DockSizes(
+            horizontal: rail(forHostWidth: usable.width, endsWithCollapseKey: false).shownSize,
+            vertical: verticalRail(forHostHeight: usable.height, orientation: .leftEdge).shownSize
+        )
+    }
+
+    /// Where the toolbar rests in `usable`: at its shown dock, where it floats, or as its collapsed
+    /// handle.
+    func frame(in usable: CGRect) -> CGRect {
+        frame(of: rail(in: usable.size), in: usable)
     }
 
     /// The same, for a rail already laid out for `usable`.
-    func frame(for placement: EditorToolbarPlacement, rail: NotebookToolbarRail, in usable: CGRect) -> CGRect {
-        var shown = placement
-        if case .docked = placement, rail.docksShared { shown = .docked(.topCenter) }
-        return EditorToolbarLayout.frame(for: shown, size: toolbarSize(of: rail), in: usable)
+    func frame(of rail: NotebookToolbarRail, in usable: CGRect) -> CGRect {
+        if showsRevealHandle { return handleFrame(in: usable) }
+        let shown = shownDock.map { .docked($0) } ?? placement
+        return EditorToolbarLayout.frame(for: shown, size: rail.size, in: usable)
     }
 
-    /// The expanded rail for a window `width` wide. Floating and docked rails share it, so
-    /// docking and undocking never resize the rail.
+    /// The horizontal rail for a window `width` wide, at the top dock or floating.
     ///
-    /// The rail grows to show every tool, including the planned ones, while the docks stay
-    /// `minimumDockTravel` apart. A window too narrow to keep them apart with every working
-    /// control showing shares one dock slot and lets the rail use its whole width. The planned
-    /// tools show as a whole group or not at all, and the rows scroll whatever does not fit. The
-    /// single compact row always scrolls on to the planned tools.
+    /// The rail grows to show every tool, including the planned ones, up to the window's width
+    /// inside its margins. The planned tools show as a whole group or not at all, and the rows
+    /// scroll whatever does not fit. The single compact row always scrolls on to the planned tools.
+    /// A floating rail ends its first row with its collapse key. A working control comes before the
+    /// planned ones, so where the window cannot fit the key and the whole group, the group gives
+    /// way; where the second row is the wider, the key takes room the first row leaves.
     func rail(forHostWidth width: CGFloat) -> NotebookToolbarRail {
+        rail(forHostWidth: width, endsWithCollapseKey: showsCollapseControl)
+    }
+
+    private func rail(forHostWidth width: CGFloat, endsWithCollapseKey: Bool) -> NotebookToolbarRail {
         let available = max(width - 2 * EditorToolbarLayout.margin, 0)
-        let travel = available - 2 * Self.minimumDockTravel
         let grip = Self.gripColumnWidth
+        let cap = toolCapWidth(endsWithCollapseKey: endsWithCollapseKey)
         let working = toolRow(includingUpcoming: false)
         let complete = toolRow(includingUpcoming: true)
         let ink = foldsInkOptions ? nil : inkRow(swatches)
         let inkWidth = ink.map { $0.contentWidth + Self.inkCapWidth } ?? 0
-        let quickInkWidth = foldsInkOptions ? 0 : inkRow(EditorInkCatalog.swatches).contentWidth + Self.inkCapWidth
-        let core = grip + max(working.contentWidth + toolCapWidth, quickInkWidth)
-        let docksShared = core > travel
-        let limit = docksShared ? available : travel
-        var railWidth = min(grip + max(complete.contentWidth + toolCapWidth, inkWidth), limit)
-        let showsUpcoming = foldsInkOptions || grip + complete.contentWidth + toolCapWidth <= railWidth
+        var railWidth = min(grip + max(complete.contentWidth + cap, inkWidth), available)
+        let showsUpcoming = foldsInkOptions || grip + complete.contentWidth + cap <= railWidth
         if !showsUpcoming {
-            railWidth = min(grip + max(working.contentWidth + toolCapWidth, inkWidth), limit)
+            railWidth = min(grip + max(working.contentWidth + cap, inkWidth), available)
         }
         let tools = showsUpcoming ? complete : working
         let rows = railWidth - grip
         return NotebookToolbarRail(
-            size: CGSize(width: railWidth, height: expandedHeight),
-            docksShared: docksShared, showsUpcoming: showsUpcoming,
-            toolRow: tools, inkRow: ink,
-            toolRowOverflows: tools.contentWidth + toolCapWidth > rows + 0.5,
+            orientation: .horizontal, size: CGSize(width: railWidth, height: expandedHeight),
+            showsInkRow: showsInkRow, showsUpcoming: showsUpcoming, toolRow: tools, inkRow: ink,
+            toolRowOverflows: tools.contentWidth + cap > rows + 0.5,
             inkRowOverflows: ink != nil && inkWidth > rows + 0.5
         )
     }
 
-    /// Room after the tool strip: the trailing inset, or at compact width a divider, the
-    /// current-ink chip and any collapse key before it.
+    /// The rail on end at a side dock of a window `height` tall: the grip column against the
+    /// screen edge, then the tools, then the ink column nearest the page, where the second row
+    /// opens. The columns run as the rows do and grow to show every tool up to the height inside
+    /// the margins, the planned tools as a whole group or not at all; the columns scroll whatever
+    /// does not fit.
+    func verticalRail(forHostHeight height: CGFloat, orientation: NotebookRailOrientation) -> NotebookToolbarRail {
+        let available = max(height - 2 * EditorToolbarLayout.margin, 0)
+        let cap = NotebookTheme.stripInsets.right
+        let working = toolRow(includingUpcoming: false)
+        let complete = toolRow(includingUpcoming: true)
+        let ink = inkRow(swatches, axis: .vertical)
+        let inkLength = ink.contentWidth + Self.inkCapWidth
+        var length = min(max(complete.contentWidth + cap, inkLength), available)
+        let showsUpcoming = complete.contentWidth + cap <= length
+        if !showsUpcoming {
+            length = min(max(working.contentWidth + cap, inkLength), available)
+        }
+        let tools = showsUpcoming ? complete : working
+        let columns = 2 * NotebookTheme.rowHeight + NotebookTheme.rowSpacing
+        return NotebookToolbarRail(
+            orientation: orientation, size: CGSize(width: Self.gripColumnWidth + columns, height: length),
+            showsInkRow: showsInkRow, showsUpcoming: showsUpcoming, toolRow: tools, inkRow: ink,
+            toolRowOverflows: tools.contentWidth + cap > length + 0.5,
+            inkRowOverflows: inkLength > length + 0.5
+        )
+    }
+
+    /// Room after the tool strip, which never scrolls: a divider before the current-ink chip at
+    /// compact width and before any collapse key, those controls, and the trailing inset.
     var toolCapWidth: CGFloat {
+        toolCapWidth(endsWithCollapseKey: showsCollapseControl)
+    }
+
+    private func toolCapWidth(endsWithCollapseKey: Bool) -> CGFloat {
         let inset = NotebookTheme.stripInsets.right
-        guard foldsInkOptions else { return inset }
-        let collapseKey = showsCollapseControl ? NotebookTheme.itemSpacing + NotebookTheme.controlSize : 0
-        return Self.groupGap + NotebookTheme.currentInkChipWidth + collapseKey + inset
+        let controls = (foldsInkOptions ? [NotebookTheme.currentInkChipWidth] : [])
+            + (endsWithCollapseKey ? [NotebookTheme.controlSize] : [])
+        guard !controls.isEmpty else { return inset }
+        let spacing = CGFloat(controls.count - 1) * NotebookTheme.itemSpacing
+        return Self.groupGap + controls.reduce(0, +) + spacing + inset
     }
 
     /// Room after the ink strip, which never scrolls: a divider, the custom colour well and the
@@ -308,6 +450,7 @@ struct NotebookToolbarComposition: Equatable {
 
     /// The ink families, then the eraser, lasso and ruler, then the widths, then the planned
     /// tools after a caption. At compact width the widths live in the current-ink chip's panel.
+    /// Every control is square, so the row measures the same along either axis.
     func toolRow(includingUpcoming: Bool) -> NotebookStripRow {
         var items: [NotebookStripItem] = EditorInkFamily.allCases.map { .family($0) }
         items += [.divider(0), .eraser, .lasso, .ruler]
@@ -315,32 +458,78 @@ struct NotebookToolbarComposition: Equatable {
         if includingUpcoming {
             items += [.divider(2), .upcomingLabel] + NotebookUpcomingFeature.placed(.toolStrip).map { .upcoming($0) }
         }
-        return row(items)
+        return row(items, axis: .horizontal)
     }
 
     /// The presets lead, so they show at rest on every regular-width window; the swatches
-    /// follow, custom colours newest first.
-    func inkRow(_ swatches: [EditorInkColor]) -> NotebookStripRow {
-        row(EditorInkCatalog.presets.map { .preset($0) } + [.divider(0)] + swatches.map { .swatch($0) })
+    /// follow, custom colours newest first. On end the presets are square keys, as a column has
+    /// no room for their labels.
+    func inkRow(_ swatches: [EditorInkColor], axis: Axis = .horizontal) -> NotebookStripRow {
+        row(EditorInkCatalog.presets.map { .preset($0) } + [.divider(0)] + swatches.map { .swatch($0) }, axis: axis)
     }
 
-    private func row(_ items: [NotebookStripItem]) -> NotebookStripRow {
+    private func row(_ items: [NotebookStripItem], axis: Axis) -> NotebookStripRow {
         NotebookStripRow(items: items) { item in
             switch item {
             case .divider: Self.dividerWidth
-            case let .preset(preset): NotebookPresetChip.width(for: preset, at: dynamicTypeSize, isBold: isBoldText)
+            case let .preset(preset) where axis == .horizontal:
+                NotebookPresetChip.width(for: preset, at: dynamicTypeSize, isBold: isBoldText)
             default: NotebookTheme.controlSize
             }
         }
     }
 }
 
-/// The expanded rail in one window width.
+/// How the expanded rail lays out.
+enum NotebookRailOrientation: Equatable {
+    /// At the top or floating: the grip column at the leading end, the tools above the ink.
+    case horizontal
+    /// On end against the left edge: the grip column at the screen edge, then the tools, then the
+    /// ink nearest the page.
+    case leftEdge
+    /// The mirror image against the right edge.
+    case rightEdge
+
+    var axis: Axis { self == .horizontal ? .horizontal : .vertical }
+
+    /// Where the rail is drawn inside the room it keeps: against the edge it rests at, so the
+    /// second row opens toward the page and the first never moves.
+    var anchor: Alignment {
+        switch self {
+        case .horizontal: .top
+        case .leftEdge: .leading
+        case .rightEdge: .trailing
+        }
+    }
+
+    /// The columns of a rail on end from left to right: the grip against the screen edge, the tools
+    /// beside it, and the ink nearest the page, where the second row opens. A rail in rows has none.
+    var columns: [NotebookRailColumn] {
+        switch self {
+        case .horizontal: []
+        case .leftEdge: [.grip, .tools, .ink]
+        case .rightEdge: [.ink, .tools, .grip]
+        }
+    }
+}
+
+/// A column of a rail on end.
+enum NotebookRailColumn: Hashable {
+    case grip
+    case tools
+    /// The second row on end, with the seam on its side toward the tools.
+    case ink
+}
+
+/// The rail in one window.
 struct NotebookToolbarRail: Equatable {
+    let orientation: NotebookRailOrientation
+    /// The expanded rail, with its second row: the room the toolbar keeps whether or not that row
+    /// shows.
     let size: CGSize
-    /// The window is too narrow to tell the docks apart, so every docked rail rests in the
-    /// centre and one dock slot stands for all three.
-    let docksShared: Bool
+    /// Whether the second row shows: the ink row below the tools, or the ink column beside them on
+    /// end. A rail without an ink row has none.
+    let showsInkRow: Bool
     /// Whether the planned tools close the tool row: at regular width only where the whole group
     /// fits, and always on the scrolling compact row.
     let showsUpcoming: Bool
@@ -350,6 +539,43 @@ struct NotebookToolbarRail: Equatable {
     /// A row wider than its strip keeps room for a trailing chevron that pages it.
     let toolRowOverflows: Bool
     let inkRowOverflows: Bool
+
+    init(
+        orientation: NotebookRailOrientation, size: CGSize, showsInkRow: Bool, showsUpcoming: Bool,
+        toolRow: NotebookStripRow, inkRow: NotebookStripRow?, toolRowOverflows: Bool, inkRowOverflows: Bool
+    ) {
+        self.orientation = orientation
+        self.size = size
+        self.showsInkRow = showsInkRow && inkRow != nil
+        self.showsUpcoming = showsUpcoming
+        self.toolRow = toolRow
+        self.inkRow = inkRow
+        self.toolRowOverflows = toolRowOverflows
+        self.inkRowOverflows = inkRowOverflows
+    }
+
+    /// The rail as drawn: the first row alone, the grip and the tools on end, until the second opens.
+    var shownSize: CGSize { showsInkRow ? size : firstRowSize }
+
+    /// The grip column and the first row, the part of the rail that always shows.
+    var firstRowSize: CGSize {
+        guard inkRow != nil else { return size }
+        return switch orientation {
+        case .horizontal: CGSize(width: size.width, height: NotebookTheme.rowHeight)
+        case .leftEdge, .rightEdge:
+            CGSize(width: NotebookToolbarComposition.gripColumnWidth + NotebookTheme.rowHeight, height: size.height)
+        }
+    }
+
+    /// What an ink's key tells assistive technologies about the second row it opens and closes:
+    /// whether the row shows the selected ink's settings, and what a tap does to it.
+    func inkKeyAccessibility(isSelected: Bool) -> (value: String?, hint: String?) {
+        guard inkRow != nil else { return (nil, nil) }
+        guard isSelected else { return (nil, "Selects this ink and shows its presets and colors.") }
+        return showsInkRow
+            ? ("Presets and colors shown", "Hides the presets and colors.")
+            : ("Presets and colors hidden", "Shows the presets and colors.")
+    }
 }
 
 // MARK: - Strips
@@ -400,10 +626,11 @@ enum NotebookStripItem: Hashable, Identifiable {
     }
 }
 
-/// One item of a strip at the width the strip lays it out at.
+/// One item of a strip at the length the strip lays it out at. A strip on end measures down the
+/// column the same way, so `minX` and `width` run along the strip whichever way it lies.
 struct NotebookStripSlot: Equatable, Identifiable {
     let item: NotebookStripItem
-    /// Leading edge in the strip's content, after the leading inset.
+    /// Start in the strip's content, after the leading inset.
     let minX: CGFloat
     let width: CGFloat
 
@@ -540,11 +767,20 @@ struct NotebookStripOverflow: Equatable {
         self.containerWidth = containerWidth
     }
 
-    init(_ geometry: ScrollGeometry) {
-        self.init(
-            offset: geometry.contentOffset.x, contentWidth: geometry.contentSize.width,
-            containerWidth: geometry.containerSize.width
-        )
+    /// Measured along `axis`, so a strip on end reads its vertical scrolling.
+    init(_ geometry: ScrollGeometry, axis: Axis = .horizontal) {
+        switch axis {
+        case .horizontal:
+            self.init(
+                offset: geometry.contentOffset.x, contentWidth: geometry.contentSize.width,
+                containerWidth: geometry.containerSize.width
+            )
+        case .vertical:
+            self.init(
+                offset: geometry.contentOffset.y, contentWidth: geometry.contentSize.height,
+                containerWidth: geometry.containerSize.height
+            )
+        }
     }
 
     var hidesLeading: Bool { offset > 1 }
@@ -575,19 +811,25 @@ private final class NotebookStripGeometry: ObservableObject {
 /// leading chevron.
 private struct NotebookStripSnapping: ScrollTargetBehavior {
     let row: NotebookStripRow
+    let axis: Axis
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
-        target.rect.origin.x = row.restingOffset(near: target.rect.minX, containerWidth: context.containerSize.width)
+        let size = context.containerSize
+        switch axis {
+        case .horizontal: target.rect.origin.x = row.restingOffset(near: target.rect.minX, containerWidth: size.width)
+        case .vertical: target.rect.origin.y = row.restingOffset(near: target.rect.minY, containerWidth: size.height)
+        }
     }
 }
 
-/// A horizontally scrolling row of controls with hidden indicators. At rest only whole
-/// controls show; while it moves its edges fade instead. Separate chevrons page through
-/// controls hidden past either edge: the leading one over the strip's start, the trailing one
-/// in a slot after it that the row keeps while it is too wide.
+/// A scrolling row of controls with hidden indicators, lying along the rail or on end in a column.
+/// At rest only whole controls show; while it moves its edges fade instead. Separate chevrons page
+/// through controls hidden past either end: the leading one over the strip's start, the trailing
+/// one in a slot after it that the row keeps while it is too long.
 @MainActor
 private struct NotebookToolStrip<Control: View>: View {
     let label: String
+    let axis: Axis
     let row: NotebookStripRow
     let reservesTrailingChevron: Bool
     /// How far a paused rail dims the controls and chevrons. Placeholders are unavailable whether
@@ -597,7 +839,7 @@ private struct NotebookToolStrip<Control: View>: View {
     var reveals: UInt64 = 0
     var revealTarget: NotebookStripItem.ID?
     @ViewBuilder let control: (NotebookStripItem) -> Control
-    @State private var position = ScrollPosition(edge: .leading)
+    @State private var position: ScrollPosition
     @StateObject private var geometry = NotebookStripGeometry()
     /// Changes only when the strip is resized, which sets its trailing room.
     @State private var containerWidth: CGFloat = 0
@@ -607,28 +849,47 @@ private struct NotebookToolStrip<Control: View>: View {
     @State private var isMoving = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    init(
+        label: String, axis: Axis = .horizontal, row: NotebookStripRow, reservesTrailingChevron: Bool,
+        contentOpacity: Double, reveals: UInt64 = 0, revealTarget: NotebookStripItem.ID? = nil,
+        @ViewBuilder control: @escaping (NotebookStripItem) -> Control
+    ) {
+        self.label = label
+        self.axis = axis
+        self.row = row
+        self.reservesTrailingChevron = reservesTrailingChevron
+        self.contentOpacity = contentOpacity
+        self.reveals = reveals
+        self.revealTarget = revealTarget
+        self.control = control
+        _position = State(initialValue: ScrollPosition(edge: axis == .horizontal ? .leading : .top))
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            ScrollView(.horizontal) {
-                HStack(spacing: NotebookTheme.itemSpacing) {
+        stack(spacing: 0) {
+            ScrollView(axis == .horizontal ? .horizontal : .vertical) {
+                stack(spacing: NotebookTheme.itemSpacing) {
                     ForEach(row.slots) { slot in
                         control(slot.item)
-                            .frame(width: slot.width, height: NotebookTheme.controlSize)
+                            .frame(
+                                width: axis == .horizontal ? slot.width : NotebookTheme.controlSize,
+                                height: axis == .horizontal ? NotebookTheme.controlSize : slot.width
+                            )
                             .opacity(slot.item.isPlaceholder ? 1 : contentOpacity)
                     }
                 }
-                .padding(.leading, NotebookTheme.stripInsets.left)
-                .padding(.trailing, row.trailingRoom(containerWidth: containerWidth))
-                .padding(.vertical, NotebookTheme.stripInsets.top)
+                .padding(startEdge, NotebookTheme.stripInsets.left)
+                .padding(endEdge, row.trailingRoom(containerWidth: containerWidth))
+                .padding(axis == .horizontal ? .vertical : .horizontal, NotebookTheme.stripInsets.top)
             }
             .scrollIndicators(.hidden)
-            // The system's edge effect would blur the shell's top edge wherever the rail meets
-            // the top of the window; the strip draws its own edges.
+            // The system's edge effect would blur the shell's edge wherever the rail meets the
+            // window's; the strip draws its own ends.
             .scrollEdgeEffectHidden()
             .scrollPosition($position)
-            .scrollTargetBehavior(NotebookStripSnapping(row: row))
-            .onScrollGeometryChange(for: NotebookStripOverflow.self) { geometry in
-                NotebookStripOverflow(geometry)
+            .scrollTargetBehavior(NotebookStripSnapping(row: row, axis: axis))
+            .onScrollGeometryChange(for: NotebookStripOverflow.self) { [axis] geometry in
+                NotebookStripOverflow(geometry, axis: axis)
             } action: { _, value in
                 geometry.overflow = value
                 if containerWidth != value.containerWidth { containerWidth = value.containerWidth }
@@ -646,18 +907,23 @@ private struct NotebookToolStrip<Control: View>: View {
                 }
             }
             .mask { mask }
-            .overlay(alignment: .leading) {
+            .overlay(alignment: axis == .horizontal ? .leading : .top) {
                 if hiddenEdges.leading {
-                    chevron("chevron.left", label: "Show previous \(label.lowercased())") { row.leadingPage(from: $0) }
+                    let symbol = axis == .horizontal ? "chevron.left" : "chevron.up"
+                    chevron(symbol, label: "Show previous \(label.lowercased())") { row.leadingPage(from: $0) }
                 }
             }
             if reservesTrailingChevron {
                 ZStack {
                     if hiddenEdges.trailing {
-                        chevron("chevron.right", label: "Show more \(label.lowercased())") { row.trailingPage(from: $0) }
+                        let symbol = axis == .horizontal ? "chevron.right" : "chevron.down"
+                        chevron(symbol, label: "Show more \(label.lowercased())") { row.trailingPage(from: $0) }
                     }
                 }
-                .frame(width: NotebookTheme.controlSize)
+                .frame(
+                    width: axis == .horizontal ? NotebookTheme.controlSize : nil,
+                    height: axis == .horizontal ? nil : NotebookTheme.controlSize
+                )
             }
         }
         .accessibilityElement(children: .contain)
@@ -665,7 +931,24 @@ private struct NotebookToolStrip<Control: View>: View {
         .onChange(of: reveals) {
             guard let revealTarget else { return }
             let target = row.offset(showing: revealTarget, containerWidth: geometry.overflow.containerWidth)
-            withAnimation(pageAnimation) { position.scrollTo(x: target) }
+            withAnimation(pageAnimation) { scroll(to: target) }
+        }
+    }
+
+    private var startEdge: Edge.Set { axis == .horizontal ? .leading : .top }
+    private var endEdge: Edge.Set { axis == .horizontal ? .trailing : .bottom }
+
+    /// A row along the strip's axis.
+    private func stack<Content: View>(spacing: CGFloat, @ViewBuilder content: () -> Content) -> some View {
+        let layout = axis == .horizontal
+            ? AnyLayout(HStackLayout(spacing: spacing)) : AnyLayout(VStackLayout(spacing: spacing))
+        return layout(content)
+    }
+
+    private func scroll(to offset: CGFloat) {
+        switch axis {
+        case .horizontal: position.scrollTo(x: offset)
+        case .vertical: position.scrollTo(y: offset)
         }
     }
 
@@ -679,42 +962,59 @@ private struct NotebookToolStrip<Control: View>: View {
     }
 
     /// At rest a hard edge just past the last whole control, and clear under the leading
-    /// chevron up to the first whole one; while moving, a short fade at each edge with hidden
+    /// chevron up to the first whole one; while moving, a short fade at each end with hidden
     /// controls. The two cross-fade as the strip starts and settles.
     private var mask: some View {
-        ZStack(alignment: .leading) {
+        let isHorizontal = axis == .horizontal
+        return ZStack(alignment: isHorizontal ? .leading : .top) {
             Group {
                 if let restingMask {
+                    let length = max(restingMask.end - restingMask.start, 0)
                     Color.black
-                        .frame(width: max(restingMask.end - restingMask.start, 0))
-                        .offset(x: restingMask.start)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(width: isHorizontal ? length : nil, height: isHorizontal ? nil : length)
+                        .offset(x: isHorizontal ? restingMask.start : 0, y: isHorizontal ? 0 : restingMask.start)
+                        .frame(
+                            maxWidth: .infinity, maxHeight: .infinity, alignment: isHorizontal ? .leading : .top
+                        )
                 } else {
                     Color.black
                 }
             }
             .opacity(isMoving ? 0 : 1)
-            HStack(spacing: 0) {
+            stack(spacing: 0) {
                 if hiddenEdges.leading {
-                    Color.clear.frame(width: NotebookTheme.controlSize)
-                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: NotebookStripMask.fadeLength)
+                    Color.clear.frame(
+                        width: isHorizontal ? NotebookTheme.controlSize : nil,
+                        height: isHorizontal ? nil : NotebookTheme.controlSize
+                    )
+                    fade(from: .clear, to: .black)
                 }
                 Color.black
                 if hiddenEdges.trailing {
-                    LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: NotebookStripMask.fadeLength)
+                    fade(from: .black, to: .clear)
                 }
             }
             .opacity(isMoving ? 1 : 0)
         }
     }
 
+    private func fade(from start: Color, to end: Color) -> some View {
+        let isHorizontal = axis == .horizontal
+        return LinearGradient(
+            colors: [start, end],
+            startPoint: isHorizontal ? .leading : .top, endPoint: isHorizontal ? .trailing : .bottom
+        )
+        .frame(
+            width: isHorizontal ? NotebookStripMask.fadeLength : nil,
+            height: isHorizontal ? nil : NotebookStripMask.fadeLength
+        )
+    }
+
     private func chevron(
         _ symbol: String, label: String, offset: @escaping (NotebookStripOverflow) -> CGFloat
     ) -> some View {
         Button {
-            withAnimation(pageAnimation) { position.scrollTo(x: offset(geometry.overflow)) }
+            withAnimation(pageAnimation) { scroll(to: offset(geometry.overflow)) }
         } label: {
             Image(systemName: symbol)
                 .font(.system(size: NotebookTheme.chevronSize, weight: .semibold))
@@ -733,12 +1033,14 @@ private struct NotebookToolStrip<Control: View>: View {
 
 // MARK: - Rail
 
-/// The ivory tool rail on one shell. The first row holds the ink families, the eraser, lasso
+/// The tool rail on one pane of glass. The first row holds the ink families, the eraser, lasso
 /// and ruler, the widths and the planned tools; the second the presets and colours, with the
-/// custom colour well fixed at its end. The grip column at the leading edge comes from the
-/// host, which owns placement; a floating rail adds its collapse key under the grip, or on the
-/// single compact row after the current-ink chip. While writing is paused the content dims over
-/// the opaque shell, except the planned tools, which are unavailable either way.
+/// custom colour well fixed at its end. The second row shows only while the user has opened it
+/// from an ink's key, and opens toward the page inside the room the toolbar keeps for it. At a
+/// side dock the rows stand on end as columns: the grip against the screen edge, then the tools,
+/// then the ink. The grip comes from the host, which owns placement; a floating rail ends its first
+/// row with its collapse key, after the current-ink chip on the single compact row. While writing
+/// is paused the content dims, except the planned tools, which are unavailable either way.
 @MainActor
 struct NotebookToolbar<Grip: View>: View {
     @ObservedObject var store: NotebookSceneToolStore
@@ -769,66 +1071,132 @@ struct NotebookToolbar<Grip: View>: View {
         let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
         let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
         let dimming = actions.contentOpacity(for: contrast)
-        HStack(spacing: 0) {
-            gripColumn
-                .frame(width: NotebookToolbarComposition.gripColumnWidth)
-                .opacity(dimming)
-            VStack(spacing: 0) {
-                toolRow(marks, dimming: dimming)
-                    .frame(height: NotebookTheme.rowHeight)
-                if let inkRow = rail.inkRow {
-                    NotebookChromeDivider(axis: .horizontal)
-                        .frame(height: NotebookTheme.rowSpacing)
-                        .opacity(dimming)
-                    HStack(spacing: 0) {
-                        NotebookToolStrip(
-                            label: "Ink", row: inkRow, reservesTrailingChevron: rail.inkRowOverflows,
-                            contentOpacity: dimming, reveals: inkRowReveals, revealTarget: firstSwatchID(in: inkRow)
-                        ) { control($0, marks: marks) }
-                        HStack(spacing: NotebookTheme.itemSpacing) {
-                            NotebookChromeDivider(axis: .vertical)
-                            NotebookCustomColorWell(
-                                store: store, isSelected: marks.marksCustomColor, isHighlighted: highlightsColors
-                            )
+        let transition = NotebookInkRowTransition(reduceMotion: reduceMotion)
+        lanes(marks: marks, dimming: dimming, transition: transition)
+            .animation(transition.extent(opening: rail.showsInkRow)) {
+                $0.modifier(NotebookRailExtent(
+                    openAmount: rail.showsInkRow ? 1 : 0, closed: rail.firstRowSize, open: rail.size,
+                    anchor: rail.orientation.anchor
+                ))
+            }
+            .clipShape(shape)
+            .notebookGlass(in: shape)
+            .contentShape(shape)
+            .disabled(!actions.isEnabled)
+            .environment(\.notebookKeysPaused, !actions.isEnabled)
+            .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Drawing tools")
+            .onChange(of: store.revealRequest) { respondToPencilReveal() }
+            .task(id: inkRowReveals) { await highlightColors() }
+            // The room the toolbar keeps, its second row's included, with the rail drawn against
+            // the edge it rests at; the rest of the room leaves its touches to the page.
+            .frame(width: rail.size.width, height: rail.size.height, alignment: rail.orientation.anchor)
+    }
+
+    /// The grip, the rows and the seam between them, in rows along the top and on end at a side,
+    /// mirrored so the tools always sit beside the grip and the second row opens toward the page.
+    @ViewBuilder
+    private func lanes(marks: NotebookInkMarks, dimming: Double, transition: NotebookInkRowTransition) -> some View {
+        let hiddenOffset = transition.hiddenOffset(for: rail.orientation)
+        let gripColumn = grip
+            .frame(width: NotebookToolbarComposition.gripColumnWidth)
+            .opacity(dimming)
+        switch rail.orientation {
+        case .horizontal:
+            HStack(alignment: .top, spacing: 0) {
+                gripColumn
+                VStack(spacing: 0) {
+                    toolRow(marks, dimming: dimming)
+                        .frame(height: NotebookTheme.rowHeight)
+                    if let inkRow = rail.inkRow {
+                        VStack(spacing: 0) {
+                            seam(.horizontal, dimming: dimming)
+                            inkLane(inkRow, axis: .horizontal, marks: marks, dimming: dimming)
+                                .frame(height: NotebookTheme.rowHeight)
                         }
-                        .padding(.leading, NotebookTheme.itemSpacing)
-                        .padding(.trailing, NotebookTheme.stripInsets.right)
-                        .opacity(dimming)
+                        .modifier(NotebookInkRowDisclosure(
+                            isShown: rail.showsInkRow, hiddenOffset: hiddenOffset, animation: transition.content
+                        ))
                     }
-                    .frame(height: NotebookTheme.rowHeight)
+                }
+            }
+        case .leftEdge, .rightEdge:
+            HStack(spacing: 0) {
+                ForEach(rail.orientation.columns, id: \.self) { column in
+                    switch column {
+                    case .grip:
+                        gripColumn
+                    case .tools:
+                        toolColumn(marks, dimming: dimming)
+                    case .ink:
+                        if let inkRow = rail.inkRow {
+                            inkColumn(inkRow, marks: marks, dimming: dimming)
+                                .modifier(NotebookInkRowDisclosure(
+                                    isShown: rail.showsInkRow, hiddenOffset: hiddenOffset, animation: transition.content
+                                ))
+                        }
+                    }
                 }
             }
         }
-        .clipShape(shape)
-        .background { NotebookPanelShell() }
-        .contentShape(shape)
-        .disabled(!actions.isEnabled)
-        .environment(\.notebookKeysPaused, !actions.isEnabled)
-        .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Drawing tools")
-        .onChange(of: store.revealRequest) { respondToPencilReveal() }
-        .task(id: inkRowReveals) { await highlightColors() }
     }
 
-    /// Docked, the whole column is the grip. Floating over two rows, the grip takes the top half
-    /// and the collapse key the bottom, so the rail keeps its docked width.
-    @ViewBuilder private var gripColumn: some View {
-        if composition.showsCollapseControl && composition.rowCount > 1 {
-            VStack(spacing: 0) {
-                grip
-                collapseKey
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .overlay {
-                Rectangle()
-                    .fill(NotebookTheme.divider.color)
-                    .frame(width: NotebookTheme.gripSeparatorLength, height: NotebookTheme.dividerThickness)
-                    .accessibilityHidden(true)
-            }
-        } else {
-            grip
+    /// The second row on end, with the seam between it and the tools.
+    private func inkColumn(_ inkRow: NotebookStripRow, marks: NotebookInkMarks, dimming: Double) -> some View {
+        let seamLeads = rail.orientation == .leftEdge
+        return HStack(spacing: 0) {
+            if seamLeads { seam(.vertical, dimming: dimming) }
+            inkLane(inkRow, axis: .vertical, marks: marks, dimming: dimming)
+                .frame(width: NotebookTheme.rowHeight)
+            if !seamLeads { seam(.vertical, dimming: dimming) }
         }
+    }
+
+    /// The hairline between the rows, or between the columns of a rail on end.
+    private func seam(_ axis: Axis, dimming: Double) -> some View {
+        NotebookChromeDivider(axis: axis, kind: .seam)
+            .frame(
+                width: axis == .vertical ? NotebookTheme.rowSpacing : nil,
+                height: axis == .horizontal ? NotebookTheme.rowSpacing : nil
+            )
+            .opacity(dimming)
+    }
+
+    /// The presets and colours, then the custom colour well fixed at the strip's end.
+    private func inkLane(_ inkRow: NotebookStripRow, axis: Axis, marks: NotebookInkMarks, dimming: Double) -> some View {
+        let isHorizontal = axis == .horizontal
+        let lane = isHorizontal ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
+        let cap = isHorizontal
+            ? AnyLayout(HStackLayout(spacing: NotebookTheme.itemSpacing))
+            : AnyLayout(VStackLayout(spacing: NotebookTheme.itemSpacing))
+        return lane {
+            NotebookToolStrip(
+                label: "Ink", axis: axis, row: inkRow, reservesTrailingChevron: rail.inkRowOverflows,
+                contentOpacity: dimming, reveals: inkRowReveals, revealTarget: firstSwatchID(in: inkRow)
+            ) { control($0, marks: marks, axis: axis) }
+            cap {
+                NotebookChromeDivider(axis: isHorizontal ? .vertical : .horizontal, kind: .group)
+                NotebookCustomColorWell(
+                    store: store, isSelected: marks.marksCustomColor, isHighlighted: highlightsColors
+                )
+            }
+            .padding(isHorizontal ? .leading : .top, NotebookTheme.itemSpacing)
+            .padding(isHorizontal ? .trailing : .bottom, NotebookTheme.stripInsets.right)
+            .opacity(dimming)
+        }
+    }
+
+    /// The tool strip on end, beside the grip.
+    private func toolColumn(_ marks: NotebookInkMarks, dimming: Double) -> some View {
+        VStack(spacing: 0) {
+            NotebookToolStrip(
+                label: "Tools", axis: .vertical, row: rail.toolRow, reservesTrailingChevron: rail.toolRowOverflows,
+                contentOpacity: dimming
+            ) { control($0, marks: marks, axis: .vertical) }
+            Color.clear.frame(height: NotebookTheme.stripInsets.right)
+        }
+        .frame(width: NotebookTheme.rowHeight)
     }
 
     private var collapseKey: some View {
@@ -852,10 +1220,12 @@ struct NotebookToolbar<Grip: View>: View {
                 label: "Tools", row: rail.toolRow, reservesTrailingChevron: rail.toolRowOverflows,
                 contentOpacity: dimming
             ) { control($0, marks: marks) }
-            if composition.foldsInkOptions {
+            if composition.foldsInkOptions || composition.showsCollapseControl {
                 HStack(spacing: NotebookTheme.itemSpacing) {
                     NotebookChromeDivider(axis: .vertical)
-                    NotebookCurrentInkChip(store: store, showsOptions: $showsInkPanel)
+                    if composition.foldsInkOptions {
+                        NotebookCurrentInkChip(store: store, showsOptions: $showsInkPanel)
+                    }
                     if composition.showsCollapseControl { collapseKey }
                 }
                 .padding(.leading, NotebookTheme.itemSpacing)
@@ -867,12 +1237,18 @@ struct NotebookToolbar<Grip: View>: View {
         }
     }
 
+    /// One strip item as drawn in a strip lying along `axis`.
     @ViewBuilder
-    private func control(_ item: NotebookStripItem, marks: NotebookInkMarks) -> some View {
+    private func control(_ item: NotebookStripItem, marks: NotebookInkMarks, axis: Axis = .horizontal) -> some View {
         switch item {
         case let .family(family):
-            NotebookToolButton(title: family.title, symbol: family.symbol, isSelected: store.tool.kind == .ink(family)) {
-                actions.select(.ink(family))
+            let isSelected = store.tool.kind == .ink(family)
+            let accessibility = rail.inkKeyAccessibility(isSelected: isSelected)
+            NotebookToolButton(
+                title: family.title, symbol: family.symbol, isSelected: isSelected,
+                value: accessibility.value, hint: accessibility.hint
+            ) {
+                actions.chooseInk(family, opensSettings: rail.inkRow != nil)
             }
         case .eraser:
             NotebookEraserButton(kind: store.tool.kind, actions: actions)
@@ -892,6 +1268,10 @@ struct NotebookToolbar<Grip: View>: View {
             NotebookUpcomingMark()
         case let .upcoming(feature):
             NotebookUpcomingToolButton(feature: feature)
+        case let .preset(preset) where axis == .vertical:
+            NotebookPresetKey(preset: preset, isSelected: marks.presetID == preset.id) {
+                actions.apply(preset)
+            }
         case let .preset(preset):
             NotebookPresetChip(preset: preset, isSelected: marks.presetID == preset.id) {
                 actions.apply(preset)
@@ -901,7 +1281,7 @@ struct NotebookToolbar<Grip: View>: View {
                 actions.selectColor(color)
             }
         case .divider:
-            NotebookChromeDivider(axis: .vertical)
+            NotebookChromeDivider(axis: axis == .horizontal ? .vertical : .horizontal, kind: .group)
         }
     }
 
@@ -909,7 +1289,8 @@ struct NotebookToolbar<Grip: View>: View {
         row.slots.first { if case .swatch = $0.item { true } else { false } }?.id
     }
 
-    /// The store only counts gestures while the toolbar is available, so every count deserves an answer.
+    /// The store only counts gestures while the toolbar is available, so every count deserves an
+    /// answer. The host opens the second row for it; here the colours come into view on it.
     private func respondToPencilReveal() {
         switch composition.pencilRevealResponse {
         case .expand:
@@ -929,6 +1310,84 @@ struct NotebookToolbar<Grip: View>: View {
         // A newer reveal cancels this one and keeps the highlight for its own full duration.
         guard !Task.isCancelled else { return }
         withAnimation(fade) { highlightsColors = false }
+    }
+}
+
+/// How the second row opens and closes. The rail grows toward the page on a spring as the row
+/// fades in, slipping a little out from under the first, and shrinks back as it fades out. Under
+/// Reduce Motion the row only fades: the rail takes its new size at once as the row opens, and
+/// once the row has faded as it closes.
+struct NotebookInkRowTransition: Equatable {
+    let reduceMotion: Bool
+
+    /// Where the hidden row rests relative to its place: tucked toward the first row.
+    func hiddenOffset(for orientation: NotebookRailOrientation) -> CGSize {
+        guard !reduceMotion else { return .zero }
+        let travel = NotebookTheme.inkRowTravel
+        return switch orientation {
+        case .horizontal: CGSize(width: 0, height: -travel)
+        case .leftEdge: CGSize(width: -travel, height: 0)
+        case .rightEdge: CGSize(width: travel, height: 0)
+        }
+    }
+
+    /// How the rail's drawn size follows the row. A closing rail under Reduce Motion holds its size
+    /// while the row fades, then takes the new one within a frame; SwiftUI applies an animation
+    /// without duration at once, delay and all.
+    func extent(opening: Bool) -> Animation? {
+        guard reduceMotion else { return .spring(duration: NotebookTheme.inkRowDuration, bounce: 0) }
+        return opening ? nil : .linear(duration: NotebookTheme.frameDuration).delay(NotebookTheme.toolsFadeDuration)
+    }
+
+    /// How the row's content fades and moves.
+    var content: Animation {
+        reduceMotion
+            ? .linear(duration: NotebookTheme.toolsFadeDuration)
+            : .spring(duration: NotebookTheme.inkRowDuration, bounce: 0)
+    }
+}
+
+/// Draws the rail at its first row's size, its second row's or any size between, against the
+/// edge it rests at. Only the amount open animates, so a rail resized with its window or its text
+/// takes its new size at once.
+private struct NotebookRailExtent: ViewModifier, Animatable {
+    /// 0 with the first row alone, 1 with the second open.
+    var openAmount: Double
+    let closed: CGSize
+    let open: CGSize
+    let anchor: Alignment
+
+    nonisolated var animatableData: Double {
+        get { openAmount }
+        set { openAmount = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content.frame(
+            width: closed.width + (open.width - closed.width) * openAmount,
+            height: closed.height + (open.height - closed.height) * openAmount,
+            alignment: anchor
+        )
+    }
+}
+
+/// Shows or hides the second row in its place. Hidden, it leaves keyboard focus and assistive
+/// technologies to the rest of the rail, and its keys keep their look while they fade; it lies
+/// outside the glass's shape, which leaves its touches to the page.
+private struct NotebookInkRowDisclosure: ViewModifier {
+    let isShown: Bool
+    let hiddenOffset: CGSize
+    let animation: Animation
+
+    func body(content: Content) -> some View {
+        content
+            .transformEnvironment(\.notebookKeysHiding) { $0 = $0 || !isShown }
+            .animation(animation) {
+                $0.opacity(isShown ? 1 : 0).offset(isShown ? .zero : hiddenOffset)
+            }
+            // Applied outside the animation's body, where SwiftUI refreshes a changed `disabled`.
+            .disabled(!isShown)
+            .accessibilityHidden(!isShown)
     }
 }
 
@@ -984,6 +1443,8 @@ struct NotebookInkControls: View {
         .padding(NotebookTheme.inkPanelPadding)
         .frame(width: NotebookTheme.inkPanelWidth)
         .disabled(!store.isToolbarAvailable)
+        // The panel is a matte popover, though the glass rail presents it.
+        .environment(\.notebookKeysOnGlass, false)
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -1008,7 +1469,7 @@ private struct NotebookCurrentInkChip: View {
                     .overlay(NotebookSwatchRing(color: store.tool.color))
                     .frame(width: NotebookTheme.currentInkSwatchDiameter, height: NotebookTheme.currentInkSwatchDiameter)
                 Circle()
-                    .modifier(NotebookKeyForeground())
+                    .modifier(NotebookKeyForeground(isMark: true))
                     .frame(width: store.tool.widthStep.dotDiameter, height: store.tool.widthStep.dotDiameter)
             }
             .frame(width: NotebookTheme.currentInkChipWidth, height: NotebookTheme.controlSize)
@@ -1040,6 +1501,8 @@ private struct NotebookToolButton: View {
     let symbol: String
     let isSelected: Bool
     var isToggle = false
+    var value: String?
+    var hint: String?
     let action: () -> Void
 
     var body: some View {
@@ -1050,6 +1513,8 @@ private struct NotebookToolButton: View {
         // Several inks share similar glyphs, so pointer and Pencil hover name them.
         .help(title)
         .accessibilityLabel(title)
+        .accessibilityValue(value ?? "")
+        .accessibilityHint(hint ?? "")
         .accessibilityAddTraits(traits)
         .accessibilityShowsLargeContentViewer {
             Label(title, systemImage: symbol)
@@ -1384,6 +1849,7 @@ struct NotebookPresetChip: View {
                     .overlay(alignment: .bottom) {
                         if isSelected {
                             Capsule()
+                                .modifier(NotebookKeyForeground(isMark: true))
                                 .frame(width: NotebookTheme.selectionMarkSize.width, height: NotebookTheme.selectionMarkSize.height)
                                 .padding(.bottom, NotebookTheme.presetMarkInset)
                                 .accessibilityHidden(true)
@@ -1410,6 +1876,38 @@ struct NotebookPresetChip: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityShowsLargeContentViewer {
             Label(preset.name, systemImage: "circle.fill")
+        }
+    }
+}
+
+/// A preset as a square key, for a rail on end where a labelled chip has no room: the preset's
+/// ink family with a bead of its colour, as the collapsed handle shows the tool in use. The full
+/// name stays its label, its pointer help and its Large Content Viewer title.
+@MainActor
+private struct NotebookPresetKey: View {
+    let preset: EditorInkPreset
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            NotebookToolGlyph(symbol: preset.family.symbol, isSelected: isSelected)
+                .overlay {
+                    Circle()
+                        .fill(preset.color.swiftUIColor)
+                        .overlay(NotebookSwatchRing(color: preset.color))
+                        .frame(width: NotebookTheme.presetDotDiameter, height: NotebookTheme.presetDotDiameter)
+                        .offset(NotebookTheme.presetKeyBeadOffset)
+                        .accessibilityHidden(true)
+                }
+        }
+        .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
+        .help(preset.name)
+        .accessibilityLabel("\(preset.name) preset")
+        .accessibilityInputLabels(NotebookPresetChip.inputLabels(for: preset))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityShowsLargeContentViewer {
+            Label(preset.name, systemImage: preset.family.symbol)
         }
     }
 }
@@ -1528,7 +2026,7 @@ enum NotebookSwatchContrast {
     }
 }
 
-/// Opens the system colour picker. Selected, it shows the colour in use, which is not on the shelf.
+/// Opens the colour screen. Selected, it shows the colour in use, which is not on the shelf.
 @MainActor
 private struct NotebookCustomColorWell: View {
     /// A muted hue wheel that marks the well as the way to any colour.
@@ -1541,9 +2039,6 @@ private struct NotebookCustomColorWell: View {
     let isSelected: Bool
     var isHighlighted = false
     @State private var isPicking = false
-    @State private var pick = NotebookColorPick()
-
-    private var actions: NotebookToolbarActions { NotebookToolbarActions(store: store) }
 
     var body: some View {
         Button { isPicking = true } label: {
@@ -1569,88 +2064,12 @@ private struct NotebookCustomColorWell: View {
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
         .accessibilityLabel("Custom color")
         .accessibilityValue(isSelected ? store.tool.color.accessibilityName : "")
-        .accessibilityHint("Opens the color picker. The color showing when you close it is added to your swatches.")
+        .accessibilityHint("Opens the color picker. Try a color on the scratchpad; once it shows Ready, leaving writes with it and adds it to your swatches.")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityShowsLargeContentViewer {
             Label("Custom color", systemImage: "paintpalette")
         }
-        .sheet(isPresented: $isPicking) {
-            NotebookColorPicker(initial: store.tool.color, pick: pick) { isPicking = false }
-                .presentationBackground(NotebookTheme.panelSurface.color)
-        }
-        .onChange(of: isPicking) { _, picking in
-            if !picking { pick.finish(with: actions) }
-        }
-        .notebookToolbarPresentation(isPicking, store: store)
-        // Every change arrives, however many fall within one frame, so a pause always closes it.
-        .onReceive(store.$isToolbarAvailable) { available in
-            if !available { isPicking = false }
-        }
-    }
-}
-
-/// One visit to the colour picker. The picker reports every colour the user passes on the
-/// way, so only the one showing when it closes is kept, and only once.
-@MainActor
-final class NotebookColorPick {
-    private var latest: EditorInkColor?
-
-    func record(_ color: UIColor) {
-        latest = NotebookSwatchShelf.color(from: color)
-    }
-
-    /// Adds the last colour shown as a swatch and selects it. A visit without a choice, or one
-    /// already finished, changes nothing; so does one that ends while writing is paused.
-    func finish(with actions: NotebookToolbarActions) {
-        guard let latest else { return }
-        self.latest = nil
-        actions.addCustomColor(latest)
-    }
-}
-
-/// The system colour picker. It reports colours to a `NotebookColorPick` and asks to be
-/// closed when the user finishes; the well keeps the colour once the presentation has ended,
-/// however it ended.
-struct NotebookColorPicker: UIViewControllerRepresentable {
-    let initial: EditorInkColor
-    let pick: NotebookColorPick
-    let close: @MainActor () -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(pick: pick, close: close)
-    }
-
-    func makeUIViewController(context: Context) -> UIColorPickerViewController {
-        let picker = UIColorPickerViewController()
-        picker.supportsAlpha = false
-        picker.selectedColor = initial.platformColor
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ picker: UIColorPickerViewController, context: Context) {
-        context.coordinator.close = close
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, UIColorPickerViewControllerDelegate {
-        let pick: NotebookColorPick
-        var close: @MainActor () -> Void
-
-        init(pick: NotebookColorPick, close: @escaping @MainActor () -> Void) {
-            self.pick = pick
-            self.close = close
-        }
-
-        func colorPickerViewController(
-            _ viewController: UIColorPickerViewController, didSelect color: UIColor, continuously: Bool
-        ) {
-            pick.record(color)
-        }
-
-        func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
-            close()
-        }
+        .notebookColorScreen(isPresented: $isPicking, store: store)
     }
 }
 
@@ -1663,7 +2082,7 @@ private struct NotebookWidthButton: View {
     var body: some View {
         Button(action: action) {
             Circle()
-                .modifier(NotebookKeyForeground())
+                .modifier(NotebookKeyForeground(isMark: true))
                 .frame(width: step.dotDiameter, height: step.dotDiameter)
                 .frame(width: NotebookTheme.controlSize, height: NotebookTheme.controlSize)
                 .overlay(alignment: .bottom) {

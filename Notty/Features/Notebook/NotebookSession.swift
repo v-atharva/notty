@@ -285,7 +285,7 @@ final class NotebookSession: ObservableObject {
         guard canEdit else { return }
         extentIntent = nil
         pageCount += 1
-        canvasControls?.applyPageCount(pageCount)
+        canvasControls?.applyRequestedPageCount(pageCount)
         enqueueCurrentDrawing()
     }
 

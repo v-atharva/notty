@@ -1345,7 +1345,7 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertEqual(canvas.contentOffset.y, 0, accuracy: 0.5)
 
         for placement in [
-            EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.6)), .docked(.topLeading),
+            EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.6)), .docked(.leftEdge),
             .floating(CGPoint(x: 0.5, y: 0)), .docked(.topCenter)
         ] {
             actions.place(placement)
@@ -1417,6 +1417,42 @@ final class NotebookControllerTests: XCTestCase {
         }
         controller.scrollViewDidEndDecelerating(canvas)
         XCTAssertFalse(rig.chrome.state.showsHeader, "the spring back reports no movement")
+        XCTAssertTrue(store.areToolsHidden)
+    }
+
+    /// A fling that reveals the end card adopts the card's room as it carries the page past the
+    /// end. The room moves the end of the scroll range, never the page, so the bounce on past the
+    /// lifted end and back to it reads as no movement and the header and tools stay away.
+    func testAFlingThatRevealsTheEndCardKeepsTheChromeHidden() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        let rig = try await NotebookChromeRig(store: store)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        controller.writingChrome = rig.chrome
+        controller.onAddPage = {}
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        let end = maximumOffsetY(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end - 600), animated: false)
+        controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end - 500), animated: false)
+        var target = CGPoint(x: canvas.contentOffset.x, y: end)
+        controller.scrollViewWillEndDragging(canvas, withVelocity: CGPoint(x: 0, y: 5), targetContentOffset: &target)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        for y in [end - 200, end, end + 40, end + 80] {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        XCTAssertTrue(controller.isEndCardRevealed)
+        let lifted = maximumOffsetY(canvas)
+        XCTAssertGreaterThan(lifted, end + 80)
+        for y in [lifted + 40, lifted + 15, lifted] {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertFalse(rig.chrome.state.showsHeader, "the bounce back to the lifted end reports no movement")
         XCTAssertTrue(store.areToolsHidden)
     }
 

@@ -1,10 +1,10 @@
 import SwiftUI
 import UIKit
 
-/// The card a pull past the last page reveals on the stone beneath it: the end of the notebook,
-/// with exporting it, which is coming later, and adding a page. The controller places it under
-/// the last page in the pass that moves the paper. A move only shifts this view; the SwiftUI
-/// content inside is built again only when the card's state, width or text size changes.
+/// The card a pull or a fling past the last page reveals on the near-black beneath it: the end of
+/// the notebook, with exporting it, which is coming later, and adding a page. The controller places
+/// it under the last page in the pass that moves the paper. A move only shifts this view; the
+/// SwiftUI content inside is built again only when the card's state, width or text size changes.
 @MainActor
 final class NotebookEndOfNotebookCard: UIView {
     enum AddPage: Equatable {

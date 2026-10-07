@@ -23,6 +23,9 @@ final class NotebookSceneToolStore: ObservableObject {
     /// True while the writing view keeps the tools out of sight. The toolbar keeps its
     /// placement and preferences; only whether it shows changes.
     @Published private(set) var areToolsHidden = false
+    /// True while the rail shows its second row, the presets and colours of the ink in use. The row
+    /// opens only at the user's request, so it is not stored: every launch shows the first row alone.
+    @Published private(set) var isInkRowOpen = false
     /// How far the toolbar reaches in from the top or bottom of the control area, the canvas
     /// less its chrome. The canvas it is drawn over adds it to the chrome as scroll space,
     /// whether or not it owns the tools, so no page end stays covered. It is handed to the
@@ -138,6 +141,12 @@ final class NotebookSceneToolStore: ObservableObject {
     func setToolsHidden(_ hidden: Bool) {
         guard areToolsHidden != hidden else { return }
         areToolsHidden = hidden
+    }
+
+    /// Opens or closes the rail's second row. Only a real change is published.
+    func setInkRowOpen(_ open: Bool) {
+        guard isInkRowOpen != open else { return }
+        isInkRowOpen = open
     }
 
     /// Asks for hidden tools back, as the reveal tab and the other stand-ins do. The writing view

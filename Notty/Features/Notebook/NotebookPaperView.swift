@@ -6,6 +6,7 @@ import UIKit
 class NotebookPaperView: UIView {
     static var paperColor: UIColor { NotebookTheme.paperIvory.uiColor }
     static var backdropColor: UIColor { NotebookTheme.backdropStone.uiColor }
+    static var belowPaperColor: UIColor { NotebookTheme.backdropBelowPaper.uiColor }
 
     let contentLayer = CALayer()
     /// Paper above page 1, so the space reserved for the chrome and for overscroll at the top
@@ -14,6 +15,10 @@ class NotebookPaperView: UIView {
     /// Paper fibres under the dividers and the edges, continuing through the head margin. It
     /// repeats a cached tile and moves with `contentLayer`, so scrolling and zooming never redraw it.
     let grainLayer = CALayer()
+    /// Near-black below the last page, across the whole window at any zoom, while stone stays
+    /// beside the paper down to its foot. It moves with `contentLayer`, so a pull or a fling past
+    /// the end opens dark space beneath the page.
+    let belowPaperLayer = CALayer()
     /// Line just below the last page.
     let edgeLayer = CALayer()
     /// Lines just outside the sides of the paper, from the top of the head margin to the bottom
@@ -23,15 +28,10 @@ class NotebookPaperView: UIView {
     let trailingEdgeLayer = CALayer()
     /// Divider at the top of page 1, where the head margin ends.
     let pageTopLayer = CALayer()
-    /// Shading on the stone below the last page and beside the paper. Gradients in page
-    /// coordinates zoom with the page, so nothing blurs while scrolling or zooming.
-    let bottomShadowLayer = CAGradientLayer()
+    /// Shading on the stone beside the paper, down to its foot. Gradients in page coordinates
+    /// zoom with the page, so nothing blurs while scrolling or zooming.
     let leadingShadowLayer = CAGradientLayer()
     let trailingShadowLayer = CAGradientLayer()
-    /// Quarter ellipses outside the lower corners of the paper, where the bottom and side bands
-    /// would otherwise end in hard cuts.
-    let leadingCornerShadowLayer = CAGradientLayer()
-    let trailingCornerShadowLayer = CAGradientLayer()
     private(set) var boundaryLayers: [CALayer] = []
     private(set) var geometryUpdates = 0
     private(set) var viewportUpdates = 0
@@ -49,9 +49,8 @@ class NotebookPaperView: UIView {
 
     /// Layers that frame the paper; empty geometry hides them all.
     private var framingLayers: [CALayer] {
-        [headMarginLayer, edgeLayer, leadingEdgeLayer, trailingEdgeLayer, pageTopLayer]
-            + [bottomShadowLayer, leadingShadowLayer, trailingShadowLayer]
-            + [leadingCornerShadowLayer, trailingCornerShadowLayer]
+        [headMarginLayer, belowPaperLayer, edgeLayer, leadingEdgeLayer, trailingEdgeLayer, pageTopLayer]
+            + [leadingShadowLayer, trailingShadowLayer]
     }
 
     private var edgeLayers: [CALayer] { [edgeLayer, leadingEdgeLayer, trailingEdgeLayer] }
@@ -62,7 +61,7 @@ class NotebookPaperView: UIView {
     ) {
         self.accessibility = accessibility
         super.init(frame: frame)
-        // Stone shows wherever there is no paper: past the last page, beside a page zoomed below
+        // Stone shows wherever there is no paper above the page's foot: beside a page zoomed below
         // width fit, and above the head margin when zoomed far out.
         backgroundColor = Self.backdropColor
         isOpaque = true
@@ -79,25 +78,19 @@ class NotebookPaperView: UIView {
         grainLayer.anchorPoint = .zero
         grainLayer.isHidden = accessibility.prefersPlainMaterials
         contentLayer.addSublayer(grainLayer)
-        // Each band is darkest where it touches the paper. A corner ellipse is centred on the page
-        // corner with the bands' depths as radii, so it fades like the bottom band along the page
-        // side and like the side band below the page; halfway between their strengths halves the
-        // step left at either seam.
-        let cornerOpacity = (NotebookTheme.pageShadowOpacity + NotebookTheme.pageSideShadowOpacity) / 2
-        for (shadow, opacity, start, end) in [
-            (bottomShadowLayer, NotebookTheme.pageShadowOpacity, CGPoint(x: 0.5, y: 0), CGPoint(x: 0.5, y: 1)),
-            (leadingShadowLayer, NotebookTheme.pageSideShadowOpacity, CGPoint(x: 1, y: 0.5), CGPoint(x: 0, y: 0.5)),
-            (trailingShadowLayer, NotebookTheme.pageSideShadowOpacity, CGPoint(x: 0, y: 0.5), CGPoint(x: 1, y: 0.5)),
-            (leadingCornerShadowLayer, cornerOpacity, CGPoint(x: 1, y: 0), CGPoint(x: 2, y: 1)),
-            (trailingCornerShadowLayer, cornerOpacity, CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 1))
+        // Each band is darkest where it touches the paper.
+        for (shadow, start, end) in [
+            (leadingShadowLayer, CGPoint(x: 1, y: 0.5), CGPoint(x: 0, y: 0.5)),
+            (trailingShadowLayer, CGPoint(x: 0, y: 0.5), CGPoint(x: 1, y: 0.5))
         ] {
-            Self.shade(shadow, opacity: opacity, from: start, to: end)
+            Self.shade(shadow, opacity: NotebookTheme.pageSideShadowOpacity, from: start, to: end)
             shadow.anchorPoint = .zero
             contentLayer.addSublayer(shadow)
         }
-        for corner in [leadingCornerShadowLayer, trailingCornerShadowLayer] {
-            corner.type = .radial
-        }
+        // Under the edges, which frame the page on the near-black as on the stone.
+        belowPaperLayer.anchorPoint = .zero
+        belowPaperLayer.backgroundColor = Self.belowPaperColor.cgColor
+        contentLayer.addSublayer(belowPaperLayer)
         for edge in edgeLayers {
             edge.anchorPoint = .zero
             contentLayer.addSublayer(edge)
@@ -158,14 +151,12 @@ class NotebookPaperView: UIView {
             contentLayer.bounds = CGRect(x: 0, y: 0, width: width, height: height)
             let margin = NotebookTheme.headMarginLength
             let side = NotebookTheme.pageSideShadowDepth
-            let depth = NotebookTheme.pageShadowDepth
+            let reach = NotebookTheme.belowPaperReach
             headMarginLayer.frame = CGRect(x: 0, y: -margin, width: width, height: margin)
             grainLayer.frame = CGRect(x: 0, y: -margin, width: width, height: height + margin)
-            bottomShadowLayer.frame = CGRect(x: 0, y: height, width: width, height: depth)
+            belowPaperLayer.frame = CGRect(x: -reach, y: height, width: width + 2 * reach, height: reach)
             leadingShadowLayer.frame = CGRect(x: -side, y: -margin, width: side, height: height + margin)
             trailingShadowLayer.frame = CGRect(x: width, y: -margin, width: side, height: height + margin)
-            leadingCornerShadowLayer.frame = CGRect(x: -side, y: height, width: side, height: depth)
-            trailingCornerShadowLayer.frame = CGRect(x: width, y: height, width: side, height: depth)
             for (divider, y) in zip(boundaryLayers, boundaries) {
                 divider.position = CGPoint(x: 0, y: y)
             }

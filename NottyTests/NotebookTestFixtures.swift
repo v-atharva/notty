@@ -358,6 +358,12 @@ struct RenderedPixels {
         let offset = (Int(point.y * scale) * width + Int(point.x * scale)) * 4
         return Array(rgba[offset..<offset + 4])
     }
+
+    /// Glass dithers its rendering by a few levels from frame to frame, so renders that differ by
+    /// no more than that show the same picture.
+    func looksLike(_ other: RenderedPixels) -> Bool {
+        rgba.count == other.rgba.count && !zip(rgba, other.rgba).contains { abs(Int($0) - Int($1)) > 8 }
+    }
 }
 
 /// Hands out defaults suites for one test at a time and deletes them when it finishes.

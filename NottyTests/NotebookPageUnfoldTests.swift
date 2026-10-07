@@ -147,18 +147,46 @@ final class NotebookPageUnfoldTests: XCTestCase {
             XCTAssertEqual(measured.shown, measured.expected, accuracy: 0.012, "\(y) pt down")
         }
 
-        // The bottom keeps six tenths of its light: its kernel takes in the stone below the page too, so it lies
-        // between the stone and the paper, each dimmed by that edge's attenuation.
+        // The bottom keeps six tenths of its light: its kernel takes in the dark below the page too, so it lies
+        // between that dark and the paper, each dimmed by that edge's attenuation.
         let farAttenuation = timeline.attenuation(radius: timeline.currentFrame.farEdgeRadius)
         XCTAssertEqual(farAttenuation, 0.6, accuracy: 0.001)
         let bottom = frame.statistics(rows: (frame.height - 2)..<frame.height, columns: 64..<(frame.width - 64))
-        let stoneLuminance = Self.luminance(Self.stone)
+        let backdropLuminance = Self.luminance(Self.backdrop)
         XCTAssertGreaterThanOrEqual(
-            Self.luminance(bottom.mean), min(paperLuminance, stoneLuminance) * farAttenuation - 0.01
+            Self.luminance(bottom.mean), min(paperLuminance, backdropLuminance) * farAttenuation - 0.01
         )
         XCTAssertLessThanOrEqual(
-            Self.luminance(bottom.mean), max(paperLuminance, stoneLuminance) * farAttenuation + 0.01
+            Self.luminance(bottom.mean), max(paperLuminance, backdropLuminance) * farAttenuation + 0.01
         )
+    }
+
+    /// Added from the card, a page shows only the card's room of itself, its top, where the frost
+    /// has barely begun: on the 12.9-inch iPad in portrait that strip keeps 95% of its light at
+    /// the frost's steepest, while the foot of the page keeps 60%. Hence the paper scrolls on to
+    /// the new page as it clears.
+    func testAtTheCardsGlimpseOfTheNewPageTheFrostBarelyShows() async throws {
+        let unfold = try await readyUnfold()
+        let fixture = try await PaperFixture(screenPixelsPerPoint: 1)
+        let card = NotebookEndOfNotebookCard()
+        card.configure(addPage: .available, contentSize: .large, maximumWidth: 1_024 - 2 * NotebookTheme.endCardGap)
+        let room = card.bounds.height + 2 * NotebookTheme.endCardGap
+        let zoom = 1_024 / Self.pageSize.width
+        let strip = Int((room / zoom).rounded(.down))
+        XCTAssertGreaterThan(strip, 100)
+        let frame = try render(unfold, source: fixture.source, tilt: 27)
+        let paper = Pixels(fixture.source)
+        let columns = 64..<(frame.width - 64)
+        func kept(_ rows: Range<Int>) -> Double {
+            Self.luminance(frame.statistics(rows: rows, columns: columns).mean)
+                / Self.luminance(paper.statistics(rows: rows, columns: columns).mean)
+        }
+        let glimpse = kept((strip - 8)..<strip)
+        let foot = kept((frame.height - 40)..<(frame.height - 32))
+        XCTAssertGreaterThan(glimpse, 0.94, "The glimpse's lowest rows, the most frosted it shows.")
+        XCTAssertLessThan(foot, 0.65)
+        try record(["cardRoomPoints": room, "glimpsePagePoints": Double(strip), "glimpseLightKept": glimpse,
+                    "footLightKept": foot], name: "unfold-glimpse")
     }
 
     func testTheFrostBlursARuleOnItsOwnRow() async throws {
@@ -199,7 +227,7 @@ final class NotebookPageUnfoldTests: XCTestCase {
         XCTAssertGreaterThan(distinct.count, 12, "the grain varies along a row")
     }
 
-    func testStoneShowsWhereTheKernelMissesThePage() async throws {
+    func testTheBackdropShowsWhereTheKernelMissesThePage() async throws {
         let unfold = try await readyUnfold()
         let source = Self.flat(Self.ivory)
         let frame = try render(unfold, source: source, tilt: 27)
@@ -214,9 +242,9 @@ final class NotebookPageUnfoldTests: XCTestCase {
             )
         }
         let edge = frame.luminance(x: 0, y: y)
-        let stone = Self.luminance(Self.stone) * attenuation
-        XCTAssertLessThan(edge, frame.luminance(x: frame.width / 2, y: y) - 0.02, "stone mixes in at the side")
-        XCTAssertGreaterThan(edge, stone - 0.02)
+        let backdrop = Self.luminance(Self.backdrop) * attenuation
+        XCTAssertLessThan(edge, frame.luminance(x: frame.width / 2, y: y) - 0.02, "the dark mixes in at the side")
+        XCTAssertGreaterThan(edge, backdrop - 0.02)
     }
 
     // MARK: - Playing
@@ -310,7 +338,7 @@ final class NotebookPageUnfoldTests: XCTestCase {
         )
     }
 
-    func testReduceMotionFadesFromStoneWithoutFrost() async throws {
+    func testReduceMotionFadesFromTheDarkBelowThePageWithoutFrost() async throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let unfold = NotebookPageUnfold(device: device, prefersReducedMotion: { true })
         _ = await unfold.ready()
@@ -325,7 +353,8 @@ final class NotebookPageUnfoldTests: XCTestCase {
         XCTAssertTrue(played)
         let layer = try XCTUnwrap(unfold.layer)
         XCTAssertEqual(
-            layer.backgroundColor, NotebookTheme.backdropStone.cgColor, "it starts as the stone the page replaces"
+            layer.backgroundColor, NotebookTheme.backdropBelowPaper.cgColor,
+            "it starts as the dark the page is added over"
         )
         XCTAssertEqual(layer.frame, fixture.page)
         await fulfillment(of: [ended], timeout: 3)
@@ -382,7 +411,7 @@ final class NotebookPageUnfoldTests: XCTestCase {
         _ = await reduced.ready()
         XCTAssertFalse(reduced.needsSource, "The fade needs no picture of the page.")
         XCTAssertTrue(reduced.play(page: page, source: nil, in: host) {})
-        XCTAssertEqual(reduced.layer?.backgroundColor, NotebookTheme.backdropStone.cgColor)
+        XCTAssertEqual(reduced.layer?.backgroundColor, NotebookTheme.backdropBelowPaper.cgColor)
         reduced.finish()
         XCTAssertFalse(NotebookPageUnfold(device: nil).needsSource)
         XCTAssertFalse(NotebookPageUnfold(device: device).needsSource, "Not before the shaders are ready.")
@@ -599,25 +628,26 @@ final class NotebookPageUnfoldTests: XCTestCase {
             frames.append(timeline.advance(elapsed: elapsed, interval: elapsed == 0 ? 0 : 1_000.0 / 60))
             elapsed += 1_000.0 / 60
         }
-        let picks = [0, 7, 14, 21, 28, 33].map { frames[$0] }
+        let picks = (0..<6).map { frames[$0 * (frames.count - 1) / 5] }
         var means: [Double] = []
         for (name, source) in [("blank", fixture.source), ("written", written)] {
             let live = Pixels(source)
             var panels: [Pixels] = []
             for frame in picks {
-                let frost = try render(unfold, source: source, tilt: frame.tilt, taps: frame.taps)
+                let frost = try render(unfold, source: source, tilt: frame.tilt, taps: frame.taps, timeline: timeline)
                 let shown = frost.over(live, opacity: frame.fade)
                 if name == "blank" {
                     means.append(shown.statistics(rows: 0..<shown.height, columns: 0..<shown.width).mean.sum())
                 }
                 panels.append(shown)
             }
-            try write(Pixels.strip(panels, gap: 24, background: Self.stone), name: "unfold-filmstrip-\(name)")
+            try write(Pixels.strip(panels, gap: 24, background: Self.backdrop), name: "unfold-filmstrip-\(name)")
             if name == "written" {
                 let crops = try [frames[0], frames[14]].map { frame in
-                    try render(unfold, source: source, tilt: frame.tilt).crop(x: 0, y: 700, width: 400, height: 300)
+                    try render(unfold, source: source, tilt: frame.tilt, timeline: timeline)
+                        .crop(x: 0, y: 700, width: 400, height: 300)
                 }
-                try write(Pixels.strip(crops, gap: 12, background: Self.stone), name: "unfold-grain-crop")
+                try write(Pixels.strip(crops, gap: 12, background: Self.backdrop), name: "unfold-grain-crop")
             }
         }
         for (earlier, later) in zip(means, means.dropFirst()) {
@@ -627,9 +657,10 @@ final class NotebookPageUnfoldTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private static var stone: SIMD3<Double> {
+    /// The near-black a page is added over, which the frost shows wherever its kernel misses the page.
+    private static var backdrop: SIMD3<Double> {
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-        NotebookTheme.backdropStone.uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        NotebookTheme.backdropBelowPaper.uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return SIMD3(Double(red), Double(green), Double(blue))
     }
 
@@ -656,9 +687,10 @@ final class NotebookPageUnfoldTests: XCTestCase {
         }
     }
 
-    /// The tilt about halfway through the clearing at 60 Hz, its twentieth frame.
+    /// The tilt about halfway through the clearing at 60 Hz and the source's pace, its twentieth
+    /// frame; the app's slower pace passes through the same tilt later.
     private func midwayTilt() throws -> Double {
-        var timeline = Timeline(pageHeight: Self.pageSize.height)
+        var timeline = Timeline(pageHeight: Self.pageSize.height, timeScale: Timeline.sourceTimeScale)
         var tilt = timeline.currentFrame.tilt
         for frame in 0...19 {
             tilt = timeline.advance(elapsed: Double(frame) * 1_000 / 60, interval: frame == 0 ? 0 : 1_000.0 / 60).tilt

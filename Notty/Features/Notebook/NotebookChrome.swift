@@ -1,10 +1,10 @@
 import SwiftUI
 import UIKit
 
-// The editor's shared chrome. The header, the tool rail, handles, popovers and cards are all
-// drawn from these pieces, so one material and one set of key states hold everywhere.
+// The editor's shared chrome. The header, popovers and cards share one matte material; the tool
+// rail and its stand-ins sit on Liquid Glass over the page. One set of key states holds on both.
 
-/// The matte ivory-gray shell under the header, the tool rail, handles and cards: a soft
+/// The matte ivory-gray shell under the header and the status, recovery and end cards: a soft
 /// vertical gradient, a bright line inside the top edge, a darker lower edge and a static
 /// shadow baked once per corner radius. Under Increase Contrast it turns flat with a dark
 /// outline all round. The shadow reaches `shellShadowBleed` past the shell, so hosting views
@@ -57,6 +57,31 @@ struct NotebookPanelShell: View {
             ],
             startPoint: .top, endPoint: .bottom
         )
+    }
+}
+
+extension View {
+    /// Sets the view on the tool rail's Liquid Glass in `shape`: the system's regular glass, which
+    /// draws its own edge and shadow and adapts itself to Reduce Transparency and Increase Contrast.
+    /// Keys inside take the system's adaptive foreground and raise a lens of glass for selection.
+    ///
+    /// A stand-in that is a single control passes `interactive`, so its glass answers a touch as the
+    /// system's glass buttons do. The rail does not: its keys show their own presses, and its grip
+    /// drags it.
+    func notebookGlass(in shape: some Shape, interactive: Bool = false) -> some View {
+        modifier(NotebookGlass(shape: shape, interactive: interactive))
+    }
+}
+
+/// The glass behind `notebookGlass`.
+private struct NotebookGlass<GlassShape: Shape>: ViewModifier {
+    let shape: GlassShape
+    let interactive: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .glassEffect(NotebookTheme.railGlass.interactive(interactive), in: shape)
+            .environment(\.notebookKeysOnGlass, true)
     }
 }
 
@@ -131,24 +156,52 @@ private enum NotebookRecessLip {
     }
 }
 
-/// The single hairline between control groups, or between the rail's two rows.
+/// The single hairline between control groups, or between the rail's two rows or columns.
 struct NotebookChromeDivider: View {
+    enum Kind {
+        /// A short hairline between control groups, padded like a control.
+        case group
+        /// The seam between the rail's rows or columns, stopping short of the rail's ends.
+        case seam
+    }
+
+    /// The direction the hairline runs.
     let axis: Axis
+    let kind: Kind
+    @Environment(\.notebookKeysOnGlass) private var isOnGlass
+
+    /// A vertical hairline between groups in a row, or a horizontal seam between rows.
+    init(axis: Axis) {
+        self.init(axis: axis, kind: axis == .vertical ? .group : .seam)
+    }
+
+    init(axis: Axis, kind: Kind) {
+        self.axis = axis
+        self.kind = kind
+    }
 
     var body: some View {
         Group {
-            switch axis {
-            case .vertical:
+            switch (kind, axis) {
+            case (.group, .vertical):
                 Rectangle()
                     .frame(width: NotebookTheme.dividerThickness, height: NotebookTheme.dividerLength)
                     .padding(.horizontal, NotebookTheme.dividerPadding)
-            case .horizontal:
+            case (.group, .horizontal):
+                Rectangle()
+                    .frame(width: NotebookTheme.dividerLength, height: NotebookTheme.dividerThickness)
+                    .padding(.vertical, NotebookTheme.dividerPadding)
+            case (.seam, .horizontal):
                 Rectangle()
                     .frame(height: NotebookTheme.dividerThickness)
                     .padding(.horizontal, NotebookTheme.rowDividerInset)
+            case (.seam, .vertical):
+                Rectangle()
+                    .frame(width: NotebookTheme.dividerThickness)
+                    .padding(.vertical, NotebookTheme.rowDividerInset)
             }
         }
-        .foregroundStyle(NotebookTheme.divider.color)
+        .foregroundStyle(isOnGlass ? AnyShapeStyle(.separator) : AnyShapeStyle(NotebookTheme.divider.color))
         .accessibilityHidden(true)
     }
 }
@@ -185,6 +238,7 @@ extension NotebookKeyStyle {
         let isPressed: Bool
         let isFocused: Bool
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @Environment(\.notebookKeysOnGlass) private var isOnGlass
 
         var body: some View {
             switch shape {
@@ -214,7 +268,11 @@ extension NotebookKeyStyle {
                         $0.opacity(isPressed && !isSelected ? pressedOpacity : 0)
                     }
                 if isSelected {
-                    NotebookRecessedWell(shape: outline, pressed: isPressed)
+                    if isOnGlass {
+                        NotebookGlassSelection(shape: outline, pressed: isPressed)
+                    } else {
+                        NotebookRecessedWell(shape: outline, pressed: isPressed)
+                    }
                 }
                 if isFocused {
                     outline.strokeBorder(NotebookTheme.glyph.color, lineWidth: NotebookTheme.focusRingWidth)
@@ -222,6 +280,24 @@ extension NotebookKeyStyle {
             }
             .accessibilityHidden(true)
         }
+    }
+}
+
+/// A selected key on glass: a raised lens of frosted glass in the key's shape, the rail's own
+/// material lifted rather than a recess cut into it. A press dims it a little, as the press
+/// shading does for unselected keys.
+struct NotebookGlassSelection<SelectionShape: InsettableShape>: View {
+    let shape: SelectionShape
+    var pressed = false
+
+    var body: some View {
+        shape
+            .fill(.clear)
+            .glassEffect(NotebookTheme.selectionGlass, in: shape)
+            .overlay {
+                if pressed { shape.fill(NotebookTheme.selectedWell.color.opacity(NotebookTheme.pressedWellOpacity)) }
+            }
+            .accessibilityHidden(true)
     }
 }
 
@@ -269,14 +345,42 @@ enum NotebookKeyRelease {
 /// that only a writing pause disables keeps the glyph tone, as its rail dims it with the rest of
 /// its content; dimming the disabled tone as well would leave it unreadable. A key of a rail the
 /// writing view is hiding keeps its tone too, as it fades out unchanged.
+///
+/// On glass a key's symbols and text take the system's adaptive foreground, as the system's own
+/// glass toolbars do: the primary style, and the secondary for a disabled key, which measures
+/// 3.0:1 over the paper and 4.5:1 over black where the tertiary falls to 2.2:1. Its filled marks, the
+/// width dots, selection marks and grip ridges, take the system's label colours resolved for the
+/// glass instead: the vibrant styles lighten filled shapes until a width dot measures 1.6:1 over
+/// the paper and 2.1:1 over black, where the label colour keeps 19.8:1 and 5.8:1, as the symbols
+/// do. A paused rail's keys take the label colours too, as a vibrant symbol inside a scrolling
+/// strip ignores the opacity the rail dims its controls by. The matte header and popovers keep the
+/// charcoal tones.
 struct NotebookKeyForeground: ViewModifier {
+    /// True for a filled mark rather than a symbol or text.
+    var isMark = false
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.notebookKeysPaused) private var isPaused
     @Environment(\.notebookKeysHiding) private var isHiding
+    @Environment(\.notebookKeysOnGlass) private var isOnGlass
 
     func body(content: Content) -> some View {
         let live = isEnabled || isPaused || isHiding
-        content.foregroundStyle((live ? NotebookTheme.glyph : NotebookTheme.disabledGlyph).color)
+        if isOnGlass {
+            content.foregroundStyle(Self.glassStyle(isMark: isMark, isLive: live, isPaused: isPaused))
+        } else {
+            content.foregroundStyle((live ? NotebookTheme.glyph : NotebookTheme.disabledGlyph).color)
+        }
+    }
+
+    /// The label colour a filled mark takes on glass, resolved for the glass where it is drawn.
+    static func glassMarkColor(isLive: Bool) -> UIColor {
+        isLive ? .label : .secondaryLabel
+    }
+
+    /// The style of a key's symbol, text or filled mark on glass.
+    static func glassStyle(isMark: Bool, isLive: Bool, isPaused: Bool) -> AnyShapeStyle {
+        if isMark || isPaused { return AnyShapeStyle(Color(uiColor: glassMarkColor(isLive: isLive))) }
+        return AnyShapeStyle(isLive ? HierarchicalShapeStyle.primary : .secondary)
     }
 }
 
@@ -286,6 +390,11 @@ extension EnvironmentValues {
     /// True inside a rail the writing view is hiding, whose keys are disabled from the moment the
     /// hide begins so they leave keyboard focus between strokes rather than as the fade ends.
     @Entry var notebookKeysHiding = false
+    /// True inside the rail's glass and its stand-ins, whose keys take the system's adaptive
+    /// foreground and raise a glass lens for selection instead of sinking into a well. A popover or
+    /// cover presented from the rail inherits it, and so do the SwiftUI views a presented UIKit
+    /// screen hosts, so the presented content resets it to false.
+    @Entry var notebookKeysOnGlass = false
 
     /// Whether a selected key draws its selection: while enabled, and in a rail that is disabled
     /// only because it is hiding, so the fade shows it as it was. A paused rail draws none.
@@ -296,7 +405,7 @@ extension EnvironmentValues {
 struct NotebookSelectionMark: View {
     var body: some View {
         Capsule()
-            .modifier(NotebookKeyForeground())
+            .modifier(NotebookKeyForeground(isMark: true))
             .frame(width: NotebookTheme.selectionMarkSize.width, height: NotebookTheme.selectionMarkSize.height)
             .padding(.bottom, NotebookTheme.selectionMarkInset)
             .accessibilityHidden(true)
@@ -398,6 +507,8 @@ struct NotebookActionKey<Label: View>: View {
 /// A small capitalised heading over a group of rows in a popover or menu.
 struct NotebookSectionLabel: View {
     let text: String
+    @Environment(\.notebookKeysOnGlass) private var isOnGlass
+    @Environment(\.notebookKeysPaused) private var isPaused
 
     init(_ text: String) {
         self.text = text
@@ -407,8 +518,15 @@ struct NotebookSectionLabel: View {
         Text(text)
             .notebookTypeface(NotebookTheme.sectionLabel)
             .textCase(.uppercase)
-            .foregroundStyle(NotebookTheme.glyphSecondary.color)
+            .foregroundStyle(tone)
             .accessibilityAddTraits(.isHeader)
+    }
+
+    /// On glass a caption reads as a key's text does: vibrant secondary text measures 3.0:1 over the
+    /// paper, short of the 4.5:1 text needs.
+    private var tone: AnyShapeStyle {
+        guard isOnGlass else { return AnyShapeStyle(NotebookTheme.glyphSecondary.color) }
+        return NotebookKeyForeground.glassStyle(isMark: false, isLive: true, isPaused: isPaused)
     }
 }
 

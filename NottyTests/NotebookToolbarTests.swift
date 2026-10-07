@@ -133,7 +133,7 @@ final class NotebookToolbarTests: XCTestCase {
             let probe = EnabledProbe()
             let hosting = AppearanceTrackingHostingController(
                 rootView: EnabledProbeView(probe: probe)
-                    .modifier(NotebookRailFade(hiddenAmount: hiddenAmount, offset: -8, isHidden: isHidden))
+                    .modifier(NotebookRailFade(hiddenAmount: hiddenAmount, offset: CGSize(width: 0, height: -8), isHidden: isHidden))
             )
             let window = try NotebookTestFixtures.window(showing: hosting, width: 200)
             defer {
@@ -172,7 +172,7 @@ final class NotebookToolbarTests: XCTestCase {
             NotebookUpcomingToolButton(feature: placeholder)
         }
         func drawn(isHidden: Bool) throws -> RenderedPixels {
-            try RenderedPixels(rendering: keys.modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: isHidden)))
+            try RenderedPixels(rendering: keys.modifier(NotebookRailFade(hiddenAmount: 0, offset: CGSize(width: 0, height: -8), isHidden: isHidden)))
         }
         let shown = try drawn(isHidden: false)
         XCTAssertTrue(try drawn(isHidden: true).rgba == shown.rgba, "A hiding rail's keys look as they did.")
@@ -184,7 +184,7 @@ final class NotebookToolbarTests: XCTestCase {
         // A paused rail keeps its paused look while it hides.
         func paused(isHidden: Bool) throws -> RenderedPixels {
             try RenderedPixels(rendering: keys.disabled(true).environment(\.notebookKeysPaused, true)
-                .modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: isHidden)))
+                .modifier(NotebookRailFade(hiddenAmount: 0, offset: CGSize(width: 0, height: -8), isHidden: isHidden)))
         }
         XCTAssertTrue(try paused(isHidden: true).rgba == paused(isHidden: false).rgba)
     }
@@ -277,7 +277,7 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertEqual(resolver.startFrame.midX, 500, accuracy: 0.001)
         XCTAssertEqual(resolver.startFrame.midY, 400, accuracy: 0.001)
 
-        let dock = EditorToolbarLayout.frame(for: .docked(.topLeading), size: size, in: usable)
+        let dock = EditorToolbarLayout.frame(for: .docked(.topCenter), size: size, in: usable)
         let release = CGSize(width: dock.midX - 500 + 10, height: dock.midY - 400 + 5)
         let session = NotebookToolbarDragSession()
         for step in 1...5 {
@@ -291,14 +291,88 @@ final class NotebookToolbarTests: XCTestCase {
         }
         XCTAssertEqual(emissions.count, 0, "Intermediate drag positions never persist.")
         XCTAssertEqual(session.previewFrame?.midX ?? 0, dock.midX + 10, accuracy: 0.001)
-        XCTAssertEqual(session.targetedDock, .topLeading)
+        XCTAssertEqual(session.targetedDock, .topCenter)
 
         let placement = session.end(at: release, actions: actions)
-        XCTAssertEqual(placement, .docked(.topLeading))
-        XCTAssertEqual(store.toolbar.placement, .docked(.topLeading))
+        XCTAssertEqual(placement, .docked(.topCenter))
+        XCTAssertEqual(store.toolbar.placement, .docked(.topCenter))
         XCTAssertFalse(session.isActive)
         XCTAssertNil(session.end(at: release, actions: actions))
         XCTAssertEqual(emissions.count, 1)
+    }
+
+    /// A rail held by its grip barely moves sideways when it spans the window, so the finger says
+    /// which edge it is pushed to; the dock it lands in stands it on end, at the vertical size. The
+    /// grip starts within reach of the left edge, so only a finger moving toward it docks there:
+    /// dragged straight down into the page, the rail floats.
+    func testDragPushedToASideDocksTheRailOnEnd() throws {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+        let emissions = countToolbarEmissions(of: store)
+        let usable = CGRect(x: 0, y: 0, width: 834, height: 1_104)
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let sizes = composition.dockSizes(in: usable.size)
+        let resolver = NotebookToolbarDragResolver(
+            placement: .docked(.topCenter), size: sizes.horizontal, dockSizes: sizes, usable: usable
+        )
+        let session = NotebookToolbarDragSession()
+        let grip = CGPoint(x: resolver.startFrame.minX + 22, y: resolver.startFrame.midY)
+
+        XCTAssertLessThan(grip.x, EditorToolbarLayout.edgeSnapDistance, "The grip starts within reach of the left edge.")
+        func finger(_ x: CGFloat) -> (translation: CGSize, pointer: CGPoint) {
+            (CGSize(width: x - grip.x, height: 400), CGPoint(x: x, y: grip.y + 400))
+        }
+
+        // Straight down into the page, the finger still on the grip: it floats.
+        let down = finger(grip.x)
+        session.move(to: down.translation, pointer: down.pointer, resolver: resolver, actions: actions)
+        XCTAssertNil(session.targetedDock)
+        // Pushed on toward the left edge, it docks there.
+        let pushed = finger(grip.x - EditorToolbarLayout.edgeApproachDistance)
+        session.move(to: pushed.translation, pointer: pushed.pointer, resolver: resolver, actions: actions)
+        XCTAssertEqual(session.targetedDock, .leftEdge)
+        // Away from the edge it floats; pushed across to the far side it docks there.
+        let away = finger(300)
+        session.move(to: away.translation, pointer: away.pointer, resolver: resolver, actions: actions)
+        XCTAssertNil(session.targetedDock)
+        let (across, farSide) = finger(820)
+        session.move(to: across, pointer: farSide, resolver: resolver, actions: actions)
+        XCTAssertEqual(session.targetedDock, .rightEdge)
+        XCTAssertEqual(emissions.count, 0)
+
+        let placement = session.end(at: across, pointer: farSide, actions: actions)
+        XCTAssertEqual(placement, .docked(.rightEdge))
+        XCTAssertEqual(store.toolbar.placement, .docked(.rightEdge))
+        XCTAssertEqual(emissions.count, 1)
+        let docked = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let rail = docked.rail(in: usable.size)
+        XCTAssertEqual(rail.orientation, .rightEdge)
+        XCTAssertEqual(rail.size, sizes.vertical)
+        let frame = docked.frame(in: usable)
+        XCTAssertEqual(frame.maxX, usable.maxX - EditorToolbarLayout.margin, accuracy: 0.001)
+
+        // Without side docks, as at compact width, the same push floats the rail instead.
+        let compact = NotebookToolbarDragResolver(
+            placement: .docked(.topCenter), size: sizes.horizontal, dockSizes: sizes, usable: usable, sideDocks: false
+        )
+        guard case .floating = compact.placement(translation: across, pointer: farSide) else {
+            return XCTFail("A window without side docks floats a rail pushed to a side.")
+        }
+    }
+
+    /// Where the side docks are not offered a rail stored at a side rests at the top; dropping it
+    /// back there keeps the side it was stored at, for when the window widens.
+    func testADropInPlaceKeepsASideDockTheWindowDoesNotOffer() {
+        let usable = CGRect(x: 0, y: 0, width: 507, height: 1_290)
+        let size = CGSize(width: 483, height: 52)
+        let resolver = NotebookToolbarDragResolver(
+            placement: .docked(.leftEdge), size: size, usable: usable, sideDocks: false
+        )
+        XCTAssertEqual(resolver.startFrame.minY, EditorToolbarLayout.margin, "It rests at the top.")
+        XCTAssertEqual(resolver.placement(translation: CGSize(width: 0, height: 10)), .docked(.leftEdge))
+        XCTAssertEqual(resolver.targetedDock(translation: CGSize(width: 0, height: 10)), .topCenter,
+            "The marker lights the top, where the rail shows.")
     }
 
     func testDragEndingAwayFromDocksFloatsAtTheClampedFraction() throws {
@@ -371,12 +445,17 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertFalse(session.isActive)
         XCTAssertEqual(emissions.count, 1)
 
-        let towardsLeading = CGSize(width: -180, height: 0)
-        let recomputed = NotebookToolbarDragResolver(placement: .docked(.topTrailing), size: size, usable: usable)
-        XCTAssertEqual(recomputed.placement(translation: towardsLeading), .docked(.topCenter))
-        session.move(to: towardsLeading, resolver: resolver, actions: actions)
-        let docked = session.end(at: towardsLeading, resolver: recomputed, actions: actions)
-        XCTAssertEqual(docked, .docked(.topLeading), "The resolver fixed at the start of the drag decides.")
+        let towardsLeft = CGSize(width: -180, height: 300)
+        let pointer = CGPoint(x: 20, y: 400)
+        let recomputed = NotebookToolbarDragResolver(
+            placement: .docked(.topCenter), size: size, usable: usable, sideDocks: false
+        )
+        guard case .floating = recomputed.placement(translation: towardsLeft, pointer: pointer) else {
+            return XCTFail("The later resolver would float the toolbar.")
+        }
+        session.move(to: towardsLeft, pointer: pointer, resolver: resolver, actions: actions)
+        let docked = session.end(at: towardsLeft, pointer: pointer, resolver: recomputed, actions: actions)
+        XCTAssertEqual(docked, .docked(.leftEdge), "The resolver fixed at the start of the drag decides.")
         XCTAssertEqual(emissions.count, 2)
 
         store.detach(owner)
@@ -386,16 +465,47 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Collapse and reveal
 
-    func testFloatingRailHoldsItsCollapseKeyInTheGripColumn() {
+    /// A floating rail ends its first row with its collapse key, so the key shows whether or not the
+    /// second row does. Where the second row is the wider, as on the 11-inch iPad in portrait, the
+    /// key takes room the first row leaves. Where the first row is the wider and the window fits the
+    /// key as well, as in landscape on the 12.9-inch iPad, the rail grows by the key's room alone and
+    /// still shows every planned tool. Where it cannot fit both, as in portrait on the 12.9-inch iPad,
+    /// the planned tools yield to the key and the second row governs again. The dock slots keep the
+    /// docked rail's size. The single compact row keeps the docked width, its strip giving up the room.
+    func testFloatingRailEndsItsFirstRowWithItsCollapseKey() {
         let floating = EditorToolbarPreferences(
             placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: false, customSwatches: []
         )
-        for width in [834.0, 1_024, 1_366] as [CGFloat] {
-            let docked = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
-            let composition = NotebookToolbarComposition(preferences: floating, horizontalSizeClass: .regular)
+        let key = NotebookToolbarComposition.groupGap + NotebookTheme.controlSize
+        for isOpen in [false, true] {
+            let docked = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular, isInkRowOpen: isOpen)
+            let composition = NotebookToolbarComposition(
+                preferences: floating, horizontalSizeClass: .regular, isInkRowOpen: isOpen
+            )
             XCTAssertTrue(composition.showsCollapseControl)
-            XCTAssertEqual(composition.toolCapWidth, docked.toolCapWidth, "The key sits under the grip, not after the rows.")
-            XCTAssertEqual(composition.rail(forHostWidth: width), docked.rail(forHostWidth: width), "\(width)")
+            XCTAssertFalse(docked.showsCollapseControl)
+            XCTAssertEqual(composition.toolCapWidth, docked.toolCapWidth + key, "The key closes the first row.")
+            XCTAssertEqual(
+                composition.rail(forHostWidth: 834), docked.rail(forHostWidth: 834),
+                "The second row governs the width, so the key takes room the first row leaves."
+            )
+            let landscape = composition.rail(forHostWidth: 1_366)
+            let dockedLandscape = docked.rail(forHostWidth: 1_366)
+            XCTAssertEqual(landscape.size.width, dockedLandscape.size.width + key, accuracy: 0.5)
+            XCTAssertEqual(landscape.size.height, dockedLandscape.size.height)
+            XCTAssertTrue(landscape.showsUpcoming)
+            XCTAssertFalse(landscape.toolRowOverflows)
+
+            let portrait = composition.rail(forHostWidth: 1_024)
+            XCTAssertTrue(docked.rail(forHostWidth: 1_024).showsUpcoming)
+            XCTAssertFalse(portrait.showsUpcoming, "The planned tools yield to the key.")
+            XCTAssertEqual(portrait.toolRow, docked.toolRow(includingUpcoming: false))
+            XCTAssertFalse(portrait.toolRowOverflows, "Every working tool and the key show.")
+            XCTAssertEqual(portrait.size, composition.rail(forHostWidth: 834).size, "The second row governs again.")
+            for size in [CGSize(width: 834, height: 1_194), CGSize(width: 1_024, height: 1_366), CGSize(width: 1_366, height: 1_024)] {
+                XCTAssertEqual(composition.dockSizes(in: size), docked.dockSizes(in: size), "\(size)")
+                XCTAssertEqual(composition.shownDockSizes(in: size), docked.shownDockSizes(in: size), "\(size)")
+            }
         }
         XCTAssertEqual(NotebookToolbarComposition.gripColumnWidth, NotebookTheme.controlSize)
         let compact = NotebookToolbarComposition(preferences: floating, horizontalSizeClass: .compact)
@@ -405,6 +515,58 @@ final class NotebookToolbarTests: XCTestCase {
             compact.toolCapWidth, compactDocked.toolCapWidth + NotebookTheme.itemSpacing + NotebookTheme.controlSize,
             "The single compact row keeps its collapse key after the current-ink chip."
         )
+        XCTAssertEqual(compact.rail(forHostWidth: 507).size, compactDocked.rail(forHostWidth: 507).size)
+    }
+
+    /// The collapsed handle centres across the first row of the rail it stands for, which shows
+    /// whether or not the second row does, so collapsing and expanding the rail moves nothing in
+    /// sight. A dragged handle stores the point that puts that row where the handle was let go,
+    /// and the handle comes back to rest there when collapsed again.
+    func testCollapsedHandleRestsOnTheFirstRowAndADropKeepsTheRowWhereItWasLetGo() throws {
+        let usable = CGRect(x: 0, y: 0, width: 1_024, height: 1_300)
+        let placement = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.4))
+        let expanded = NotebookToolbarComposition(
+            preferences: EditorToolbarPreferences(placement: placement, isCollapsed: false, customSwatches: []),
+            horizontalSizeClass: .regular
+        )
+        let collapsed = NotebookToolbarComposition(
+            preferences: EditorToolbarPreferences(placement: placement, isCollapsed: true, customSwatches: []),
+            horizontalSizeClass: .regular
+        )
+        let room = expanded.frame(in: usable)
+        let handle = collapsed.frame(in: usable)
+        XCTAssertEqual(handle.size, NotebookTheme.collapsedHandleSize)
+        XCTAssertEqual(handle.midX, room.midX, accuracy: 0.001)
+        XCTAssertEqual(handle.midY, room.minY + NotebookTheme.rowHeight / 2, accuracy: 0.001, "Across the first row.")
+        XCTAssertEqual(collapsed.handleFrame(in: usable), handle, "A hidden floating rail leaves its stand-in there too.")
+        XCTAssertEqual(expanded.handleFrame(in: usable), handle)
+
+        let rail = collapsed.rail(in: usable.size)
+        let resolver = NotebookToolbarDragResolver(
+            placement: placement, size: collapsed.toolbarSize(of: rail), dockSizes: collapsed.dockSizes(in: usable.size),
+            usable: usable, centreOffset: collapsed.centreOffset
+        )
+        XCTAssertEqual(resolver.startFrame, handle, "The drag starts from where the handle is drawn.")
+        let translation = CGSize(width: -260, height: 330)
+        let dropped = try XCTUnwrap({ () -> CGPoint? in
+            guard case let .floating(point) = resolver.placement(translation: translation) else { return nil }
+            return point
+        }())
+        let landed = NotebookToolbarComposition(
+            preferences: EditorToolbarPreferences(placement: .floating(dropped), isCollapsed: false, customSwatches: []),
+            horizontalSizeClass: .regular
+        )
+        let letGo = resolver.previewFrame(translation: translation)
+        let landedRoom = landed.frame(in: usable)
+        XCTAssertEqual(landedRoom.minY + NotebookTheme.rowHeight / 2, letGo.midY, accuracy: 0.001, "The first row lands where the handle was let go.")
+        XCTAssertEqual(landed.handleFrame(in: usable).origin.x, letGo.origin.x, accuracy: 0.001)
+        XCTAssertEqual(landed.handleFrame(in: usable).origin.y, letGo.origin.y, accuracy: 0.001, "Collapsed again, it rests there.")
+
+        let compact = NotebookToolbarComposition(
+            preferences: EditorToolbarPreferences(placement: placement, isCollapsed: true, customSwatches: []),
+            horizontalSizeClass: .compact
+        )
+        XCTAssertEqual(compact.handleOffset, .zero, "The single compact row is the whole rail, so its handle centres on the point.")
     }
 
     func testRestoredFloatingCollapsedToolbarShowsTheRevealControl() throws {
@@ -422,7 +584,7 @@ final class NotebookToolbarTests: XCTestCase {
     func testDockedRestoreIsNeverCollapsed() throws {
         let stored = #"{"version":1,"placement":{"dock":"topTrailing"},"collapsed":true,"swatches":[]}"#
         let store = storeWithToolbarData(Data(stored.utf8))
-        XCTAssertEqual(store.toolbar.placement, .docked(.topTrailing))
+        XCTAssertEqual(store.toolbar.placement, .docked(.rightEdge))
         XCTAssertFalse(store.toolbar.isCollapsed)
         let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
         XCTAssertFalse(composition.showsRevealHandle)
@@ -431,7 +593,7 @@ final class NotebookToolbarTests: XCTestCase {
         let (available, owner) = availableStore()
         defer { available.detach(owner) }
         let actions = NotebookToolbarActions(store: available)
-        actions.place(.docked(.topLeading))
+        actions.place(.docked(.leftEdge))
         actions.setCollapsed(true)
         XCTAssertFalse(available.toolbar.isCollapsed)
         actions.place(.floating(CGPoint(x: 0.5, y: 0.5)))
@@ -448,11 +610,11 @@ final class NotebookToolbarTests: XCTestCase {
         defer { store.detach(owner) }
         let actions = NotebookToolbarActions(store: store)
 
-        XCTAssertTrue(actions.place(.docked(.topTrailing)))
+        XCTAssertTrue(actions.place(.docked(.rightEdge)))
         store.setToolsHidden(true)
         actions.showTools()
         XCTAssertFalse(store.areToolsHidden, "The reveal tab asks for the tools back.")
-        XCTAssertEqual(store.toolbar.placement, .docked(.topTrailing))
+        XCTAssertEqual(store.toolbar.placement, .docked(.rightEdge))
 
         let floating = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.5))
         XCTAssertTrue(actions.place(floating))
@@ -522,10 +684,12 @@ final class NotebookToolbarTests: XCTestCase {
         let fixture = try await NotebookTestFixtures.mountToolbarHost(store: store)
         defer { fixture.close() }
         XCTAssertTrue(store.toolbar.isCollapsed)
+        XCTAssertFalse(store.isInkRowOpen)
         store.handlePencil(.showInkAttributes, from: fixture.controller)
         XCTAssertEqual(store.revealRequest, 1)
         try await NotebookTestFixtures.waitUntil { !store.toolbar.isCollapsed }
         XCTAssertEqual(store.toolbar.placement, collapsed.placement)
+        XCTAssertTrue(store.isInkRowOpen, "The rail expands with its colours in sight.")
     }
 
     func testEveryLayoutAnswersAPencilRevealRequestVisibly() {
@@ -571,7 +735,10 @@ final class NotebookToolbarTests: XCTestCase {
         let firstSwatch = try XCTUnwrap(row.slots.first { if case .swatch = $0.item { true } else { false } })
         let target = firstSwatch.minX - NotebookStripRow.leadingClearance
         XCTAssertLessThan(target, row.maximumOffset(containerWidth: ink.bounds.width))
+        XCTAssertFalse(fixture.store.isInkRowOpen, "The colours start out of sight on the closed second row.")
         fixture.store.handlePencil(.showColorPalette, from: fixture.controller)
+        // The toolbar answers the request in its next update.
+        try await NotebookTestFixtures.waitUntil { fixture.store.isInkRowOpen }
         // Paging ends exactly on its target; a flick's snapping never applies to it.
         try await NotebookTestFixtures.waitUntil { abs(ink.contentOffset.x - target) < 0.01 }
         XCTAssertEqual(
@@ -611,6 +778,7 @@ final class NotebookToolbarTests: XCTestCase {
 
         fixture.store.handlePencil(.showContextualPalette, from: fixture.controller)
         try await NotebookTestFixtures.waitUntil { fixture.hosting.presentedViewController != nil }
+        XCTAssertFalse(fixture.store.isInkRowOpen, "The compact rail has no second row to open.")
 
         fixture.controller.setInputGate(.failed)
         XCTAssertFalse(fixture.store.isToolbarAvailable)
@@ -650,15 +818,12 @@ final class NotebookToolbarTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - host.bounds.height) < 0.5 }
         host.layoutIfNeeded()
 
-        let handle = EditorToolbarLayout.frame(
-            for: collapsed.placement, size: NotebookTheme.collapsedHandleSize, in: host.bounds
-        )
-        let expanded = EditorToolbarLayout.frame(
-            for: collapsed.placement,
-            size: NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
-                .toolbarSize(forHostWidth: host.bounds.width),
-            in: host.bounds
-        )
+        let handle = NotebookToolbarComposition(preferences: collapsed, horizontalSizeClass: .regular)
+            .frame(in: host.bounds)
+        var floating = collapsed
+        floating.setCollapsed(false)
+        let expanded = NotebookToolbarComposition(preferences: floating, horizontalSizeClass: .regular)
+            .frame(in: host.bounds)
         let besideHandle = CGPoint(x: expanded.minX + 20, y: expanded.minY + 4)
         XCTAssertFalse(handle.contains(besideHandle))
         XCTAssertFalse(fixture.hit(CGPoint(x: handle.midX, y: handle.midY)).isDescendant(of: fixture.controller.view))
@@ -666,6 +831,243 @@ final class NotebookToolbarTests: XCTestCase {
             fixture.hit(besideHandle).isDescendant(of: canvas),
             "A collapsed toolbar leaves the rest of its expanded frame to the canvas."
         )
+    }
+
+    // MARK: - Second row
+
+    /// The second row starts closed in every launch: opening it writes nothing to the defaults,
+    /// and a store made again from the same defaults shows the first row alone.
+    func testTheSecondRowStartsClosedAndIsNeverStored() {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = NotebookSceneToolStore(identifier: suite, defaults: defaults)
+        XCTAssertFalse(store.isInkRowOpen, "A new scene shows the first row alone.")
+        let owner = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        store.attach(owner)
+        store.setToolbarAvailable(true, for: owner)
+        defer { store.detach(owner) }
+        let stored = defaults.persistentDomain(forName: suite) ?? [:]
+        NotebookToolbarActions(store: store).openInkRow()
+        XCTAssertTrue(store.isInkRowOpen)
+        XCTAssertEqual(
+            NSDictionary(dictionary: defaults.persistentDomain(forName: suite) ?? [:]), NSDictionary(dictionary: stored),
+            "Opening the row stores nothing."
+        )
+        XCTAssertFalse(NotebookSceneToolStore(identifier: suite, defaults: defaults).isInkRowOpen, "The next launch starts closed.")
+    }
+
+    /// An ink's key opens the second row and selects the ink; the key of the ink in use closes the
+    /// open row, and opens it again; another ink's key keeps it open and shows that ink's settings.
+    func testAnInksKeyOpensItsSettingsAndTheSameKeyClosesThem() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+        XCTAssertEqual(store.tool.kind, .ink(.pen))
+        XCTAssertFalse(store.isInkRowOpen)
+
+        actions.chooseInk(.pen)
+        XCTAssertTrue(store.isInkRowOpen, "The ink in use opens its settings.")
+        actions.chooseInk(.pen)
+        XCTAssertFalse(store.isInkRowOpen, "The same key closes them.")
+        actions.chooseInk(.pen)
+        XCTAssertTrue(store.isInkRowOpen, "and opens them again.")
+        XCTAssertEqual(store.tool.kind, .ink(.pen))
+
+        actions.chooseInk(.pencil)
+        XCTAssertEqual(store.tool.kind, .ink(.pencil))
+        XCTAssertTrue(store.isInkRowOpen, "Another ink keeps the row open, showing its own settings.")
+        actions.chooseInk(.pencil)
+        XCTAssertFalse(store.isInkRowOpen)
+        actions.chooseInk(.marker)
+        XCTAssertEqual(store.tool.kind, .ink(.marker))
+        XCTAssertTrue(store.isInkRowOpen, "A closed row opens with the ink a key selects.")
+    }
+
+    /// The eraser, lasso and ruler have no settings on the second row: each closes an open row and
+    /// none opens a closed one. The ink settings on the first and second rows leave it as it is.
+    func testToolsWithoutInkSettingsCloseTheSecondRowAndNeverOpenIt() throws {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+        let closing: [(String, () -> Void)] = [
+            ("the eraser key", { actions.selectEraser() }),
+            ("a mode from the eraser's menu", { actions.select(.eraser(.bitmap)) }),
+            ("the lasso", { actions.select(.lasso) }),
+            ("the ruler", { actions.toggleRuler() }),
+        ]
+        for (name, choose) in closing {
+            actions.chooseInk(.fountainPen)
+            XCTAssertTrue(store.isInkRowOpen)
+            choose()
+            XCTAssertFalse(store.isInkRowOpen, "\(name) closes the row.")
+            choose()
+            XCTAssertFalse(store.isInkRowOpen, "\(name) never opens it.")
+        }
+
+        actions.chooseInk(.fountainPen)
+        let preset = try XCTUnwrap(EditorInkCatalog.presets.first { $0.family == .marker })
+        let keeping: [(String, () -> Void)] = [
+            ("a preset", { actions.apply(preset) }),
+            ("a colour", { actions.selectColor(EditorInkCatalog.swatches[3]) }),
+            ("a width", { actions.selectWidth(.bold) }),
+            ("a custom colour", { actions.addCustomColor(EditorInkColor(red: 0.2, green: 0.4, blue: 0.7)) }),
+        ]
+        for (name, choose) in keeping {
+            choose()
+            XCTAssertTrue(store.isInkRowOpen, "\(name) keeps the row open.")
+        }
+        XCTAssertEqual(store.tool.kind, .ink(.marker))
+        actions.chooseInk(.marker)
+        XCTAssertFalse(store.isInkRowOpen)
+        actions.selectWidth(.fine)
+        XCTAssertFalse(store.isInkRowOpen, "A width on the first row never opens the second.")
+    }
+
+    /// At compact width the current-ink chip holds the ink settings, so an ink's key only selects
+    /// the ink and never opens or closes a second row the rail does not have.
+    func testWithoutASecondRowAnInksKeyOnlySelectsIt() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        let actions = NotebookToolbarActions(store: store)
+        actions.chooseInk(.pen, opensSettings: false)
+        actions.chooseInk(.crayon, opensSettings: false)
+        XCTAssertEqual(store.tool.kind, .ink(.crayon))
+        XCTAssertFalse(store.isInkRowOpen)
+        actions.openInkRow()
+        actions.chooseInk(.crayon, opensSettings: false)
+        XCTAssertTrue(store.isInkRowOpen, "It leaves the row as it was.")
+
+        let compact = NotebookToolbarComposition(
+            preferences: .standard, horizontalSizeClass: .compact, isInkRowOpen: true
+        ).rail(forHostWidth: 507)
+        XCTAssertNil(compact.inkRow)
+        XCTAssertFalse(compact.showsInkRow)
+        XCTAssertEqual(compact.shownSize, compact.size)
+    }
+
+    /// While writing is paused no key, gesture or request opens or closes the second row.
+    func testAPausedToolbarNeitherOpensNorClosesTheSecondRow() {
+        let store = NotebookTestFixtures.toolStore()
+        XCTAssertFalse(store.isToolbarAvailable)
+        let actions = NotebookToolbarActions(store: store)
+        actions.chooseInk(.pen)
+        actions.openInkRow()
+        XCTAssertFalse(store.isInkRowOpen)
+
+        let (available, owner) = availableStore()
+        let open = NotebookToolbarActions(store: available)
+        open.chooseInk(.pen)
+        XCTAssertTrue(available.isInkRowOpen)
+        available.setToolbarAvailable(false, for: owner)
+        open.chooseInk(.pen)
+        open.select(.lasso)
+        open.selectEraser()
+        open.toggleRuler()
+        XCTAssertTrue(available.isInkRowOpen, "A paused rail keeps its row as it was.")
+        available.detach(owner)
+    }
+
+    /// An Apple Pencil gesture that switches the tool leaves the second row alone, so the rail at the
+    /// page's edge never moves while the user writes; returning to the ink shows its row as it was.
+    func testPencilToolSwitchesLeaveTheSecondRowAlone() {
+        let (store, owner) = availableStore()
+        defer { store.detach(owner) }
+        NotebookToolbarActions(store: store).chooseInk(.pen)
+        XCTAssertTrue(store.isInkRowOpen)
+        store.handlePencil(.switchEraser, from: owner)
+        XCTAssertEqual(store.tool.kind, .eraser(.vector))
+        XCTAssertTrue(store.isInkRowOpen)
+        store.handlePencil(.switchEraser, from: owner)
+        XCTAssertEqual(store.tool.kind, .ink(.pen))
+        XCTAssertTrue(store.isInkRowOpen)
+        store.handlePencil(.switchPrevious, from: owner)
+        XCTAssertTrue(store.isInkRowOpen)
+    }
+
+    /// An ink's key tells VoiceOver whether its settings show on the second row and what a tap does
+    /// to them; without a second row it says nothing of one.
+    func testInkKeysDescribeTheSecondRowToAssistiveTechnologies() {
+        func rail(open: Bool, sizeClass: UserInterfaceSizeClass = .regular) -> NotebookToolbarRail {
+            NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: sizeClass, isInkRowOpen: open)
+                .rail(forHostWidth: 1_024)
+        }
+        let shown = rail(open: true).inkKeyAccessibility(isSelected: true)
+        XCTAssertEqual(shown.value, "Presets and colors shown")
+        XCTAssertEqual(shown.hint, "Hides the presets and colors.")
+        let hidden = rail(open: false).inkKeyAccessibility(isSelected: true)
+        XCTAssertEqual(hidden.value, "Presets and colors hidden")
+        XCTAssertEqual(hidden.hint, "Shows the presets and colors.")
+        for open in [false, true] {
+            let other = rail(open: open).inkKeyAccessibility(isSelected: false)
+            XCTAssertNil(other.value, "Another ink's key has no row of its own to report.")
+            XCTAssertEqual(other.hint, "Selects this ink and shows its presets and colors.")
+            let compact = rail(open: open, sizeClass: .compact).inkKeyAccessibility(isSelected: true)
+            XCTAssertNil(compact.value)
+            XCTAssertNil(compact.hint)
+        }
+    }
+
+    /// The second row eases in on a spring of about 0.3 seconds as the rail grows toward the page,
+    /// slipping a little out from under the first, and eases out the same way. Under Reduce Motion
+    /// it only fades: the rail takes its new size at once as the row opens, and only once the row
+    /// has faded as it closes.
+    func testTheSecondRowEasesInAndOutAndOnlyFadesUnderReduceMotion() {
+        let standard = NotebookInkRowTransition(reduceMotion: false)
+        XCTAssertEqual(standard.hiddenOffset(for: .horizontal), CGSize(width: 0, height: -8), "Tucked under the first row.")
+        XCTAssertEqual(standard.hiddenOffset(for: .leftEdge), CGSize(width: -8, height: 0), "Tucked toward the tools.")
+        XCTAssertEqual(standard.hiddenOffset(for: .rightEdge), CGSize(width: 8, height: 0))
+        XCTAssertEqual(standard.extent(opening: true), .spring(duration: 0.3, bounce: 0))
+        XCTAssertEqual(standard.extent(opening: false), .spring(duration: 0.3, bounce: 0))
+        XCTAssertEqual(standard.content, .spring(duration: 0.3, bounce: 0))
+
+        let reduced = NotebookInkRowTransition(reduceMotion: true)
+        for orientation in [NotebookRailOrientation.horizontal, .leftEdge, .rightEdge] {
+            XCTAssertEqual(reduced.hiddenOffset(for: orientation), .zero, "Under Reduce Motion nothing slides.")
+        }
+        XCTAssertNil(reduced.extent(opening: true), "The rail takes the open size at once, then the row fades in.")
+        XCTAssertEqual(reduced.extent(opening: false), .linear(duration: 1.0 / 60).delay(0.15), "It shrinks once the row has faded.")
+        XCTAssertEqual(reduced.content, .linear(duration: 0.15))
+    }
+
+    /// The toolbar keeps the expanded rail's room whether or not the second row shows, so opening
+    /// it never moves the rail or the page: every placement rests in the same frame and reports the
+    /// same docks, while the rail is drawn at its first row alone against the edge it rests at.
+    func testTheRailKeepsRoomForItsSecondRowAndDrawsItsFirstRowAlone() {
+        let usable = CGRect(x: 0, y: 0, width: 834, height: 1_104)
+        let placements: [EditorToolbarPlacement] = [
+            .docked(.topCenter), .docked(.leftEdge), .docked(.rightEdge), .floating(CGPoint(x: 0.5, y: 0.3)),
+        ]
+        for placement in placements {
+            var preferences = EditorToolbarPreferences.standard
+            preferences.place(placement)
+            func composition(open: Bool) -> NotebookToolbarComposition {
+                NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: .regular, isInkRowOpen: open)
+            }
+            let closed = composition(open: false).rail(in: usable.size)
+            let open = composition(open: true).rail(in: usable.size)
+            XCTAssertFalse(closed.showsInkRow, "\(placement)")
+            XCTAssertTrue(open.showsInkRow, "\(placement)")
+            XCTAssertEqual(closed.size, open.size, "\(placement): the room kept is the expanded rail's.")
+            XCTAssertEqual(
+                composition(open: false).frame(of: closed, in: usable), composition(open: true).frame(of: open, in: usable),
+                "\(placement): opening the row never moves the rail."
+            )
+            XCTAssertEqual(composition(open: false).dockSizes(in: usable.size), composition(open: true).dockSizes(in: usable.size))
+            XCTAssertEqual(open.shownSize, open.size, "\(placement): open, the whole rail shows.")
+            if placement.axis == .horizontal {
+                XCTAssertEqual(closed.shownSize, CGSize(width: closed.size.width, height: NotebookTheme.rowHeight), "\(placement)")
+                XCTAssertEqual(closed.orientation.anchor, .top)
+            } else {
+                XCTAssertEqual(closed.shownSize, CGSize(width: 96, height: closed.size.height), "\(placement)")
+            }
+        }
+        let closedSizes = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
+            .shownDockSizes(in: usable.size)
+        let openSizes = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular, isInkRowOpen: true)
+            .shownDockSizes(in: usable.size)
+        XCTAssertEqual(closedSizes.horizontal.height, NotebookTheme.rowHeight, "The top dock's target outlines one row.")
+        XCTAssertEqual(closedSizes.vertical.width, 96, "A side dock's target outlines the grip and the tools.")
+        XCTAssertEqual(openSizes, NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular).dockSizes(in: usable.size))
     }
 
     // MARK: - Swatches, folding and strips
@@ -827,48 +1229,6 @@ final class NotebookToolbarTests: XCTestCase {
             EditorInkCatalog.swatches + [colors[0]],
             "The shelf shows each colour once."
         )
-    }
-
-    // MARK: - Custom colour picker
-
-    func testColourPickerAddsOnlyTheColourShowingWhenItCloses() throws {
-        let (store, owner) = availableStore()
-        defer { store.detach(owner) }
-        let actions = NotebookToolbarActions(store: store)
-        let emissions = countToolbarEmissions(of: store)
-        let tool = store.tool
-        let pick = NotebookColorPick()
-        var closeRequests = 0
-        let coordinator = NotebookColorPicker.Coordinator(pick: pick) { closeRequests += 1 }
-        let picker = UIColorPickerViewController()
-
-        let passedThrough = (1...6).map { UIColor(red: CGFloat($0) / 10, green: 0.3, blue: 0.5, alpha: 1) }
-        for (index, color) in passedThrough.enumerated() {
-            coordinator.colorPickerViewController(picker, didSelect: color, continuously: index < passedThrough.count - 1)
-        }
-        XCTAssertEqual(emissions.count, 0, "Colours passed on the way are never stored.")
-        XCTAssertEqual(store.tool, tool, "Colours passed on the way never change the ink.")
-
-        coordinator.colorPickerViewControllerDidFinish(picker)
-        XCTAssertEqual(closeRequests, 1)
-        XCTAssertEqual(emissions.count, 0, "Finishing only closes the picker; the well keeps the colour once it has closed.")
-
-        pick.finish(with: actions)
-        let kept = NotebookSwatchShelf.color(from: try XCTUnwrap(passedThrough.last))
-        XCTAssertEqual(store.toolbar.customSwatches, [kept])
-        XCTAssertEqual(store.tool.color, kept)
-        XCTAssertEqual(emissions.count, 1)
-
-        pick.finish(with: actions)
-        XCTAssertEqual(emissions.count, 1, "A closed picker keeps its colour once.")
-
-        coordinator.colorPickerViewController(picker, didSelect: .systemTeal, continuously: false)
-        store.setToolbarAvailable(false, for: owner)
-        pick.finish(with: actions)
-        store.setToolbarAvailable(true, for: owner)
-        pick.finish(with: actions)
-        XCTAssertEqual(store.toolbar.customSwatches, [kept], "A picker closed while writing is paused changes nothing.")
-        XCTAssertEqual(emissions.count, 1)
     }
 
     // MARK: - Selection, pressed and focus states
@@ -1120,57 +1480,59 @@ final class NotebookToolbarTests: XCTestCase {
     /// The rail in the 11-inch and 12.9-inch iPads' regular-width windows, with 0, 2, 4 and 8 custom
     /// colours, at the default text size and at the rail's xxLarge limit. Larger chips widen the ink
     /// row by 47 points there, which is what moves the eleven-inch landscape rail apart from its limit.
-    func testRailWidthFollowsTheDockAndPlannedToolRules() {
+    /// One top dock, so the rail grows to the window's width inside its margins, showing the
+    /// planned tools wherever the whole group fits. A floating rail measures the same way with its
+    /// collapse key closing the first row.
+    func testRailWidthFollowsThePlannedToolRules() throws {
         struct Case {
             let width: CGFloat
             let customColors: Int
             var textSize = DynamicTypeSize.large
             let rail: CGFloat
-            let docksShared: Bool
             let showsUpcoming: Bool
         }
         let cases = [
-            Case(width: 834, customColors: 0, rail: 807, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 2, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 4, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 8, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 1_194, customColors: 0, rail: 807, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 2, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 4, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 8, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_024, customColors: 0, rail: 965, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 2, rail: 965, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 4, rail: 991, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 8, rail: 1_000, docksShared: true, showsUpcoming: true),
-            Case(width: 1_366, customColors: 0, rail: 965, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 2, rail: 965, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 4, rail: 991, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 8, rail: 1_042, docksShared: false, showsUpcoming: true),
-            Case(width: 678, customColors: 0, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 2, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 4, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 8, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 0, rail: 807, showsUpcoming: false),
+            Case(width: 834, customColors: 2, rail: 810, showsUpcoming: false),
+            Case(width: 834, customColors: 4, rail: 810, showsUpcoming: false),
+            Case(width: 834, customColors: 8, rail: 810, showsUpcoming: false),
+            Case(width: 1_194, customColors: 0, rail: 965, showsUpcoming: true),
+            Case(width: 1_194, customColors: 2, rail: 965, showsUpcoming: true),
+            Case(width: 1_194, customColors: 4, rail: 991, showsUpcoming: true),
+            Case(width: 1_194, customColors: 8, rail: 1_170, showsUpcoming: true),
+            Case(width: 1_024, customColors: 0, rail: 965, showsUpcoming: true),
+            Case(width: 1_024, customColors: 2, rail: 965, showsUpcoming: true),
+            Case(width: 1_024, customColors: 4, rail: 991, showsUpcoming: true),
+            Case(width: 1_024, customColors: 8, rail: 1_000, showsUpcoming: true),
+            Case(width: 1_366, customColors: 0, rail: 965, showsUpcoming: true),
+            Case(width: 1_366, customColors: 2, rail: 965, showsUpcoming: true),
+            Case(width: 1_366, customColors: 4, rail: 991, showsUpcoming: true),
+            Case(width: 1_366, customColors: 8, rail: 1_175, showsUpcoming: true),
+            Case(width: 678, customColors: 0, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 2, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 4, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 8, rail: 654, showsUpcoming: false),
 
-            Case(width: 834, customColors: 0, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 2, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 4, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 834, customColors: 8, textSize: .xxLarge, rail: 810, docksShared: true, showsUpcoming: false),
-            Case(width: 1_194, customColors: 0, textSize: .xxLarge, rail: 854, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 2, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 4, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_194, customColors: 8, textSize: .xxLarge, rail: 870, docksShared: false, showsUpcoming: false),
-            Case(width: 1_024, customColors: 0, textSize: .xxLarge, rail: 965, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 2, textSize: .xxLarge, rail: 965, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 4, textSize: .xxLarge, rail: 1_000, docksShared: true, showsUpcoming: true),
-            Case(width: 1_024, customColors: 8, textSize: .xxLarge, rail: 1_000, docksShared: true, showsUpcoming: true),
-            Case(width: 1_366, customColors: 0, textSize: .xxLarge, rail: 965, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 2, textSize: .xxLarge, rail: 965, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 4, textSize: .xxLarge, rail: 1_038, docksShared: false, showsUpcoming: true),
-            Case(width: 1_366, customColors: 8, textSize: .xxLarge, rail: 1_042, docksShared: false, showsUpcoming: true),
-            Case(width: 678, customColors: 0, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 2, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 4, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
-            Case(width: 678, customColors: 8, textSize: .xxLarge, rail: 654, docksShared: true, showsUpcoming: false),
+            Case(width: 834, customColors: 0, textSize: .xxLarge, rail: 810, showsUpcoming: false),
+            Case(width: 834, customColors: 2, textSize: .xxLarge, rail: 810, showsUpcoming: false),
+            Case(width: 834, customColors: 4, textSize: .xxLarge, rail: 810, showsUpcoming: false),
+            Case(width: 834, customColors: 8, textSize: .xxLarge, rail: 810, showsUpcoming: false),
+            Case(width: 1_194, customColors: 0, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_194, customColors: 2, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_194, customColors: 4, textSize: .xxLarge, rail: 1_038, showsUpcoming: true),
+            Case(width: 1_194, customColors: 8, textSize: .xxLarge, rail: 1_170, showsUpcoming: true),
+            Case(width: 1_024, customColors: 0, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_024, customColors: 2, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_024, customColors: 4, textSize: .xxLarge, rail: 1_000, showsUpcoming: true),
+            Case(width: 1_024, customColors: 8, textSize: .xxLarge, rail: 1_000, showsUpcoming: true),
+            Case(width: 1_366, customColors: 0, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_366, customColors: 2, textSize: .xxLarge, rail: 965, showsUpcoming: true),
+            Case(width: 1_366, customColors: 4, textSize: .xxLarge, rail: 1_038, showsUpcoming: true),
+            Case(width: 1_366, customColors: 8, textSize: .xxLarge, rail: 1_222, showsUpcoming: true),
+            Case(width: 678, customColors: 0, textSize: .xxLarge, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 2, textSize: .xxLarge, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 4, textSize: .xxLarge, rail: 654, showsUpcoming: false),
+            Case(width: 678, customColors: 8, textSize: .xxLarge, rail: 654, showsUpcoming: false),
         ]
         for test in cases {
             let preferences = toolbar(customColors: test.customColors)
@@ -1178,24 +1540,139 @@ final class NotebookToolbarTests: XCTestCase {
             let rail = self.rail(for: preferences, hostWidth: test.width, textSize: test.textSize)
             XCTAssertEqual(rail.size.width, test.rail, accuracy: 0.001, label)
             XCTAssertEqual(rail.size.height, 2 * NotebookTheme.rowHeight + NotebookTheme.rowSpacing, label)
-            XCTAssertEqual(rail.docksShared, test.docksShared, label)
+            XCTAssertEqual(rail.orientation, .horizontal, label)
             XCTAssertEqual(rail.showsUpcoming, test.showsUpcoming, label)
             XCTAssertEqual(rail.toolRow.slots.contains { $0.item.isPlaceholder }, test.showsUpcoming, label)
             XCTAssertEqual(
                 rail.toolRow.slots.contains { $0.item == .upcomingLabel }, test.showsUpcoming,
                 "\(label): the planned tools show as a whole group or not at all."
             )
-            let available = test.width - 2 * EditorToolbarLayout.margin
-            if test.docksShared {
-                XCTAssertLessThanOrEqual(rail.size.width, available, label)
-            } else {
-                XCTAssertGreaterThanOrEqual((available - rail.size.width) / 2, NotebookToolbarComposition.minimumDockTravel, label)
-            }
+            XCTAssertLessThanOrEqual(rail.size.width, test.width - 2 * EditorToolbarLayout.margin, label)
+            // A floating rail ends its first row with the collapse key; the planned tools yield to it
+            // where both cannot fit, and the rail grows by the key only where that row governs.
             var floating = preferences
             floating.place(.floating(CGPoint(x: 0.5, y: 0.5)))
-            XCTAssertEqual(self.rail(for: floating, hostWidth: test.width, textSize: test.textSize).size, rail.size,
-                "\(label): floating and docked rails share one width.")
+            let floatingRail = self.rail(for: floating, hostWidth: test.width, textSize: test.textSize)
+            let key = NotebookToolbarComposition.groupGap + NotebookTheme.controlSize
+            let grip = NotebookToolbarComposition.gripColumnWidth
+            let available = test.width - 2 * EditorToolbarLayout.margin
+            let inkWidth = try XCTUnwrap(rail.inkRow, label).contentWidth + NotebookToolbarComposition.inkCapWidth
+            let keepsGroup = test.showsUpcoming
+                && grip + rail.toolRow.contentWidth + NotebookTheme.stripInsets.right + key <= available
+            XCTAssertEqual(floatingRail.showsUpcoming, keepsGroup, "\(label): the planned tools yield to the collapse key.")
+            let row = floatingRail.toolRow.contentWidth + NotebookTheme.stripInsets.right + key
+            XCTAssertEqual(floatingRail.size.width, min(grip + max(row, inkWidth), available), accuracy: 0.001, label)
+            XCTAssertEqual(floatingRail.size.height, rail.size.height, label)
+            XCTAssertEqual(floatingRail.toolRowOverflows, grip + row > available + 0.5, label)
         }
+    }
+
+    /// On end at a side the rail is the grip column and two 52-point columns wide, and as tall as its
+    /// longer column up to the height below the header, on the 11-inch and 13-inch iPads in both
+    /// orientations. The planned tools show only as a whole group, and a column that cannot fit
+    /// scrolls and keeps a slot for its chevron.
+    func testVerticalRailFitsBelowTheHeaderInEveryOrientation() {
+        struct Case {
+            let name: String
+            /// The toolbar layer's height: the screen less the status bar, the header and the home indicator.
+            let height: CGFloat
+            let customColors: Int
+            let length: CGFloat
+            let showsUpcoming: Bool
+            let toolsScroll: Bool
+            let inkScrolls: Bool
+        }
+        let cases = [
+            Case(name: "11-inch portrait", height: 1_104, customColors: 0, length: 921, showsUpcoming: true, toolsScroll: false, inkScrolls: false),
+            Case(name: "11-inch portrait", height: 1_104, customColors: 8, length: 956, showsUpcoming: true, toolsScroll: false, inkScrolls: false),
+            Case(name: "11-inch landscape", height: 728, customColors: 0, length: 680, showsUpcoming: false, toolsScroll: false, inkScrolls: false),
+            Case(name: "11-inch landscape", height: 728, customColors: 2, length: 680, showsUpcoming: false, toolsScroll: false, inkScrolls: false),
+            Case(name: "11-inch landscape", height: 728, customColors: 8, length: 704, showsUpcoming: false, toolsScroll: false, inkScrolls: true),
+            Case(name: "13-inch portrait", height: 1_270, customColors: 0, length: 921, showsUpcoming: true, toolsScroll: false, inkScrolls: false),
+            Case(name: "13-inch portrait", height: 1_270, customColors: 8, length: 956, showsUpcoming: true, toolsScroll: false, inkScrolls: false),
+            Case(name: "13-inch landscape", height: 926, customColors: 0, length: 680, showsUpcoming: false, toolsScroll: false, inkScrolls: false),
+            Case(name: "13-inch landscape", height: 926, customColors: 4, length: 772, showsUpcoming: false, toolsScroll: false, inkScrolls: false),
+            Case(name: "13-inch landscape", height: 926, customColors: 8, length: 902, showsUpcoming: false, toolsScroll: false, inkScrolls: true),
+            Case(name: "short window", height: 500, customColors: 0, length: 476, showsUpcoming: false, toolsScroll: true, inkScrolls: true),
+        ]
+        for test in cases {
+            for dock in [EditorToolbarDock.leftEdge, .rightEdge] {
+                var preferences = toolbar(customColors: test.customColors)
+                preferences.place(.docked(dock))
+                let label = "\(test.name) with \(test.customColors) custom colours at the \(dock)"
+                let composition = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: .regular)
+                let usable = CGRect(x: 0, y: 0, width: 834, height: test.height)
+                let rail = composition.rail(in: usable.size)
+                XCTAssertEqual(rail.orientation, dock == .leftEdge ? .leftEdge : .rightEdge, label)
+                XCTAssertEqual(rail.size.width, 152, label)
+                XCTAssertEqual(rail.size.height, test.length, accuracy: 0.001, label)
+                XCTAssertLessThanOrEqual(rail.size.height, test.height - 2 * EditorToolbarLayout.margin, label)
+                XCTAssertEqual(rail.showsUpcoming, test.showsUpcoming, label)
+                XCTAssertEqual(rail.toolRowOverflows, test.toolsScroll, label)
+                XCTAssertEqual(rail.inkRowOverflows, test.inkScrolls, label)
+                XCTAssertEqual(rail.toolRow.slots.contains { $0.item == .upcomingLabel }, test.showsUpcoming, label)
+                let ink = try? XCTUnwrap(rail.inkRow)
+                XCTAssertTrue(
+                    ink?.slots.allSatisfy { $0.item.isDivider || $0.width == NotebookTheme.controlSize } ?? false,
+                    "\(label): every control in a column, presets included, is a square key."
+                )
+                XCTAssertEqual(composition.dockSizes(in: usable.size).vertical, rail.size, label)
+
+                let frame = composition.frame(of: rail, in: usable)
+                XCTAssertEqual(frame.midY, usable.midY, accuracy: 0.001, "\(label): centred along its edge.")
+                XCTAssertTrue(usable.insetBy(dx: 11.999, dy: 11.999).contains(frame), label)
+            }
+        }
+    }
+
+    /// At a side the rail stands on end from the screen edge toward the page, mirrored per side: the
+    /// grip against the edge, the tools beside it, and the ink column nearest the page, where the
+    /// second row opens, so the first row alone is the grip and the tools facing the page. At compact
+    /// width, where a column cannot hold the folded ink, a stored side rests at the top in rows and
+    /// keeps its side for a wider window.
+    func testSideDocksStandTheRailOnEndFromTheScreenEdgeTowardThePage() {
+        let sides: [(EditorToolbarDock, NotebookRailOrientation, [NotebookRailColumn], Alignment)] = [
+            (.leftEdge, .leftEdge, [.grip, .tools, .ink], .leading),
+            (.rightEdge, .rightEdge, [.ink, .tools, .grip], .trailing),
+        ]
+        for (dock, orientation, columns, anchor) in sides {
+            let preferences = EditorToolbarPreferences(placement: .docked(dock), isCollapsed: false, customSwatches: [])
+            let regular = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: .regular)
+            XCTAssertTrue(regular.offersSideDocks)
+            XCTAssertEqual(regular.shownDock, dock)
+            XCTAssertEqual(regular.orientation, orientation)
+            XCTAssertEqual(orientation.axis, .vertical)
+            XCTAssertEqual(orientation.columns, columns, "\(dock): from left to right")
+            XCTAssertEqual(orientation.anchor, anchor, "\(dock): drawn against the screen edge")
+            let wide = CGRect(x: 0, y: 0, width: 1_024, height: 1_290)
+            let rail = regular.rail(in: wide.size)
+            XCTAssertEqual(
+                rail.firstRowSize, CGSize(width: NotebookToolbarComposition.gripColumnWidth + NotebookTheme.rowHeight, height: rail.size.height),
+                "\(dock): the first row on end is the grip and the tool column."
+            )
+
+            let compact = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: .compact)
+            XCTAssertFalse(compact.offersSideDocks)
+            XCTAssertEqual(compact.storedDock, dock)
+            XCTAssertEqual(compact.shownDock, .topCenter)
+            XCTAssertEqual(compact.orientation, .horizontal)
+            let usable = CGRect(x: 0, y: 0, width: 507, height: 1_290)
+            XCTAssertEqual(compact.rail(in: usable.size), compact.rail(forHostWidth: 507))
+            let top = EditorToolbarLayout.frame(
+                for: .docked(.topCenter), size: compact.toolbarSize(of: compact.rail(in: usable.size)), in: usable
+            )
+            XCTAssertEqual(compact.frame(in: usable), top, "\(dock): it rests at the top.")
+            let side = EditorToolbarLayout.frame(for: .docked(dock), size: regular.toolbarSize(of: rail), in: wide)
+            XCTAssertEqual(regular.frame(in: wide), side, "\(dock): a wider window shows it at its side.")
+        }
+        let floating = NotebookToolbarComposition(
+            preferences: EditorToolbarPreferences(placement: .floating(CGPoint(x: 0.1, y: 0.5)), isCollapsed: false, customSwatches: []),
+            horizontalSizeClass: .regular
+        )
+        XCTAssertNil(floating.shownDock)
+        XCTAssertEqual(floating.orientation, .horizontal, "A floating rail always lies in rows.")
+        XCTAssertEqual(floating.orientation.columns, [])
+        XCTAssertEqual(floating.orientation.anchor, .top, "Rows open downward, below the tools.")
     }
 
     func testRowsCountEveryDividerAndChipTheyLayOut() {
@@ -1231,7 +1708,6 @@ final class NotebookToolbarTests: XCTestCase {
         )
         let rail = composition.rail(forHostWidth: 834)
         XCTAssertEqual(rail.size.width, 810)
-        XCTAssertTrue(rail.docksShared)
         XCTAssertFalse(rail.showsUpcoming)
         XCTAssertTrue(rail.inkRowOverflows)
         let row = try XCTUnwrap(rail.inkRow)
@@ -1327,7 +1803,7 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertEqual(logicalCentre(canvas).x, centre.x, accuracy: 0.5)
         XCTAssertEqual(logicalCentre(canvas).y, centre.y, accuracy: 0.5)
 
-        actions.place(.docked(.topTrailing))
+        actions.place(.docked(.rightEdge))
         try await NotebookTestFixtures.waitUntil { abs(canvas.bounds.height - (hostHeight)) < 0.5 }
         XCTAssertEqual(logicalCentre(canvas).y, centre.y, accuracy: 0.5)
         XCTAssertEqual(canvas.zoomScale, zoom, accuracy: 0.001)
@@ -1345,14 +1821,17 @@ final class NotebookToolbarTests: XCTestCase {
         host.layoutIfNeeded()
 
         let toolbar = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
-            .frame(for: fixture.store.toolbar.placement, in: host.bounds)
+            .frame(in: host.bounds)
         // The shell padding above the first row has no control, so only the toolbar's own shape claims it.
         let shellEdge = CGPoint(x: toolbar.midX, y: toolbar.minY + 2)
+        let firstRow = CGPoint(x: toolbar.midX, y: toolbar.minY + NotebookTheme.rowHeight / 2)
+        let secondRow = CGPoint(x: toolbar.midX, y: toolbar.maxY - NotebookTheme.rowHeight / 2)
         let beside = CGPoint(x: toolbar.midX, y: toolbar.maxY + 40)
 
-        for point in [CGPoint(x: toolbar.midX, y: toolbar.midY), shellEdge] {
+        for point in [firstRow, shellEdge] {
             XCTAssertFalse(fixture.hit(point).isDescendant(of: fixture.controller.view), "\(point)")
         }
+        XCTAssertTrue(fixture.hit(secondRow).isDescendant(of: canvas), "The closed second row's room leaves its touches to the canvas.")
         XCTAssertTrue(fixture.hit(beside).isDescendant(of: canvas), "Touches beside the toolbar reach the canvas.")
 
         fixture.controller.setInputGate(.failed)
@@ -1365,7 +1844,9 @@ final class NotebookToolbarTests: XCTestCase {
     }
 
     func testStripsAndGripClaimTheirOwnTouches() async throws {
-        let fixture = try await NotebookTestFixtures.mountToolbarHost()
+        let store = NotebookTestFixtures.toolStore()
+        store.setInkRowOpen(true)
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(store: store)
         defer { fixture.close() }
         let host = fixture.hosting.view!
         let strips = fixture.strips
@@ -1388,11 +1869,17 @@ final class NotebookToolbarTests: XCTestCase {
         }
 
         let toolbar = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
-            .frame(for: fixture.store.toolbar.placement, in: host.bounds)
-        let grip = CGPoint(x: toolbar.minX + NotebookToolbarComposition.gripColumnWidth / 2, y: toolbar.midY)
-        let target = fixture.hit(grip)
-        XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "The grip never passes touches to the canvas.")
-        XCTAssertFalse(strips.contains { target.isDescendant(of: $0) }, "Dragging the grip never scrolls a strip.")
+            .frame(in: host.bounds)
+        for isOpen in [true, false] {
+            store.setInkRowOpen(isOpen)
+            try await Task.sleep(for: .seconds(NotebookTheme.inkRowDuration + 0.15))
+            host.layoutIfNeeded()
+            let height = isOpen ? toolbar.height : NotebookTheme.rowHeight
+            let grip = CGPoint(x: toolbar.minX + NotebookToolbarComposition.gripColumnWidth / 2, y: toolbar.minY + height / 2)
+            let target = fixture.hit(grip)
+            XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "The grip never passes touches to the canvas.")
+            XCTAssertFalse(strips.contains { target.isDescendant(of: $0) }, "Dragging the grip never scrolls a strip.")
+        }
     }
 
     func testSceneToolbarAndCanvasShareTheSceneStore() async throws {
@@ -1596,16 +2083,18 @@ final class NotebookToolbarTests: XCTestCase {
         let frame = key.convert(key.bounds, to: shown.hosting.view)
         let rest = try await shown.settledRender()
         key.isHighlighted = true
-        var pressed = rest
         try await NotebookTestFixtures.waitUntil {
-            pressed = (try? shown.render()) ?? rest
-            return pressed.rgba != rest.rgba
+            (try? shown.render()).map { !self.differingPoints(rest, $0).isEmpty } ?? false
         }
-        let changed = differingPoints(rest, pressed)
-        XCTAssertFalse(changed.isEmpty)
-        XCTAssertTrue(changed.allSatisfy { frame.insetBy(dx: -0.5, dy: -0.5).contains($0) }, "Only the eraser key sinks.")
+        // The glass passes through a frame or two of its own as the shading appears.
+        let pressed = try await shown.settledRender()
+        XCTAssertFalse(differingPoints(rest, pressed).isEmpty)
+        // Beside the key the glass and a selected key's frosted lens may shift faintly with the
+        // shading; another key sinking would shade its well and drop its label, far more than that.
+        let sunk = differingPoints(rest, pressed, beyond: Self.glassShiftTolerance)
+        XCTAssertTrue(sunk.allSatisfy { frame.insetBy(dx: -0.5, dy: -0.5).contains($0) }, "Only the eraser key sinks.")
         key.isHighlighted = false
-        try await NotebookTestFixtures.waitUntil { (try? shown.render())?.rgba == rest.rgba }
+        try await NotebookTestFixtures.waitUntil { (try? shown.render()).map { self.differingPoints(rest, $0).isEmpty } ?? false }
     }
 
     // MARK: - Fixtures
@@ -1707,7 +2196,7 @@ final class NotebookToolbarTests: XCTestCase {
         let rail = composition.rail(forHostWidth: width)
         let content = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
             .frame(width: rail.size.width, height: rail.size.height)
-            .modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: hiding))
+            .modifier(NotebookRailFade(hiddenAmount: 0, offset: CGSize(width: 0, height: -8), isHidden: hiding))
             .disabled(disabled)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .ignoresSafeArea()
@@ -1748,11 +2237,17 @@ final class NotebookToolbarTests: XCTestCase {
         return try RenderedPixels(try XCTUnwrap(image), scale: 2)
     }
 
-    /// Points, in points, where two renders of the same size differ.
-    private func differingPoints(_ first: RenderedPixels, _ second: RenderedPixels) -> [CGPoint] {
+    /// Levels by which the rail's glass may shift beside a key whose shading changes: about half
+    /// the change a pressed well's shading makes.
+    private static let glassShiftTolerance = 16
+
+    /// Points, in points, where two renders of the same size differ by more than `tolerance` levels;
+    /// by default more than the few levels the rail's glass dithers by from one frame to the next.
+    private func differingPoints(_ first: RenderedPixels, _ second: RenderedPixels, beyond tolerance: Int = 8) -> [CGPoint] {
         guard first.rgba.count == second.rgba.count else { return [CGPoint(x: -1, y: -1)] }
         return stride(from: 0, to: first.rgba.count, by: 4).compactMap { index in
-            guard first.rgba[index..<index + 4] != second.rgba[index..<index + 4] else { return nil }
+            let differs = (index..<index + 4).contains { abs(Int(first.rgba[$0]) - Int(second.rgba[$0])) > tolerance }
+            guard differs else { return nil }
             let pixel = index / 4
             return CGPoint(x: CGFloat(pixel % first.width) / first.scale, y: CGFloat(pixel / first.width) / first.scale)
         }
@@ -1852,7 +2347,7 @@ private struct ShownRail {
             try? await Task.sleep(for: .milliseconds(100))
             guard let current = try? render() else { return nil }
             defer { previous = current }
-            return current.rgba == previous.rgba ? current : nil
+            return current.looksLike(previous) ? current : nil
         }
     }
 

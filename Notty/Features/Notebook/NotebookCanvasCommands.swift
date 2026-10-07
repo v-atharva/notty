@@ -16,7 +16,12 @@ struct NotebookCanvasControls {
     let undo: () -> Void
     let redo: () -> Void
     let setPaletteSuppressed: (Bool) -> Void
+    /// Grows the paper for a page the notebook adds on its own, as when writing reaches the foot
+    /// of the last page; the paper never moves for it.
     let applyPageCount: (Int) -> Void
+    /// Grows the paper for a page the user asked for, which the canvas brings into view. A host
+    /// that passes none has the page added as the notebook's own, and nothing scrolls to it.
+    let applyRequestedPageCount: (Int) -> Void
     let currentAvailability: () -> NotebookUndoAvailability
     let retire: (() -> Void)?
 
@@ -25,6 +30,7 @@ struct NotebookCanvasControls {
         redo: @escaping () -> Void,
         setPaletteSuppressed: @escaping (Bool) -> Void,
         applyPageCount: @escaping (Int) -> Void,
+        applyRequestedPageCount: ((Int) -> Void)? = nil,
         currentAvailability: @escaping () -> NotebookUndoAvailability = { .unavailable },
         retire: (() -> Void)? = nil
     ) {
@@ -32,6 +38,7 @@ struct NotebookCanvasControls {
         self.redo = redo
         self.setPaletteSuppressed = setPaletteSuppressed
         self.applyPageCount = applyPageCount
+        self.applyRequestedPageCount = applyRequestedPageCount ?? applyPageCount
         self.currentAvailability = currentAvailability
         self.retire = retire
     }

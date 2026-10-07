@@ -51,7 +51,8 @@ extension EditorChromeMode {
 struct NotebookMenuKey: View {
     let session: NotebookSession
     @ObservedObject var chrome: NotebookWritingChrome
-    /// The window's width and size class, which decide whether the toolbar docks can be told apart.
+    /// The window's width, which sizes the menu, and its size class, which decides whether the
+    /// toolbar's side docks are offered.
     let hostWidth: CGFloat
     let sizeClass: UserInterfaceSizeClass?
     /// True when the header is too narrow for its Redo key, which the menu then offers.
@@ -139,7 +140,7 @@ struct NotebookMenu: View {
                 separator
                 section("Toolbar position") {
                     if let store = chrome.store {
-                        NotebookToolbarPositionPicker(store: store, hostWidth: hostWidth, sizeClass: sizeClass)
+                        NotebookToolbarPositionPicker(store: store, sizeClass: sizeClass)
                     } else {
                         NotebookToolbarPositionPicker.unavailable
                     }
@@ -376,42 +377,11 @@ struct NotebookWritingViewRow: View {
 /// The four places the toolbar can sit, as segment keys. These are the grip's own placement
 /// actions made visible, so nobody has to drag.
 struct NotebookToolbarPositionPicker: View {
-    struct Segment: Identifiable {
-        let placement: EditorToolbarPlacement
-        let symbol: String
-        let label: String
-        let accessibilityLabel: String
-
-        var id: String { label }
-        /// What Voice Control answers to: the word the segment shows, then its full name.
-        var inputLabels: [String] { [label, accessibilityLabel] }
-    }
-
-    static let segments = [
-        Segment(
-            placement: .docked(.topLeading), symbol: "rectangle.inset.topleading.filled", label: "Left",
-            accessibilityLabel: "Dock top left"
-        ),
-        Segment(
-            placement: .docked(.topCenter), symbol: "rectangle.topthird.inset.filled", label: "Center",
-            accessibilityLabel: "Dock top center"
-        ),
-        Segment(
-            placement: .docked(.topTrailing), symbol: "rectangle.inset.toptrailing.filled", label: "Right",
-            accessibilityLabel: "Dock top right"
-        ),
-        Segment(
-            placement: NotebookToolbarActions.floatingPlacement, symbol: "rectangle.center.inset.filled",
-            label: "Float", accessibilityLabel: "Float"
-        ),
-    ]
+    static let segments = NotebookToolbarPlacementChoice.all
 
     @ObservedObject var store: NotebookSceneToolStore
-    let hostWidth: CGFloat
     /// The window's, which the toolbar measures with; a popover can report its own as compact.
     let sizeClass: UserInterfaceSizeClass?
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.legibilityWeight) private var legibilityWeight
 
     /// Shown before the canvas has reported its toolbar.
     static var unavailable: some View {
@@ -422,11 +392,8 @@ struct NotebookToolbarPositionPicker: View {
         let actions = NotebookToolbarActions(store: store)
         VStack(alignment: .leading, spacing: NotebookTheme.sectionSpacing) {
             Self.segmentRow(selected: store.toolbar.placement, isEnabled: actions.isEnabled) { choose($0) }
-            if Self.docksShared(
-                preferences: store.toolbar, hostWidth: hostWidth, sizeClass: sizeClass, dynamicTypeSize: dynamicTypeSize,
-                legibilityWeight: legibilityWeight
-            ) {
-                Text("In this window the docks share one place, so the toolbar sits in the center.")
+            if Self.restsAtTopInstead(preferences: store.toolbar, sizeClass: sizeClass) {
+                Text("This window is too narrow for the side docks, so the toolbar sits at the top.")
                     .font(.footnote)
                     .foregroundStyle(NotebookTheme.glyphSecondary.color)
                     .fixedSize(horizontal: false, vertical: true)
@@ -446,22 +413,15 @@ struct NotebookToolbarPositionPicker: View {
     }
 
     /// The segment that shows as selected for `placement`.
-    static func segment(for placement: EditorToolbarPlacement) -> Segment? {
+    static func segment(for placement: EditorToolbarPlacement) -> NotebookToolbarPlacementChoice? {
         segments.first { matches(placement, $0.placement) }
     }
 
-    /// Whether a docked rail in this window shares one centred slot, decided by the rail itself so
-    /// the note always agrees with what the toolbar does. The stored dock stays selected.
-    static func docksShared(
-        preferences: EditorToolbarPreferences, hostWidth: CGFloat, sizeClass: UserInterfaceSizeClass?,
-        dynamicTypeSize: DynamicTypeSize, legibilityWeight: LegibilityWeight? = nil
-    ) -> Bool {
-        var docked = preferences
-        docked.place(.docked(.topCenter))
-        return NotebookToolbarComposition(
-            preferences: docked, horizontalSizeClass: sizeClass, dynamicTypeSize: dynamicTypeSize,
-            legibilityWeight: legibilityWeight
-        ).rail(forHostWidth: hostWidth).docksShared
+    /// Whether a toolbar stored at a side rests at the top in this window, decided by the toolbar
+    /// itself so the note always agrees with what it does. The stored dock stays selected.
+    static func restsAtTopInstead(preferences: EditorToolbarPreferences, sizeClass: UserInterfaceSizeClass?) -> Bool {
+        let composition = NotebookToolbarComposition(preferences: preferences, horizontalSizeClass: sizeClass)
+        return composition.storedDock != composition.shownDock
     }
 
     private static func segmentRow(
@@ -489,12 +449,12 @@ struct NotebookToolbarPositionPicker: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
-                .accessibilityLabel(segment.accessibilityLabel)
+                .accessibilityLabel(segment.actionName)
                 .accessibilityInputLabels(segment.inputLabels)
                 .accessibilityAddTraits(isSelected ? .isSelected : [])
-                .help(segment.accessibilityLabel)
+                .help(segment.actionName)
                 .accessibilityShowsLargeContentViewer {
-                    Label(segment.accessibilityLabel, systemImage: segment.symbol)
+                    Label(segment.actionName, systemImage: segment.symbol)
                 }
             }
         }

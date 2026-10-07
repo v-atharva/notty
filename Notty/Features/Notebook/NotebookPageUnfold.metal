@@ -25,7 +25,7 @@
  * Model: the new page lies on a fixed plane; the eye is on that plane's normal through the middle of the page's top
  * edge, eyeDistance back; one glass pane, the page, is tilted about that edge, its far edge toward the eye. Per pane
  * pixel: the ray from the eye through the glass point, continued to the page; a Vogel-disk blur, rotated per pixel,
- * whose radius grows with the glass-to-page gap; light lost in proportion to the blur; the stone the page is laid on
+ * whose radius grows with the glass-to-page gap; light lost in proportion to the blur; the dark the page is laid on
  * wherever the kernel misses the page.
  *
  * Each fragment finds the pane pixel the model shows at its own point of the page, so the page stays still and only
@@ -41,7 +41,7 @@ using namespace metal;
 
 /// Laid out as NotebookPageUnfold.Uniforms.
 struct PageUnfoldUniforms {
-    float4 glass;           // sRGB stone, shown wherever the glass misses the page
+    float4 glass;           // sRGB backdrop the page is added over, shown wherever the glass misses the page
     float2 size;            // the page, in points
     float2 pixelsPerPoint;  // drawable pixels per page point
     float tilt;             // degrees
@@ -70,7 +70,7 @@ static float radians(float degrees) {
     return degrees * (M_PI_F / 180.0);
 }
 
-// The page, or beyond its edges the stone, so a sample there adds that.
+// The page, or beyond its edges the backdrop, so a sample there adds that.
 static float3 content(float2 p, constant PageUnfoldUniforms &u, texture2d<float> page, sampler paper) {
     if (p.x < 0.0 || p.y < 0.0 || p.x > u.size.x || p.y > u.size.y) return u.glass.rgb;
     return page.sample(paper, p / u.size).rgb;

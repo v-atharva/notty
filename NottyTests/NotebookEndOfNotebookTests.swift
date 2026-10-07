@@ -5,8 +5,9 @@ import UIKit
 import XCTest
 @testable import Notty
 
-/// The end of the notebook: a fling stops at the last page, a deliberate pull past it lifts the
-/// page over the end card, and a page added where the user can see it clears in with the frost.
+/// The end of the notebook: a fling overshoots and bounces as UIKit's own, showing the end card in
+/// the space it opens, and a fling that overshoots far enough, or a deliberate pull past the end,
+/// lifts the page over the card. A page added where the user can see it clears in with the frost.
 /// UIKit's own drag and deceleration cannot be driven from a hosted test, so these tests call the
 /// scroll delegate as UIKit does and move the page with offsets in between; UIKit holds offsets to
 /// whole device pixels. SwiftUI builds no accessibility elements without an assistive technology
@@ -22,57 +23,340 @@ final class NotebookEndOfNotebookTests: XCTestCase {
 
     // MARK: - Fling
 
-    func testAFlingFromAboveTheEndIsAimedAtTheEndAndStopsThere() async throws {
+    /// A fling arriving at the end is UIKit's own: never aimed, never stopped, it overshoots and
+    /// bounces back. The card shows in the space each overshoot opens, moving with the page, and a
+    /// fling too slow to carry the page the threshold past the end takes it away again on the way
+    /// back.
+    func testAFlingOvershootsAndBouncesBackNativelyWithTheCardInStep() async throws {
         let rig = try await present()
         defer { rig.close() }
         let controller = rig.controller
         let canvas = rig.canvas
+        let card = controller.endOfNotebookCard
         let end = Self.endOffset(of: canvas)
         XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5, "The page rests at its end above the home indicator.")
         XCTAssertEqual(end, canvas.contentSize.height - canvas.bounds.height + 20, accuracy: 0.5)
 
-        scroll(canvas, to: -canvas.contentInset.top)
+        scroll(canvas, to: end - 1_000)
         controller.scrollViewWillBeginDragging(canvas)
-        scroll(canvas, to: 300)
-        // However far past the end the deceleration was projected, it is aimed at the end itself.
-        for projected in [end, end + 900] {
-            XCTAssertEqual(release(controller, velocity: 9, target: projected), end, "projected to \(projected)")
+        scroll(canvas, to: end - 900)
+        // Arriving at the end at 2 points a millisecond, it overshoots by about 68 points.
+        XCTAssertEqual(release(controller, velocity: 3.8, target: end), end, "The fling's own target is UIKit's.")
+        let writes = OffsetWrites(canvas)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        decelerate(controller, through: [end - 400, end - 60, end], writes: writes)
+        XCTAssertTrue(card.isHidden, "At rest at its end the page leaves no room for the card.")
+        for overshoot in [12, 35, 58, 67, 61, 40, 18, 5] as [CGFloat] {
+            decelerate(controller, through: [end + overshoot], writes: writes)
+            XCTAssertFalse(card.isHidden, "\(overshoot) past the end: the card shows in the space opened")
+            XCTAssertEqual(card.frame.minY, rig.pageBottom + NotebookTheme.endCardGap, accuracy: 0.5,
+                "\(overshoot) past the end: the card moves with the page")
+            XCTAssertFalse(controller.isEndCardRevealed, "\(overshoot)")
         }
-        // Should UIKit carry the fling on to bounce, it stops at the end.
-        scroll(canvas, to: end - 400)
-        scroll(canvas, to: end + 45)
-        XCTAssertEqual(canvas.contentOffset.y, end, accuracy: 0.5, "The fling stops at the last page.")
+        decelerate(controller, through: [end], writes: writes)
         controller.scrollViewDidEndDecelerating(canvas)
-        XCTAssertFalse(controller.isEndCardRevealed, "A fling arriving at the end never reveals the card.")
-
-        // A tap that stops an aimed fling short of the end ends its stop as well.
-        controller.scrollViewWillBeginDragging(canvas)
-        scroll(canvas, to: end - 500)
-        XCTAssertEqual(release(controller, velocity: 9, target: end), end)
-        controller.fingerLiftObserver.onLift?()
-        scroll(canvas, to: end + 30)
-        XCTAssertEqual(canvas.contentOffset.y, end + 30, accuracy: 0.5, "Nothing halts later motion past the end.")
-        scroll(canvas, to: end)
-        XCTAssertTrue(controller.endOfNotebookCard.isHidden)
+        XCTAssertTrue(card.isHidden, "The card leaves with the page.")
+        XCTAssertFalse(controller.isEndCardRevealed, "Short of the threshold the bounce takes the card away.")
         XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
-        XCTAssertEqual(rig.pageBottom, canvas.bounds.height - 20, accuracy: 0.5, "The last page ends above the home indicator.")
+        try await assertNothingMoves(canvas, writes: writes)
     }
 
-    func testAFlingThatFallsShortOfTheEndAndADragFromTheEndAreUntouched() async throws {
+    /// A fling bound to overshoot the pull's threshold reveals the card as a pull does, adopting
+    /// its room within two frames of reaching the end, while the page still heads there at speed.
+    /// Only the room is adopted: the controller never sets the offset, and UIKit's deceleration
+    /// runs on through the end into the room untouched, out past the lifted end and back to it.
+    func testAFlingBoundToOvershootTheThresholdRevealsTheCardAsItReachesTheEnd() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let card = controller.endOfNotebookCard
+        let end = Self.endOffset(of: canvas)
+        scroll(canvas, to: end - 1_000)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 900)
+        XCTAssertEqual(release(controller, velocity: 6, target: end), end, "The fling's own target is UIKit's.")
+        let writes = OffsetWrites(canvas)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        // Frames of 100 points, as at 6 points a millisecond at 60 Hz.
+        decelerate(controller, through: Array(stride(from: end - 800, through: end - 200, by: 100)), writes: writes)
+        XCTAssertFalse(controller.isEndCardRevealed, "More than two frames short of the end.")
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+
+        decelerate(controller, through: [end - 100], writes: writes)
+        XCTAssertTrue(controller.isEndCardRevealed, "Two frames short of the end, far short of the threshold.")
+        let room = card.bounds.height + 2 * NotebookTheme.endCardGap
+        XCTAssertEqual(canvas.contentInset.bottom, 20 + room, accuracy: 0.5, "Only the room is adopted.")
+        XCTAssertTrue(card.isHidden, "The card lies below the window until the page passes the end.")
+        let lifted = end + room
+        XCTAssertEqual(Self.endOffset(of: canvas), lifted, accuracy: 0.5,
+            "UIKit's bounce now ends at the lifted end, as a pull's settles.")
+
+        decelerate(controller, through: [end], writes: writes)
+        XCTAssertTrue(controller.isEndCardRevealed, "On its way, the page keeps the room it was given.")
+        for y in [end + 95, lifted - 15, lifted + 40, lifted + 62, lifted + 30, lifted + 6, lifted] {
+            decelerate(controller, through: [y], writes: writes)
+            XCTAssertTrue(controller.isEndCardRevealed, "\(y - end) past the end")
+            XCTAssertFalse(card.isHidden, "\(y - end) past the end")
+            XCTAssertEqual(card.frame.minY, rig.pageBottom + NotebookTheme.endCardGap, accuracy: 0.5,
+                "\(y - end) past the end: the card moves with the page")
+        }
+        controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertFalse(card.isHidden)
+        XCTAssertEqual(card.frame.maxY, canvas.bounds.height - 20 - NotebookTheme.endCardGap, accuracy: 0.5,
+            "The same end state as a pull: the card whole, clear of the home indicator.")
+        try await assertNothingMoves(canvas, writes: writes)
+        XCTAssertEqual(canvas.contentOffset.y, lifted, accuracy: 0.5)
+
+        // As after a pull, scrolling back up dismisses it.
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 3)
+        XCTAssertFalse(controller.isEndCardRevealed)
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+    }
+
+    /// Whether a fling reveals the card follows how fast it reaches the end: UIKit's deceleration
+    /// sheds speed with the distance it covers, and its rubber band carries a page past the end by
+    /// `flingOvershootTime` of the speed it arrives at. Just short of the pull's threshold the
+    /// page bounces back alone; just beyond it the card is revealed.
+    func testTheRevealFollowsTheSpeedAFlingReachesTheEndWith() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+        XCTAssertEqual(NotebookViewController.flingOvershootTime, 34)
+        XCTAssertEqual(canvas.decelerationRate, .normal)
+        // Released 900 points short of the end, then 2,000 points short: each arrives at a little
+        // over 2 points a millisecond at the faster speed and a little under it at the slower.
+        for (distance, speed, reveals) in [(900, 3.85, false), (900, 4, true), (2_000, 6.05, false), (2_000, 6.2, true)]
+            as [(CGFloat, CGFloat, Bool)] {
+            let label = "\(speed) points a millisecond, \(distance) short of the end"
+            let overshoot = NotebookViewController.flingOvershoot(
+                from: end - distance, speed: speed, end: end, decelerationRate: canvas.decelerationRate
+            )
+            XCTAssertEqual(overshoot >= NotebookViewController.endRevealPull, reveals, "\(label): \(overshoot)")
+            scroll(canvas, to: end - distance - 100)
+            controller.scrollViewWillBeginDragging(canvas)
+            scroll(canvas, to: end - distance)
+            XCTAssertEqual(release(controller, velocity: speed, target: end), end, label)
+            controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+            decelerate(controller, through: [end - 40, end + 20], writes: OffsetWrites(canvas))
+            XCTAssertEqual(controller.isEndCardRevealed, reveals, label)
+            scroll(canvas, to: Self.endOffset(of: canvas))
+            controller.scrollViewDidEndDecelerating(canvas)
+            XCTAssertEqual(controller.isEndCardRevealed, reveals, label)
+            controller.scrollViewWillBeginDragging(canvas)
+            scroll(canvas, to: end - 3)
+            XCTAssertFalse(controller.isEndCardRevealed, label)
+        }
+
+        // A fling UIKit does not aim at the end never reaches it.
+        XCTAssertEqual(NotebookViewController.flingOvershoot(
+            from: end - 3_000, speed: 4, end: end, decelerationRate: canvas.decelerationRate
+        ), 0)
+    }
+
+    /// Dropped frames can carry a fling from more than two frames short of the end past it before
+    /// the room is adopted. Within the lifted end and still heading out, the room is adopted then.
+    /// Beyond the lifted end it never is: UIKit would pull the page straight back to the grown
+    /// range's end, and adopted on the way back the room would turn the page round again, so the
+    /// page bounces back without the card, as a fling short of the threshold does.
+    func testAFlingCarriedPastTheEndByDroppedFramesAdoptsTheRoomOnlyOnItsWayOut() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let card = controller.endOfNotebookCard
+        let end = Self.endOffset(of: canvas)
+        // Shown once, the card has its size.
+        scroll(canvas, to: end + 10)
+        let lifted = end + card.bounds.height + 2 * NotebookTheme.endCardGap
+        XCTAssertGreaterThan(lifted, end + NotebookViewController.endRevealPull + 40)
+
+        scroll(canvas, to: end - 1_000)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 900)
+        _ = release(controller, velocity: 6, target: end)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        var writes = OffsetWrites(canvas)
+        decelerate(controller, through: [end - 800, end - 700, end + 60], writes: writes)
+        XCTAssertTrue(controller.isEndCardRevealed, "Within the lifted end, heading out.")
+        XCTAssertEqual(Self.endOffset(of: canvas), lifted, accuracy: 0.5)
+        decelerate(controller, through: [lifted + 20, lifted], writes: writes)
+        controller.scrollViewDidEndDecelerating(canvas)
+        try await assertNothingMoves(canvas, writes: writes)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 3)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        XCTAssertFalse(controller.isEndCardRevealed)
+
+        scroll(canvas, to: end - 1_000)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 900)
+        _ = release(controller, velocity: 11, target: end)
+        writes = OffsetWrites(canvas)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        decelerate(controller, through: [end - 700, end - 500, lifted + 30, lifted + 55, lifted + 20], writes: writes)
+        XCTAssertFalse(controller.isEndCardRevealed, "Beyond the lifted end the room is never adopted.")
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+        XCTAssertFalse(card.isHidden, "The card shows in the overshoot all the same.")
+        decelerate(controller, through: [lifted - 4, end + 60, end + 10], writes: writes)
+        XCTAssertFalse(controller.isEndCardRevealed, "Nor on the way back.")
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+        decelerate(controller, through: [end], writes: writes)
+        controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertTrue(card.isHidden, "The card leaves with the page.")
+        try await assertNothingMoves(canvas, writes: writes)
+    }
+
+    /// Only a fling let go short of the end counts: a drag carried past it by hand and let go,
+    /// flung on, drifting on or heading back, springs back and takes the card with it.
+    func testAPageSpringingBackFromPastTheThresholdNeverRevealsTheCard() async throws {
         let rig = try await present()
         defer { rig.close() }
         let controller = rig.controller
         let canvas = rig.canvas
         let end = Self.endOffset(of: canvas)
 
+        for velocity in [3, 0.3, -0.5] as [CGFloat] {
+            scroll(canvas, to: end - 300)
+            controller.scrollViewWillBeginDragging(canvas)
+            scroll(canvas, to: end + 110)
+            XCTAssertEqual(release(controller, velocity: velocity, target: end), end, "\(velocity)")
+            let writes = OffsetWrites(canvas)
+            controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+            decelerate(controller, through: [end + 116, end + 118, end + 100, end + 75], writes: writes)
+            XCTAssertFalse(controller.isEndCardRevealed, "\(velocity): springing back")
+            XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5, "\(velocity)")
+            decelerate(controller, through: [end + 30, end], writes: writes)
+            controller.scrollViewDidEndDecelerating(canvas)
+            XCTAssertFalse(controller.isEndCardRevealed, "\(velocity)")
+            XCTAssertTrue(controller.endOfNotebookCard.isHidden, "\(velocity)")
+        }
+
+        // Carried past it and let go at rest: no deceleration heads out.
+        scroll(canvas, to: end - 300)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end + 100)
+        XCTAssertEqual(release(controller, velocity: 0, target: end), end)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        decelerate(controller, through: [end + 90, end + 40, end], writes: OffsetWrites(canvas))
+        XCTAssertFalse(controller.isEndCardRevealed)
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+    }
+
+    /// A fling that falls short of the end is untouched: its target, its offsets and the card.
+    func testAFlingThatFallsShortOfTheEndIsUntouched() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
         scroll(canvas, to: 400)
         controller.scrollViewWillBeginDragging(canvas)
         scroll(canvas, to: 600)
-        XCTAssertEqual(release(controller, velocity: 3, target: end - 900), end - 900, "Short of the end, native scrolling decides.")
+        XCTAssertEqual(release(controller, velocity: 3, target: end - 900), end - 900, "Native scrolling decides.")
+        let writes = OffsetWrites(canvas)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        decelerate(controller, through: [700, end - 1_100, end - 950, end - 900], writes: writes)
         controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertTrue(controller.endOfNotebookCard.isHidden)
+        XCTAssertFalse(controller.isEndCardRevealed)
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+        try await assertNothingMoves(canvas, writes: writes)
+    }
 
-        // A drag from the page resting at its end is a pull: its spring back is UIKit's own.
-        scroll(canvas, to: end)
+    /// A stroke halts a deceleration without reporting its end, so a fling's overshoot reveals
+    /// nothing once the pen is down, and the tick it readied is let go.
+    func testAStrokeEndsAFlingsClaimOnTheCard() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 900)
+        _ = release(controller, velocity: 6, target: end)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        decelerate(controller, through: [end - 800, end - 700, end - 600], writes: OffsetWrites(canvas))
+        controller.canvasViewDidBeginUsingTool(canvas)
+        scroll(canvas, to: end + 90)
+        XCTAssertFalse(controller.isEndCardRevealed)
+        XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5)
+        controller.canvasViewDidEndUsingTool(canvas)
+    }
+
+    /// A tap or a stroke that stops a fling in the frames after it adopted the card's room, before
+    /// the page reached the end, gives the room back: the fling never lifted the page, which stays
+    /// where it stopped. A stroke gives it back as it ends, as no inset shrinks under the pen.
+    func testAFlingStoppedJustShortOfTheEndGivesTheRoomBack() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+        for stop in ["tap", "stroke"] {
+            scroll(canvas, to: end - 1_000)
+            controller.scrollViewWillBeginDragging(canvas)
+            scroll(canvas, to: end - 900)
+            _ = release(controller, velocity: 6, target: end)
+            controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+            decelerate(controller, through: [end - 200, end - 100], writes: OffsetWrites(canvas))
+            XCTAssertTrue(controller.isEndCardRevealed, stop)
+            let room = canvas.contentInset.bottom
+            XCTAssertGreaterThan(room, 20, stop)
+            let writes = OffsetWrites(canvas)
+            if stop == "tap" {
+                controller.fingerLiftObserver.onLift?()
+            } else {
+                controller.canvasViewDidBeginUsingTool(canvas)
+                XCTAssertEqual(canvas.contentInset.bottom, room, "The room is kept while the pen is down.")
+                XCTAssertTrue(controller.endOfNotebookCard.isHidden, "The card lies below the screen meanwhile.")
+                try await assertNothingMoves(canvas, writes: writes)
+                // Scrolls during the stroke, at the same offset, take nothing away either.
+                controller.scrollViewDidScroll(canvas)
+                XCTAssertEqual(canvas.contentInset.bottom, room)
+                controller.canvasViewDidEndUsingTool(canvas)
+            }
+            XCTAssertFalse(controller.isEndCardRevealed, stop)
+            XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5, stop)
+            XCTAssertTrue(controller.endOfNotebookCard.isHidden, stop)
+            try await assertNothingMoves(canvas, writes: writes)
+            XCTAssertEqual(canvas.contentOffset.y, end - 100, accuracy: 0.5, "\(stop): the page stays where it stopped")
+        }
+    }
+
+    /// A tap that stops the bounce after the card was revealed leaves the page short of its
+    /// lifted end; once the finger lifts it eases there, as a pull released at rest does.
+    func testATapThatStopsTheBounceFinishesTheLift() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end - 900)
+        _ = release(controller, velocity: 6, target: end)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        decelerate(controller, through: [end, end + 80, end + 110], writes: OffsetWrites(canvas))
+        XCTAssertTrue(controller.isEndCardRevealed)
+        controller.fingerLiftObserver.onLift?()
+        let lifted = Self.endOffset(of: canvas)
+        try await NotebookTestFixtures.waitUntil { abs(canvas.contentOffset.y - lifted) < 0.5 }
+        XCTAssertTrue(controller.isEndCardRevealed)
+        XCTAssertFalse(controller.endOfNotebookCard.isHidden)
+    }
+
+    /// A drag from the page resting at its end is a pull; one from the lifted end with the card
+    /// revealed is no pull, and its own motion is UIKit's.
+    func testADragFromTheEndIsUntouchedByTheController() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+
         controller.scrollViewWillBeginDragging(canvas)
         scroll(canvas, to: end + 30)
         XCTAssertEqual(release(controller, velocity: 2, target: end + 123), end + 123)
@@ -80,21 +364,12 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         XCTAssertEqual(canvas.contentOffset.y, end + 60, accuracy: 0.5, "Nothing halts a pull's own motion.")
         controller.scrollViewDidEndDecelerating(canvas)
 
-        // With the card revealed a drag from the lifted end is no pull either, and its own motion is UIKit's.
         scroll(canvas, to: end)
         try await revealByPulling(rig)
         let lifted = Self.endOffset(of: canvas)
         controller.scrollViewWillBeginDragging(canvas)
         XCTAssertEqual(release(controller, velocity: 4, target: lifted + 123), lifted + 123)
         controller.scrollViewDidEndDecelerating(canvas)
-
-        // A drag that began above the end and carried on past it by hand springs back on its own too.
-        scroll(canvas, to: end - 300)
-        XCTAssertFalse(controller.isEndCardRevealed, "Scrolling back up dismissed the card.")
-        controller.scrollViewWillBeginDragging(canvas)
-        scroll(canvas, to: end + 50)
-        XCTAssertEqual(release(controller, velocity: 1, target: end + 77), end + 77)
-        XCTAssertFalse(controller.isEndCardRevealed)
     }
 
     // MARK: - Pull
@@ -110,14 +385,17 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         let end = Self.endOffset(of: canvas)
         XCTAssertEqual(NotebookViewController.endRevealPull, 72)
 
-        // Resting a point and a half short of the end is not resting at it.
+        // Resting a point and a half short of the end is not resting at it: the drag shows the card
+        // in the space it opens, but letting go there reveals nothing.
         scroll(canvas, to: end - 1.5)
         controller.scrollViewWillBeginDragging(canvas)
         scroll(canvas, to: end + 140)
-        XCTAssertTrue(card.isHidden, "Only a pull from the end shows the card beneath the page.")
+        XCTAssertFalse(card.isHidden)
         _ = release(controller, velocity: 0, target: end)
         XCTAssertFalse(controller.isEndCardRevealed)
+        scroll(canvas, to: end)
         controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertTrue(card.isHidden, "The card leaves with the page.")
 
         scroll(canvas, to: end)
         controller.scrollViewWillBeginDragging(canvas)
@@ -330,9 +608,12 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         XCTAssertEqual(controller.pageCount, 11)
     }
 
-    /// Tapping Add page dismisses the card and adds a page that appears where the card was, so it
-    /// clears in with the frost, without moving the page.
-    func testAddPageFromTheCardAppendsDismissesAndUnfoldsTheNewPage() async throws {
+    /// Tapping Add page dismisses the card and adds a page that appears where the card was. It
+    /// clears in with the frost while the paper scrolls on until the new page's top rests at the
+    /// top of the visible area, below the header and toolbar room, so the frost is seen clearing
+    /// down from its top edge rather than across the strip the card left; the page is taller than
+    /// that area, so its foot finishes clearing below the screen.
+    func testAddPageFromTheCardBringsTheNewPageIntoViewWhileItClears() async throws {
         let rig = try await present()
         defer { rig.close() }
         let controller = rig.controller
@@ -349,14 +630,207 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         XCTAssertFalse(controller.isEndCardRevealed)
         XCTAssertTrue(controller.endOfNotebookCard.isHidden)
         XCTAssertEqual(canvas.contentInset.bottom, 20, accuracy: 0.5, "The card's room is given up.")
-        XCTAssertEqual(canvas.contentOffset, offset, "The page never moves.")
+        XCTAssertEqual(canvas.contentOffset, offset, "Adding the page moves nothing by itself.")
         XCTAssertTrue(unfold.isPlaying, "The new page shows where the card was, so it clears in.")
+        XCTAssertTrue(controller.isBringingAddedPageIntoView)
         let layer = try XCTUnwrap(unfold.layer)
         let pageHeight = CGFloat(NotebookPaperMetrics.geometry.pageHeight)
         XCTAssertEqual(layer.frame.minY, pageHeight * 10, accuracy: 0.01)
         XCTAssertEqual(layer.frame.height, pageHeight, accuracy: 0.01)
-        let onScreen = controller.paperView.contentLayer.convert(layer.frame, to: controller.view.layer)
-        XCTAssertEqual(onScreen.minY, lastPageBottom, accuracy: 0.5, "The frost lies on the new page.")
+        func frostOnScreen() -> CGRect {
+            controller.paperView.contentLayer.convert(layer.frame, to: controller.view.layer)
+        }
+        XCTAssertEqual(frostOnScreen().minY, lastPageBottom, accuracy: 0.5, "The frost lies on the new page.")
+
+        // The page comes into view while the frost still clears.
+        try await NotebookTestFixtures.waitUntil { canvas.contentOffset.y > offset.y + 300 }
+        XCTAssertTrue(unfold.isPlaying, "The page comes into view while the frost still clears.")
+        XCTAssertEqual(frostOnScreen().minY, rig.pageBottom - pageHeight * canvas.zoomScale, accuracy: 0.5,
+            "The frost moves with its page.")
+        let started = CACurrentMediaTime()
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        XCTAssertLessThan(CACurrentMediaTime() - started, 1)
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 11), accuracy: 0.5)
+        XCTAssertEqual(frostOnScreen().minY, canvas.contentInset.top, accuracy: 0.5,
+            "The new page's top rests at the top of the visible area.")
+        XCTAssertGreaterThan(rig.pageBottom, canvas.bounds.height, "Its foot lies below the screen.")
+        XCTAssertEqual(canvas.contentOffset.x, offset.x)
+        let writes = OffsetWrites(canvas)
+        try await assertNothingMoves(canvas, writes: writes)
+    }
+
+    /// The scroll on to the new page eases off from rest however long the work of adding it held
+    /// the main thread, and comes to rest as the frost finishes clearing.
+    func testTheNewPageEasesIntoViewAndLandsAsItsFrostClears() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let unfold = try XCTUnwrap(controller.pageUnfold)
+        _ = await unfold.ready()
+        try await revealByPulling(rig)
+        let from = canvas.contentOffset.y
+        let writes = OffsetWrites(canvas)
+        XCTAssertTrue(press(controller))
+        let clearingEnd = try XCTUnwrap(unfold.clearingEnd)
+        // A busy main thread, as a slow save might keep it, holds back the first frame.
+        let busyUntil = CACurrentMediaTime() + 0.1
+        while CACurrentMediaTime() < busyUntil {}
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        let landed = CACurrentMediaTime()
+        let first = try XCTUnwrap(writes.verticalOffsets.first)
+        XCTAssertLessThan(first - from, 60, "The page eases off from rest instead of jumping.")
+        XCTAssertGreaterThan(first, from)
+        XCTAssertEqual(landed, clearingEnd, accuracy: 0.1, "The page comes to rest as the frost clears.")
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 11), accuracy: 0.5)
+        XCTAssertEqual(writes.verticalOffsets.sorted(), writes.verticalOffsets, "It never turns back.")
+    }
+
+    /// Once the new page has come to rest, the card is readied for the notebook as it now stands,
+    /// here at the page limit, so the next overshoot builds nothing beneath the moving page.
+    func testTheCardIsReadiedAgainOnceTheNewPageComesToRest() async throws {
+        let rig = try await present(pageCount: NotebookViewController.maximumPageCount - 1)
+        defer { rig.close() }
+        let controller = rig.controller
+        let card = controller.endOfNotebookCard
+        _ = await controller.pageUnfold?.ready()
+        try await revealByPulling(rig)
+        XCTAssertEqual(card.addPage, .available)
+        XCTAssertTrue(press(controller))
+        XCTAssertTrue(controller.isBringingAddedPageIntoView)
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        await NotebookTestFixtures.drainMainQueue()
+        XCTAssertEqual(card.addPage, .limitReached)
+        let bodies = card.diagnostics.bodyCount
+        let canvas = rig.canvas
+        let end = Self.endOffset(of: canvas)
+        controller.scrollViewWillBeginDragging(canvas)
+        scroll(canvas, to: end + 30)
+        XCTAssertFalse(card.isHidden)
+        XCTAssertEqual(card.diagnostics.bodyCount, bodies, "The overshoot builds nothing.")
+        scroll(canvas, to: end)
+        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+    }
+
+    /// Only a page the user asked for moves the paper: one the notebook adds on its own, as when
+    /// writing reaches the foot of the last page, appears where it lies even with the end in view.
+    func testOnlyAPageTheUserAskedForMovesThePaper() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        let unfold = try XCTUnwrap(controller.pageUnfold)
+        _ = await unfold.ready()
+        let offset = canvas.contentOffset
+        controller.setPageCount(11)
+        XCTAssertTrue(unfold.isPlaying, "The end of page 10 shows, so page 11 clears in.")
+        XCTAssertFalse(controller.isBringingAddedPageIntoView)
+        let writes = OffsetWrites(canvas)
+        try await assertNothingMoves(canvas, writes: writes)
+        XCTAssertEqual(canvas.contentOffset, offset)
+
+        // A page the user asked for is brought into view.
+        rig.scrollToEnd()
+        controller.setPageCount(12, bringingIntoView: true)
+        XCTAssertTrue(controller.isBringingAddedPageIntoView)
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 12), accuracy: 0.5)
+    }
+
+    /// A new page shorter than the visible area cannot bring its top up to the top of that area,
+    /// so the paper scrolls on only as far as its end.
+    func testANewPageShorterThanTheViewRestsAtTheEndOfThePaper() async throws {
+        let rig = try await present()
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        _ = await controller.pageUnfold?.ready()
+        zoomFullyOut(rig)
+        try await revealByPulling(rig)
+        XCTAssertTrue(press(controller))
+        XCTAssertTrue(controller.isBringingAddedPageIntoView)
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        let pageTop = CGFloat(NotebookPaperMetrics.geometry.pageHeight) * 10 * canvas.zoomScale
+        XCTAssertGreaterThan(pageTop - canvas.contentInset.top, Self.endOffset(of: canvas), "The end comes first.")
+        XCTAssertEqual(canvas.contentOffset.y, Self.endOffset(of: canvas), accuracy: 0.5)
+        XCTAssertEqual(rig.pageBottom, canvas.bounds.height - Self.chrome.bottom, accuracy: 0.5)
+    }
+
+    /// The page never moves under the pen or a finger: a stroke under way when the page is added
+    /// keeps the paper still, and a stroke, a drag or a pinch that begins while the paper scrolls
+    /// on stops it where it is.
+    func testBringingTheNewPageIntoViewNeverMovesThePageUnderAStrokeOrAFinger() async throws {
+        let rig = try await present(pageCount: 8)
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        _ = await controller.pageUnfold?.ready()
+
+        try await revealByPulling(rig)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        XCTAssertTrue(press(controller))
+        XCTAssertFalse(controller.isBringingAddedPageIntoView, "A stroke is under way.")
+        controller.canvasViewDidEndUsingTool(canvas)
+        let writes = OffsetWrites(canvas)
+        try await assertNothingMoves(canvas, writes: writes)
+
+        for interruption in ["stroke", "drag", "pinch"] {
+            rig.scrollToEnd()
+            try await revealByPulling(rig)
+            let start = canvas.contentOffset.y
+            XCTAssertTrue(press(controller), interruption)
+            XCTAssertTrue(controller.isBringingAddedPageIntoView, interruption)
+            try await NotebookTestFixtures.waitUntil { canvas.contentOffset.y > start + 20 }
+            XCTAssertTrue(controller.isBringingAddedPageIntoView, "\(interruption): still on its way")
+            switch interruption {
+            case "stroke": controller.canvasViewDidBeginUsingTool(canvas)
+            case "drag": controller.scrollViewWillBeginDragging(canvas)
+            default: controller.scrollViewWillBeginZooming(canvas, with: nil)
+            }
+            XCTAssertFalse(controller.isBringingAddedPageIntoView, interruption)
+            let stopped = OffsetWrites(canvas)
+            try await assertNothingMoves(canvas, writes: stopped)
+            switch interruption {
+            case "stroke": controller.canvasViewDidEndUsingTool(canvas)
+            case "drag": controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+            default: controller.scrollViewDidEndZooming(canvas, with: nil, atScale: canvas.zoomScale)
+            }
+        }
+        XCTAssertEqual(controller.pageCount, 12)
+    }
+
+    /// Under Reduce Motion the paper is set at once where the scroll on to the new page would come
+    /// to rest, with the page's top at the top of the visible area, while the page fades in there;
+    /// nothing moves after. Under the pen the paper stays where it lies.
+    func testUnderReduceMotionThePaperJumpsToTheNewPageAsItFadesIn() async throws {
+        let unfold = NotebookPageUnfold(prefersReducedMotion: { true })
+        _ = await unfold.ready()
+        let rig = try await present(pageUnfold: unfold)
+        defer { rig.close() }
+        let controller = rig.controller
+        let canvas = rig.canvas
+        try await revealByPulling(rig)
+        let offset = canvas.contentOffset
+        XCTAssertTrue(press(controller))
+        XCTAssertTrue(unfold.isPlaying, "The page fades in.")
+        XCTAssertFalse(controller.isBringingAddedPageIntoView, "Nothing scrolls.")
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 11), accuracy: 0.5)
+        XCTAssertEqual(canvas.contentOffset.x, offset.x)
+        let layer = try XCTUnwrap(unfold.layer)
+        let fadeTop = controller.paperView.contentLayer.convert(layer.frame, to: controller.view.layer).minY
+        XCTAssertEqual(fadeTop, canvas.contentInset.top, accuracy: 0.5, "The page fades in at the top of the visible area.")
+        let writes = OffsetWrites(canvas)
+        try await assertNothingMoves(canvas, writes: writes)
+
+        rig.scrollToEnd()
+        try await revealByPulling(rig)
+        let underPen = canvas.contentOffset
+        controller.canvasViewDidBeginUsingTool(canvas)
+        XCTAssertTrue(press(controller))
+        XCTAssertEqual(canvas.contentOffset, underPen, "A stroke is under way.")
+        controller.canvasViewDidEndUsingTool(canvas)
+        try await assertNothingMoves(canvas, writes: OffsetWrites(canvas))
+        XCTAssertEqual(controller.pageCount, 12)
     }
 
     /// The frost lies inside the paper beneath the canvas: it takes no touches, scrolls and zooms
@@ -544,16 +1018,22 @@ final class NotebookEndOfNotebookTests: XCTestCase {
 
     // MARK: - On the notebook screen
 
-    /// On the notebook screen, a ten-page notebook flung to its end rests with the last page above
-    /// the home indicator; a pull lifts it over the card, whose Add page adds the eleventh page
-    /// through the session and clears it in. The menu's Add page while reading page 5 adds the
-    /// twelfth out of sight.
-    func testTheEndOfATenPageNotebookOnTheNotebookScreen() async throws {
-        let screen = try await mountScreen(pageCount: 10)
+    /// On the notebook screen, an eight-page notebook flung to its end rests with the last page
+    /// above the home indicator; a pull lifts it over the card, whose Add page adds the ninth page
+    /// through the session. The frost plays in full on the production path: its layer goes into
+    /// the paper over the grain, it draws a frame each display frame for its whole length rather
+    /// than being cut short by the slow-frame guard, and the paper scrolls on to the new page
+    /// meanwhile. The menu's Add page with the end in view clears its page in too, and the paper
+    /// scrolls on to it from the strip under the home indicator. Writing that reaches the foot of
+    /// the last page adds the eleventh page on its own: it clears in where it lies, and the paper
+    /// never moves under the pen. From page 5 the twelfth page is simply there.
+    func testTheEndOfANotebookOnTheNotebookScreen() async throws {
+        let screen = try await mountScreen(pageCount: 8)
         defer { screen.close() }
         let controller = screen.controller
         let canvas = controller.canvasView
         let session = screen.session
+        let paper = controller.paperView
         let unfold = try XCTUnwrap(controller.pageUnfold)
         _ = await unfold.ready()
         let safeBottom = screen.window.safeAreaInsets.bottom
@@ -567,7 +1047,7 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         controller.scrollViewDidEndDecelerating(canvas)
         try await settle(screen)
         XCTAssertEqual(canvas.contentSize.height - canvas.contentOffset.y, canvas.bounds.height - safeBottom, accuracy: 0.5)
-        try capture(screen.window, name: "end-at-rest-ten-pages")
+        try capture(screen.window, name: "end-at-rest")
 
         controller.scrollViewWillBeginDragging(canvas)
         scroll(canvas, to: end + 90)
@@ -578,28 +1058,69 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         try await settle(screen)
         try capture(screen.window, name: "end-card-revealed")
 
+        let pressed = CACurrentMediaTime()
         XCTAssertTrue(press(controller))
-        XCTAssertEqual(session.pageCount, 11)
+        XCTAssertEqual(session.pageCount, 9)
         XCTAssertTrue(unfold.isPlaying)
-        try await Task.sleep(for: .milliseconds(60))
-        let inPlace = render(screen.window)
-        // The user scrolls on to the new page while it clears.
-        controller.scrollViewWillBeginDragging(canvas)
-        scroll(canvas, to: Self.endOffset(of: canvas))
-        controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
-        XCTAssertTrue(unfold.isPlaying, "Scrolling never cuts the frost short.")
-        try await Task.sleep(for: .milliseconds(40))
-        let scrolled = render(screen.window)
-        try write(inPlace, name: "unfold-after-add-page")
-        try write(scrolled, name: "unfold-midway-scrolled-to-new-page")
+        let layer = try XCTUnwrap(unfold.layer)
+        let sublayers = try XCTUnwrap(paper.contentLayer.sublayers)
+        let grain = try XCTUnwrap(sublayers.firstIndex { $0 === paper.grainLayer })
+        XCTAssertTrue(sublayers[grain + 1] === layer, "The frost is in the paper, over the grain.")
+        XCTAssertEqual(unfold.framesDrawn, 1, "The first frame shows with the page.")
+        XCTAssertTrue(controller.isBringingAddedPageIntoView)
         try await NotebookTestFixtures.waitUntil { !unfold.isPlaying }
+        let played = CACurrentMediaTime() - pressed
+        let frames = unfold.framesDrawn
+        // The clearing lasts about 950 ms; the slow-frame guard would end it within about 120 ms.
+        XCTAssertGreaterThan(played, 0.85, "The frost played its whole length.")
+        XCTAssertGreaterThan(frames, 30, "A frame drawn for each display frame.")
+        try await NotebookTestFixtures.waitUntil { !controller.isBringingAddedPageIntoView }
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 9), accuracy: 0.5,
+            "The new page's top rests at the top of the visible area.")
+        try record(["cardAddFrostSeconds": played, "cardAddFrostFrames": Double(frames)], name: "card-add-frost")
+        try await settle(screen)
+        try capture(screen.window, name: "card-add-page-arrived")
 
+        // The menu's Add page with the end in view: the new page's top lies under the home indicator.
+        scroll(canvas, to: Self.endOffset(of: canvas))
+        session.extendPaper()
+        XCTAssertEqual(session.pageCount, 10)
+        XCTAssertTrue(unfold.isPlaying, "The new page's top shows, so it clears in.")
         let pageHeight = CGFloat(NotebookPaperMetrics.geometry.pageHeight) * canvas.zoomScale
+        let newPageTop = canvas.contentSize.height - canvas.contentOffset.y - pageHeight
+        XCTAssertEqual(canvas.bounds.height - newPageTop, safeBottom, accuracy: 0.5,
+            "Only the strip under the home indicator shows the new page.")
+        XCTAssertTrue(controller.isBringingAddedPageIntoView, "The user asked for the page, so the paper scrolls on to it.")
+        try await NotebookTestFixtures.waitUntil { !unfold.isPlaying && !controller.isBringingAddedPageIntoView }
+        XCTAssertEqual(canvas.contentOffset.y, Self.arrivalOffset(of: canvas, pages: 10), accuracy: 0.5,
+            "The new page's top rests at the top of the visible area.")
+
+        // Writing at the foot of the last page with the end in view: once the stroke ends, the
+        // notebook adds a page of its own, which clears in where it lies.
+        scroll(canvas, to: Self.endOffset(of: canvas))
+        let atEnd = canvas.contentOffset
+        var stroke = NotebookTestFixtures.stroke(x: 300)
+        stroke.transform = CGAffineTransform(
+            translationX: 0, y: CGFloat(NotebookPaperMetrics.geometry.pageHeight) * (CGFloat(session.pageCount) - 0.1)
+        )
+        let writes = OffsetWrites(canvas)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        canvas.drawing = PKDrawing(strokes: canvas.drawing.strokes + [stroke])
+        controller.canvasViewDidEndUsingTool(canvas)
+        try await NotebookTestFixtures.waitUntil { session.pageCount == 11 }
+        XCTAssertEqual(controller.pageCount, 11)
+        XCTAssertTrue(unfold.isPlaying, "The new page's top shows, so it clears in.")
+        XCTAssertFalse(controller.isBringingAddedPageIntoView, "A page the notebook adds itself never moves the paper.")
+        try await NotebookTestFixtures.waitUntil { !unfold.isPlaying }
+        XCTAssertEqual(writes.changes, 0, "Nothing moved the page under the pen.")
+        XCTAssertEqual(canvas.contentOffset, atEnd)
+
         scroll(canvas, to: pageHeight * 4 + 200)
         let offset = canvas.contentOffset
         session.extendPaper()
         XCTAssertEqual(session.pageCount, 12)
         XCTAssertFalse(unfold.isPlaying, "Page 12 is out of sight from page 5.")
+        XCTAssertFalse(controller.isBringingAddedPageIntoView)
         XCTAssertEqual(canvas.contentOffset, offset)
         try await settle(screen)
         try capture(screen.window, name: "menu-add-page-on-page-five")
@@ -666,6 +1187,78 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         XCTAssertLessThan(p95, 8)
     }
 
+    /// The card is built soon after the canvas appears, so the first overshoot past the end shows
+    /// it without building its content beneath a moving page. A stroke under way puts that off
+    /// until the stroke ends.
+    func testTheCardIsBuiltBeforeThePageFirstOvershoots() async throws {
+        for writing in [false, true] {
+            let rig = try await present()
+            defer { rig.close() }
+            let controller = rig.controller
+            let canvas = rig.canvas
+            let card = controller.endOfNotebookCard
+            let end = Self.endOffset(of: canvas)
+            if writing { controller.canvasViewDidBeginUsingTool(canvas) }
+            XCTAssertEqual(card.bounds.height, 0, "\(writing): not built yet")
+            try await Task.sleep(for: .seconds(controller.endCardPreparationDelay + 0.3))
+            if writing {
+                XCTAssertEqual(card.bounds.height, 0, "Never while a stroke is under way.")
+                controller.canvasViewDidEndUsingTool(canvas)
+                XCTAssertEqual(card.bounds.height, 0, "Not within the stroke's own callback.")
+                await NotebookTestFixtures.drainMainQueue()
+            }
+            XCTAssertGreaterThan(card.bounds.height, 0, "\(writing): built")
+            XCTAssertTrue(card.isHidden, "\(writing)")
+            XCTAssertEqual(canvas.contentOffset.y, end, accuracy: 0.5, "\(writing): the page never moved")
+            let bodies = card.diagnostics.bodyCount
+            XCTAssertGreaterThan(bodies, 0, "\(writing)")
+
+            controller.scrollViewWillBeginDragging(canvas)
+            scroll(canvas, to: end + 30)
+            CATransaction.flush()
+            XCTAssertFalse(card.isHidden, "\(writing)")
+            XCTAssertEqual(card.diagnostics.bodyCount, bodies, "\(writing): the first overshoot builds nothing")
+            scroll(canvas, to: end)
+            controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        }
+    }
+
+    /// A pinch, a touch that stops a fling or a scroll to the top builds the card as it ends, on
+    /// the next turn, so a scroll on to the end soon after finds it built even where it began
+    /// before the preparation that follows the canvas's appearance. These canvases put that
+    /// preparation off past the test, so only the callbacks build the card, however busy the run.
+    /// None builds it beneath a stroke; the stroke's own end does.
+    func testTheEndOfAPinchATouchOrAScrollToTheTopBuildsTheCard() async throws {
+        let ends: [(String, @MainActor (NotebookViewController, PKCanvasView) -> Void)] = [
+            ("pinch", { $0.scrollViewDidEndZooming($1, with: nil, atScale: $1.zoomScale) }),
+            ("touch", { controller, _ in controller.fingerLiftObserver.onLift?() }),
+            ("scroll to the top", { $0.scrollViewDidScrollToTop($1) })
+        ]
+        for (name, end) in ends {
+            for writing in [false, true] {
+                let rig = try await present(endCardPreparationDelay: 600)
+                defer { rig.close() }
+                let controller = rig.controller
+                let canvas = rig.canvas
+                let card = controller.endOfNotebookCard
+                XCTAssertEqual(card.bounds.height, 0, "\(name), \(writing): not built yet")
+                if writing { controller.canvasViewDidBeginUsingTool(canvas) }
+                end(controller, canvas)
+                XCTAssertEqual(card.bounds.height, 0, "\(name), \(writing): not within the callback")
+                await NotebookTestFixtures.drainMainQueue()
+                if writing {
+                    XCTAssertEqual(card.bounds.height, 0, "\(name): never while a stroke is under way")
+                    controller.canvasViewDidEndUsingTool(canvas)
+                    await NotebookTestFixtures.drainMainQueue()
+                    XCTAssertGreaterThan(card.bounds.height, 0, "\(name): built once the stroke ends")
+                } else {
+                    XCTAssertGreaterThan(card.bounds.height, 0, "\(name): built as it ends")
+                }
+                XCTAssertTrue(card.isHidden, "\(name), \(writing)")
+            }
+        }
+    }
+
     /// While the page is pulled over the card and lifted with it, moving the card re-evaluates
     /// none of its SwiftUI content.
     func testMovingTheCardNeverBuildsItsContentAgain() async throws {
@@ -722,13 +1315,20 @@ final class NotebookEndOfNotebookTests: XCTestCase {
     }
 
     /// A canvas that adds pages as the session does, under the chrome, scrolled to its end.
-    private func present(pageCount: Int = 10, size: CGSize = NotebookEndOfNotebookTests.size) async throws -> Rig {
+    /// - Parameter endCardPreparationDelay: how long after appearing the canvas first builds the
+    ///   card, when not its own.
+    private func present(
+        pageCount: Int = 10, size: CGSize = NotebookEndOfNotebookTests.size, pageUnfold: NotebookPageUnfold? = nil,
+        endCardPreparationDelay: TimeInterval? = nil
+    ) async throws -> Rig {
         let controller = NotebookViewController(
-            pageCount: pageCount, initialDrawing: PKDrawing(), toolStore: NotebookTestFixtures.toolStore()
+            pageCount: pageCount, initialDrawing: PKDrawing(), toolStore: NotebookTestFixtures.toolStore(),
+            pageUnfold: pageUnfold
         )
+        if let endCardPreparationDelay { controller.endCardPreparationDelay = endCardPreparationDelay }
         controller.onAddPage = { [weak controller] in
             guard let controller else { return }
-            controller.setPageCount(controller.pageCount + 1)
+            controller.setPageCount(controller.pageCount + 1, bringingIntoView: true)
         }
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
         window.frame = CGRect(origin: .zero, size: size)
@@ -793,8 +1393,58 @@ final class NotebookEndOfNotebookTests: XCTestCase {
         max(-canvas.contentInset.top, canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom)
     }
 
+    /// Where the scroll on to the last of `pages`, just added, comes to rest: with its top at the
+    /// top of the visible area below the header and toolbar room, or at the end where that comes first.
+    private static func arrivalOffset(of canvas: UIScrollView, pages: Int) -> CGFloat {
+        let top = CGFloat(NotebookPaperMetrics.geometry.pageHeight) * CGFloat(pages - 1) * canvas.zoomScale
+        return min(endOffset(of: canvas), top - canvas.contentInset.top)
+    }
+
     private func scroll(_ canvas: UIScrollView, to y: CGFloat) {
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+    }
+
+    /// Moves the page through `offsets`, one frame each, as a deceleration and its bounce do, and
+    /// checks that each stays where it was put: the controller sets no offset of its own.
+    private func decelerate(
+        _ controller: NotebookViewController, through offsets: [CGFloat], writes: OffsetWrites, line: UInt = #line
+    ) {
+        let canvas = controller.canvasView
+        for y in offsets {
+            let before = writes.changes
+            scroll(canvas, to: y)
+            XCTAssertEqual(canvas.contentOffset.y, y, accuracy: 0.5, "The page stays at \(y).", line: line)
+            XCTAssertLessThanOrEqual(writes.changes - before, 1,
+                "Only the frame itself moved the page to \(y).", line: line)
+        }
+    }
+
+    /// Lets several display frames pass and checks that nothing moved the page meanwhile.
+    private func assertNothingMoves(_ canvas: UIScrollView, writes: OffsetWrites, line: UInt = #line) async throws {
+        let changes = writes.changes
+        let offset = canvas.contentOffset
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(writes.changes, changes, "The controller moved the page.", line: line)
+        XCTAssertEqual(canvas.contentOffset, offset, line: line)
+    }
+
+    /// Counts every change of the canvas's offset, whoever makes it.
+    @MainActor
+    private final class OffsetWrites {
+        private(set) var changes = 0
+        /// Each vertical offset written, in order.
+        private(set) var verticalOffsets: [CGFloat] = []
+        private var observation: NSKeyValueObservation?
+
+        init(_ canvas: UIScrollView) {
+            observation = canvas.observe(\.contentOffset, options: [.old, .new]) { [weak self] _, change in
+                guard change.oldValue != change.newValue, let y = change.newValue?.y else { return }
+                MainActor.assumeIsolated {
+                    self?.changes += 1
+                    self?.verticalOffsets.append(y)
+                }
+            }
+        }
     }
 
     /// Ends a drag as UIKit does, with `target` as the offset UIKit projects, and returns the

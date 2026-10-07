@@ -3,9 +3,9 @@ import SwiftUI
 import UIKit
 
 /// The single source of colours, metrics and typography for the notebook editor: ivory paper on
-/// a warm stone backdrop, with matte ivory-gray shells for the header and the tool rail. The
-/// editor forces the light appearance, so a tone has one value, plus an optional value for
-/// Increase Contrast.
+/// a warm stone backdrop, a matte ivory-gray shell for the header and cards, and a tool rail of
+/// the system's regular glass over the page. The editor forces the light appearance, so a tone has
+/// one value, plus an optional value for Increase Contrast.
 enum NotebookTheme {
     /// A colour defined once and read from UIKit or SwiftUI. A tone with an Increase Contrast
     /// value resolves through the trait collection, so SwiftUI views follow the setting without
@@ -144,17 +144,23 @@ enum NotebookTheme {
         standard: Tone(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.30),
         increased: Tone(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.55)
     )
-    /// Flat stone wherever there is no paper, without fibres, so nothing outside a page reads
-    /// as writable.
+    /// Flat stone beside the paper and above its head margin, without fibres, so nothing outside
+    /// a page reads as writable.
     static let backdropStone = Tone(red: 0.812, green: 0.792, blue: 0.749)
+    /// Near-black below the last page, where a pull or a fling past the end opens space for the
+    /// end card. A page added there clears in from this dark, against which its frost stands out
+    /// plainly, as it does not against light stone.
+    static let backdropBelowPaper = Tone(red: 0.043, green: 0.043, blue: 0.043)
+    /// How far the near-black reaches below the last page and to either side of it, in page
+    /// points. At the smallest zoom a narrow window shows about 7,000 page points from top to
+    /// bottom; this reaches past that even while a pinch bounces below the smallest zoom.
+    static let belowPaperReach: CGFloat = 20_000
     /// Paper continues this far above page 1, so the space reserved for the chrome, the status
     /// bar and overscroll at the top all show paper rather than stone.
     static let headMarginLength: CGFloat = 600
-    /// Gradient band below the last page; it zooms with the page, so nothing blurs per frame.
-    static let pageShadowDepth: CGFloat = 6
-    static let pageShadowOpacity: CGFloat = 0.18
-    /// Narrower, lighter bands along the page sides, seen only when the page is narrower than
-    /// the screen or pulled away from a side.
+    /// Gradient bands on the stone along the page sides, seen only when the page is narrower
+    /// than the screen or pulled away from a side; they zoom with the page, so nothing blurs per
+    /// frame. Below the page a shadow would lighten the near-black, so there is none.
     static let pageSideShadowDepth: CGFloat = 3
     static let pageSideShadowOpacity: CGFloat = 0.12
     /// Paper veil behind the status bar, so ink scrolling under the time and battery fades out.
@@ -164,8 +170,8 @@ enum NotebookTheme {
 
     // MARK: - End of notebook
 
-    /// The card a pull past the last page reveals on the stone beneath it. Its two keys sit side
-    /// by side at this width; a narrower window or a large text size stacks them.
+    /// The card a pull or a fling past the last page reveals on the near-black beneath it. Its two
+    /// keys sit side by side at this width; a narrower window or a large text size stacks them.
     static let endCardWidth: CGFloat = 440
     /// Space between the last page and the card, and between the card and the bottom chrome.
     static let endCardGap: CGFloat = 20
@@ -175,7 +181,7 @@ enum NotebookTheme {
 
     // MARK: - Panels
 
-    /// Top of the shell gradient shared by the header, the rail, handles and cards.
+    /// Top of the shell gradient shared by the header and cards.
     static let panelTop = Tone(red: 0.949, green: 0.937, blue: 0.918)
     /// Bottom of the shell gradient; the shell darkens slightly toward its lower edge.
     static let panelBottom = Tone(red: 0.886, green: 0.875, blue: 0.847)
@@ -267,8 +273,16 @@ enum NotebookTheme {
     static let shellShadow = Shadow(tone: shadowTone, radius: 8, offset: CGSize(width: 0, height: 2), opacity: 0.16)
     /// How far the shadow image reaches past the shell on every side.
     static let shellShadowBleed: CGFloat = 12
-    /// Contact shadow under small static pieces such as the reveal tab.
-    static let contactShadow = Shadow(tone: shadowTone, radius: 1, offset: CGSize(width: 0, height: 1), opacity: 0.16)
+
+    // MARK: - Glass
+
+    /// The tool rail's Liquid Glass and that of its stand-ins: the system's regular glass, as its own
+    /// toolbars use, unmodified. Its keys take the system's adaptive foreground on it, which stays
+    /// legible over the ivory paper, the ink and the black below the last page alike; the system
+    /// adapts it under Increase Contrast and Reduce Transparency.
+    static let railGlass = Glass.regular
+    /// The lens raised behind a selected key on the rail: the system's regular glass, unmodified.
+    static let selectionGlass = Glass.regular
 
     // MARK: - Header
 
@@ -377,29 +391,33 @@ enum NotebookTheme {
     /// The two ridges of the grip column.
     static let gripRidgeSize = CGSize(width: 2, height: 24)
     static let gripRidgeSpacing: CGFloat = 4
-    /// Hairline between the grip and the collapse key of a floating rail.
-    static let gripSeparatorLength: CGFloat = 20
     /// Collapsed floating rail; it is the reveal control, so both sides are at least 44 pt.
     static let collapsedHandleSize = CGSize(width: 56, height: 44)
-    /// The tool on the collapsed handle and the collapse key under a floating rail's grip.
+    /// The tool on the collapsed handle and a floating rail's collapse key.
     static let handleGlyphSize: CGFloat = 20
     /// Ink bead on the collapsed handle, showing the ink in use.
     static let handleBeadDiameter: CGFloat = 8
     /// Where the bead sits from the handle's centre, down and to the trailing side.
     static let handleBeadOffset: CGFloat = 10
-    /// The faint tab left where Focus mode hid the tools.
+    /// The faint tab left where Focus mode hid the tools, as it lies below the top dock; at a side
+    /// dock it stands on end.
     static let revealTabSize = CGSize(width: 48, height: 20)
     static let revealTabHitSize = CGSize(width: 64, height: 44)
-    static let revealTabOpacity = 0.94
     /// A hiding rail fades and rises this far, quickly, and settles back without bounce.
     static let toolsHideTravel: CGFloat = 8
     static let toolsHideDuration = 0.18
     static let toolsRevealDuration = 0.24
     /// Fades that stand in for the tools' movement under Reduce Motion, and the reveal tab's fade in.
     static let toolsFadeDuration = 0.15
+    /// The second row eases in and out on a spring of this length, slipping this far out from
+    /// under the first as it opens.
+    static let inkRowDuration = 0.3
+    static let inkRowTravel: CGFloat = 8
+    /// One frame at 60 Hz, the shortest change an animation can still delay.
+    static let frameDuration = 1.0 / 60
     /// Dock markers fade in as a drag starts.
     static let dockMarkerFadeDuration = 0.12
-    /// Opacity of the rail's content while writing is paused; the shell stays opaque.
+    /// Opacity of the rail's content while writing is paused; the glass behind it stays as it is.
     static let disabledOpacity = 0.55
     /// The same, under Increase Contrast.
     static let disabledOpacityIncreased = 0.70
@@ -429,6 +447,9 @@ enum NotebookTheme {
     static let presetDotSpacing: CGFloat = 6
     /// The selection mark inside a selected chip sits this far above the capsule's bottom.
     static let presetMarkInset: CGFloat = 3
+    /// Where a square preset key's ink bead sits from the key's centre: beside the family glyph's
+    /// foot, clear of the selection mark.
+    static let presetKeyBeadOffset = CGSize(width: 11, height: 6)
     static let swatchCheckmarkSize: CGFloat = 12
     /// Inner ring that keeps pale or mid-tone swatches defined on the shell and the well.
     static let swatchRingOpacity = 0.22
@@ -485,6 +506,152 @@ enum NotebookTheme {
     static let actionKeyPressedOpacity = 0.85
     static let statusCardWidth: CGFloat = 320
     static let statusCardMaxWidth: CGFloat = 480
+
+    // MARK: - Colour picker screen
+
+    /// Space between the screen's edges and its cards.
+    static let colorScreenMargin: CGFloat = 24
+    /// Space between the picker and the scratchpad.
+    static let colorScreenCardGap: CGFloat = 32
+    /// Space between the cards and the exit hint beneath them.
+    static let colorScreenHintGap: CGFloat = 16
+    /// The picker keeps this width where it fits, and narrows to the minimum before the
+    /// scratchpad moves below it.
+    static let colorPickerWidth: CGFloat = 400
+    static let colorPickerMinimumWidth: CGFloat = 320
+    /// The scratchpad beside the picker takes the rest of the width up to the maximum; below the
+    /// minimum it moves under the picker instead.
+    static let scratchpadMinimumWidth: CGFloat = 260
+    static let scratchpadMaximumWidth: CGFloat = 520
+    /// Under the picker, on a narrow window, the scratchpad is this tall where there is room.
+    static let scratchpadStackedHeight: CGFloat = 280
+    static let scratchpadMinimumHeight: CGFloat = 160
+    /// The sheet of paper sits this far inside the scratchpad's frame, leaving a band for the
+    /// border; the frame's radius 20 - 10 = 10 keeps the corners concentric.
+    static let scratchpadPaperInset: CGFloat = 10
+    static let scratchpadPaperCornerRadius: CGFloat = 10
+    /// Space before the scratchpad's caption, past the paper's inset.
+    static let scratchpadCaptionPadding: CGFloat = 12
+    /// The scratchpad slides in from this far beyond its place as the picker glides aside.
+    static let scratchpadEntryOffset: CGFloat = 32
+    /// The picker's glide aside on the first colour chosen, and the cross-fade that replaces it
+    /// under Reduce Motion.
+    static let colorScreenGlideDuration = 0.45
+    static let colorScreenFadeDuration = 0.25
+    /// The screen's cards fade in as it opens and everything fades out as it closes.
+    static let colorScreenEntranceDuration = 0.2
+    static let colorScreenExitDuration = 0.2
+
+    /// The picker panel, the scratchpad's frame and the shade bar: dark cards in the style of the
+    /// reference, a warm charcoal that sits apart from the stone at 9.8:1.
+    static let colorPanelFill = Tone(red: 0.137, green: 0.129, blue: 0.122)
+    /// A faint rim on the cards; the cards' own contrast with the stone defines them, so it turns
+    /// solid only under Increase Contrast.
+    static let colorPanelEdge = Tone(
+        standard: Tone(red: 1, green: 1, blue: 1, alpha: 0.10),
+        increased: Tone(red: 0.706, green: 0.690, blue: 0.663)
+    )
+    /// The title and the values typed in the fields: 14.7:1 on the panel.
+    static let colorPanelText = Tone(red: 0.980, green: 0.960, blue: 0.910)
+    /// The gray labels under the fields: 6.3:1 on the panel.
+    static let colorPanelLabel = Tone(
+        standard: Tone(red: 0.651, green: 0.635, blue: 0.608),
+        increased: Tone(red: 0.851, green: 0.835, blue: 0.808)
+    )
+    /// The fields' and keys' recessed face.
+    static let colorFieldFill = Tone(red: 0.086, green: 0.082, blue: 0.078)
+    /// The outline that marks a field or key as a control: 3.5:1 on the panel and 4.0:1 on the face.
+    static let colorFieldEdge = Tone(
+        standard: Tone(red: 0.478, green: 0.459, blue: 0.435),
+        increased: Tone(red: 0.706, green: 0.690, blue: 0.663)
+    )
+    /// A field being typed in, and a key while pressed.
+    static let colorFieldActiveEdge = colorPanelText
+    /// The ring handles: white with a dark rim inside and out, so one of the two reaches 3:1 on
+    /// any colour beneath.
+    static let colorHandleRing = Tone(red: 1, green: 1, blue: 1)
+    static let colorHandleRim = Tone(red: 0, green: 0, blue: 0, alpha: 0.6)
+
+    static let colorPanelPadding: CGFloat = 20
+    static let colorPanelSpacing: CGFloat = 18
+    static let colorKeySize: CGFloat = 44
+    static let colorKeyCornerRadius: CGFloat = 10
+    static let colorKeyGlyphSize: CGFloat = 19
+    static let colorSquareCornerRadius: CGFloat = 10
+    /// The square's height for its width where the screen has room; it gives way first, down to
+    /// its minimum, on a short window.
+    static let colorSquareAspectRatio: CGFloat = 0.62
+    static let colorSquareMinimumHeight: CGFloat = 120
+    static let colorHandleDiameter: CGFloat = 26
+    static let colorHandleRingWidth: CGFloat = 3
+    static let colorHandleRimWidth: CGFloat = 1
+    static let colorHueTrackHeight: CGFloat = 14
+    /// The slider takes touches across a full key's height, well beyond its thin track.
+    static let colorHueSliderHeight: CGFloat = 44
+    static let colorFieldHeight: CGFloat = 44
+    static let colorFieldCornerRadius: CGFloat = 8
+    static let colorFieldSpacing: CGFloat = 12
+    static let colorFieldLabelGap: CGFloat = 6
+    /// The HEX field and the alpha field take these shares of the field row; the hue, saturation
+    /// and brightness segments share the rest.
+    static let colorHexFieldShare: CGFloat = 0.3
+    static let colorAlphaFieldShare: CGFloat = 0.2
+
+    /// The shade bar along the bottom of the screen, above the home indicator.
+    static let shadeBarHeight: CGFloat = 136
+    static let shadeBarInset: CGFloat = 16
+    static let shadeBarCornerRadius: CGFloat = 20
+    static let shadeStripCornerRadius: CGFloat = 12
+    /// Eleven steps on a regular window, nine where it is narrow, so each stays a large target.
+    static let shadeStepCount = 11
+    static let compactShadeStepCount = 9
+    static let compactShadeBarWidth: CGFloat = 600
+    /// The ring on the selected step sits this far inside it.
+    static let shadeSelectionInset: CGFloat = 8
+    static let shadeSelectionCornerRadius: CGFloat = 8
+    static let shadeBarEntranceDuration = 0.4
+
+    /// The scratchpad's border: yellow while the colour is held, green once leaving would keep it.
+    /// Both sit on the charcoal frame, at 9.4:1 and 7.2:1, and differ in lightness as well as hue;
+    /// the status word beside the caption carries the state regardless.
+    static let trialTryingBorder = Tone(red: 0.976, green: 0.741, blue: 0.153)
+    static let trialReadyBorder = Tone(red: 0.298, green: 0.765, blue: 0.502)
+    /// The status glyph and word on the frame: 10.3:1 and 8.9:1.
+    static let trialTryingMark = Tone(red: 0.969, green: 0.788, blue: 0.322)
+    static let trialReadyMark = Tone(red: 0.443, green: 0.835, blue: 0.592)
+    static let trialBorderWidth: CGFloat = 3
+    /// The border runs this far inside the frame's edge, in the band around the paper.
+    static let trialBorderInset: CGFloat = 5
+    /// The border's change from yellow to green.
+    static let trialBorderTurnDuration = 0.25
+    /// Space between the caption and its status, and between the status glyph and word.
+    static let trialStatusSpacing: CGFloat = 10
+    static let trialStatusGlyphSpacing: CGFloat = 4
+
+    /// The "Color Selected" toast that rises from the border's starting point to rest above it.
+    static let colorToastHeight: CGFloat = 36
+    static let colorToastGap: CGFloat = 10
+    static let colorToastPadding: CGFloat = 14
+    static let colorToastSpacing: CGFloat = 6
+    static let colorToastStartScale: CGFloat = 0.6
+    static let colorToastEntranceDuration = 0.35
+    static let colorToastExitDuration = 0.18
+    /// The toast's checkmark on the shell: 5.2:1 at its darkest point.
+    static let colorToastCheck = Tone(red: 0.106, green: 0.400, blue: 0.235)
+
+    /// The eyedropper's loupe, which floats above the touch so the finger never hides it.
+    static let eyedropperLoupeDiameter: CGFloat = 120
+    static let eyedropperLoupeOffset: CGFloat = 96
+    /// Each point of the notebook shows this many times larger in the loupe.
+    static let eyedropperLoupeZoom: CGFloat = 6
+    static let eyedropperLoupeRingWidth: CGFloat = 8
+    static let eyedropperReticleSize: CGFloat = 10
+    static let eyedropperHintInset: CGFloat = 24
+    static let eyedropperHintPadding = UIEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+
+    static let colorFieldValue = Typeface(postScriptName: "BerkeleyMono-Medium", pointSize: 17, style: .body, weight: .medium)
+    static let colorFieldLabel = Typeface(postScriptName: "BerkeleyMono-Medium", pointSize: 12, style: .caption, weight: .medium, tracking: 0.6)
+    static let colorToastLabel = Typeface(postScriptName: "BerkeleyMono-SemiBold", pointSize: 14, style: .subheadline, weight: .semibold)
 
     // MARK: - Typography
 

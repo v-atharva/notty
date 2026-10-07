@@ -13,6 +13,9 @@ import Foundation
 /// `extent` below the hinge however tall the page is, so every page frosts alike. The page itself
 /// keeps its size; only the model's distance from the hinge is scaled.
 ///
+/// The source's motion plays slowed down by `timeScale`, so the clearing can be seen over the
+/// paper; the parity tests play it at the source's own pace.
+///
 /// Deterministic and free of timers: the renderer reports each frame it draws and draws what
 /// comes back. Angles are degrees, lengths page points and times milliseconds.
 public struct PageUnfoldTimeline: Equatable, Sendable {
@@ -103,6 +106,21 @@ public struct PageUnfoldTimeline: Equatable, Sendable {
     public static let handOffRadius = 1.5
     public static let unseenRadius = 0.25
 
+    // MARK: - Pace
+
+    /// How long the frost takes to clear down a new page, from its first frame to its last: slow
+    /// enough to follow on light paper, where the source's pace is over before it is seen, and
+    /// still under a second.
+    public static let clearingDuration = 950.0
+    /// How long the source's own frame loop takes to clear the frost at `frostExtent`, from the
+    /// panel swap where this frost starts to the end of its hand-off.
+    public static let sourceClearingDuration = 1_640.0 / 3
+    /// The source's own pace.
+    public static let sourceTimeScale = 1.0
+    /// How many times slower than the source the frost clears: about 1.74, which stretches the
+    /// source's clearing to `clearingDuration`.
+    public static let appTimeScale = clearingDuration / sourceClearingDuration
+
     // MARK: - Frame rate
 
     /// GPU time per frame above which the blur takes fewer taps.
@@ -150,6 +168,9 @@ public struct PageUnfoldTimeline: Equatable, Sendable {
     public let eyeDistance: Double
     /// Light lost per point of blur radius.
     public let darkeningPerPoint: Double
+    /// How many times slower than the source the hinge script and the tilt follower run. The
+    /// frame-rate guard keeps to real time, as it protects the frames themselves.
+    public let timeScale: Double
     public private(set) var phase = Phase.clearing
     /// The tilt drawn last.
     public private(set) var tilt: Double
@@ -165,12 +186,15 @@ public struct PageUnfoldTimeline: Equatable, Sendable {
     ///     height leaves its distances unscaled, as does an extent or a height that is not a
     ///     positive finite length.
     ///   - pointsPerMillimetre: the density the eye's distance and the darkening are converted at.
+    ///   - timeScale: how many times slower than the source the motion runs; one that is not a
+    ///     positive finite number runs it at the source's pace.
     public init(
         pageHeight: Double, extent: Double = frostExtent,
-        pointsPerMillimetre: Double = sourcePixelsPerMillimetre
+        pointsPerMillimetre: Double = sourcePixelsPerMillimetre, timeScale: Double = appTimeScale
     ) {
         self.pageHeight = pageHeight
         self.extent = extent
+        self.timeScale = timeScale > 0 && timeScale.isFinite ? timeScale : Self.sourceTimeScale
         let scale = extent / pageHeight
         // The shader divides by the scale, so it must be a usable positive number.
         distanceScale = extent > 0 && pageHeight > 0 && scale.isNormal ? scale : 1
@@ -206,8 +230,8 @@ public struct PageUnfoldTimeline: Equatable, Sendable {
         let cost = gpuTime ?? (missed ? interval : 0)
         frames += 1
         taps = Self.taps(taps, afterFrameCost: cost)
-        let target = Self.tilt(atHinge: Self.hinge(at: Self.scriptStart + elapsed))
-        tilt = Self.follow(tilt, toward: target, interval: interval)
+        let target = Self.tilt(atHinge: Self.hinge(at: Self.scriptStart + elapsed / timeScale))
+        tilt = Self.follow(tilt, toward: target, interval: interval / timeScale)
         let frame = currentFrame
         if frame.fade == 0 {
             phase = .finished
@@ -275,6 +299,32 @@ public struct PageUnfoldTimeline: Equatable, Sendable {
     public func handOff(tilt: Double) -> Double {
         let far = radius(atDistance: pageHeight, tilt: tilt)
         return Self.unit((far - Self.unseenRadius) / (Self.handOffRadius - Self.unseenRadius))
+    }
+
+    // MARK: - Arrival
+
+    /// How long the paper takes to scroll on to a page the user added: as long as its frost takes
+    /// to clear, so the page comes to rest as the clearing ends.
+    public static let arrivalDuration = clearingDuration
+    /// The response of the spring that scrolls the paper there. Critically damped, it eases off
+    /// from rest and eases to rest without overshoot. At this response the page is nearly in view
+    /// halfway through, while the frost still clears down it, moves on slowly as the clearing
+    /// ends, and is within a fifth of a percent of its rest by `arrivalDuration`, so landing it
+    /// there exactly shows no stop.
+    public static let arrivalResponse = arrivalDuration * 0.75
+
+    /// How far the paper has scrolled on to a page the user added, from 0 to 1, `elapsed` after it
+    /// was added: a critically damped spring released from rest, scaled to reach 1 at
+    /// `arrivalDuration`.
+    public static func arrivalProgress(at elapsed: Double) -> Double {
+        guard elapsed > 0 else { return 0 }
+        guard elapsed < arrivalDuration else { return 1 }
+        return spring(at: elapsed) / spring(at: arrivalDuration)
+    }
+
+    private static func spring(at elapsed: Double) -> Double {
+        let phase = 2 * .pi * elapsed / arrivalResponse
+        return 1 - (1 + phase) * exp(-phase)
     }
 
     // MARK: - Frame rate

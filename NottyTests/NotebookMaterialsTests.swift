@@ -263,16 +263,18 @@ final class NotebookMaterialsTests: XCTestCase {
                 XCTAssertFalse(edge.isHidden)
                 XCTAssertEqual(edge.backgroundColor, NotebookTheme.paperEdge.cgColor)
             }
-            XCTAssertEqual(paper.bottomShadowLayer.frame, CGRect(x: 0, y: height, width: width, height: 6))
             XCTAssertEqual(paper.leadingShadowLayer.frame, CGRect(x: -3, y: -600, width: 3, height: height + 600))
             XCTAssertEqual(paper.trailingShadowLayer.frame, CGRect(x: width, y: -600, width: 3, height: height + 600))
-            XCTAssertEqual(paper.leadingCornerShadowLayer.frame, CGRect(x: -3, y: height, width: 3, height: 6))
-            XCTAssertEqual(paper.trailingCornerShadowLayer.frame, CGRect(x: width, y: height, width: 3, height: 6))
+            let below = paper.belowPaperLayer.frame
+            XCTAssertEqual(below.minY, height, "The near-black begins at the page's foot.")
+            XCTAssertLessThanOrEqual(below.minX, -NotebookTheme.belowPaperReach)
+            XCTAssertGreaterThanOrEqual(below.maxX, width + NotebookTheme.belowPaperReach)
+            XCTAssertGreaterThanOrEqual(below.height, NotebookTheme.belowPaperReach)
+            XCTAssertFalse(paper.belowPaperLayer.isHidden)
         }
         let tone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.shadowTone.uiColor))
         for (shadow, opacity): (CAGradientLayer, CGFloat) in [
-            (paper.bottomShadowLayer, 0.18), (paper.leadingShadowLayer, 0.12), (paper.trailingShadowLayer, 0.12),
-            (paper.leadingCornerShadowLayer, 0.15), (paper.trailingCornerShadowLayer, 0.15)
+            (paper.leadingShadowLayer, 0.12), (paper.trailingShadowLayer, 0.12)
         ] {
             let colors = try XCTUnwrap(shadow.colors as? [CGColor])
             XCTAssertEqual(colors.count, 2)
@@ -288,63 +290,42 @@ final class NotebookMaterialsTests: XCTestCase {
         }
         XCTAssertEqual(paper.leadingShadowLayer.startPoint.x, 1, "the leading band is darkest at the paper")
         XCTAssertEqual(paper.trailingShadowLayer.startPoint.x, 0, "the trailing band is darkest at the paper")
-        XCTAssertEqual(paper.bottomShadowLayer.startPoint.y, 0, "the bottom band is darkest at the paper")
-        XCTAssertEqual(paper.leadingCornerShadowLayer.type, .radial)
-        XCTAssertEqual(paper.trailingCornerShadowLayer.type, .radial)
+        let layers = try XCTUnwrap(paper.contentLayer.sublayers)
+        let below = try XCTUnwrap(layers.firstIndex { $0 === paper.belowPaperLayer })
+        for edge in [paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer] {
+            XCTAssertGreaterThan(try XCTUnwrap(layers.firstIndex { $0 === edge }), below, "the edges frame the page on it")
+        }
     }
 
-    /// The bottom and side bands meet outside each lower corner of the paper. The shading must
-    /// turn the corner with no step between neighbouring pixels off the hairlines, and must not
-    /// spread past the bands' depths.
-    func testShadingTurnsTheLowerCornersWithoutAStep() async throws {
+    /// Below the last page the near-black spans the window, beside the page as under it, while the
+    /// stone runs down beside the page to its foot, with no shading on the near-black.
+    func testBelowTheLastPageTheNearBlackSpansTheWindow() async throws {
         let settings = AccessibilitySettings()
-        // Flat colours, so every step between neighbouring pixels comes from the shading.
+        // Flat colours, so every pixel off the hairlines is a backdrop or the paper.
         settings.increasesContrast = true
         let paper = NotebookPaperView(
-            frame: CGRect(x: 0, y: 0, width: 200, height: 200), accessibility: settings.source
+            frame: CGRect(x: 0, y: 0, width: 834, height: 800), accessibility: settings.source
         )
         let window = try await hostInWindow(paper)
         defer { window.close() }
+        // Half scale puts the paper edges on whole device pixels: 397 pt wide, 218.5 pt from
+        // either side, its foot 400 pt down.
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        let zoom: CGFloat = 4
+        paper.setViewport(scale: 0.5, offset: CGPoint(x: -218.5, y: 1_123 * 0.5 - 400))
+        paper.finishZoom()
         let scale = paper.traitCollection.displayScale
-        let perPoint = Int((zoom * scale).rounded())
-        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
-        for (name, cornerX, outward) in [("leading", CGFloat(0), -1), ("trailing", CGFloat(794), 1)] {
-            // The page corner lands in the middle of the view, on a device pixel boundary.
-            paper.setViewport(scale: zoom, offset: CGPoint(x: cornerX * zoom - 100, y: 1_123 * zoom - 100))
-            paper.finishZoom()
-            let pixels = try render(paper, scale: scale)
-            let corner = Int((100 * scale).rounded())
-            // The side hairline is the pixel column just outside the page and ends on the bottom
-            // hairline, the pixel row just below it.
-            let sideColumn = outward < 0 ? corner - 1 : corner
-            func isHairline(_ x: Int, _ y: Int) -> Bool {
-                (x == sideColumn && y <= corner) || (y == corner && (outward < 0 ? x > sideColumn : x < sideColumn))
+        let pixels = try render(paper, scale: scale)
+        func pixel(_ point: CGFloat) -> Int { Int((point * scale).rounded()) }
+        for x: CGFloat in [1, 100, 200] {
+            try assertColor(pixels.color(x: pixel(x), y: pixel(398)), equals: NotebookTheme.backdropStone,
+                "stone beside the page \(x) pt in, just above its foot")
+        }
+        try assertColor(pixels.color(x: pixel(417), y: pixel(398)), equals: NotebookTheme.paperIvory, "the page")
+        for x: CGFloat in [1, 100, 217, 220, 417, 614, 617, 833] {
+            for y: CGFloat in [402, 403, 412, 600, 799] {
+                try assertColor(pixels.color(x: pixel(x), y: pixel(y)), equals: NotebookTheme.backdropBelowPaper,
+                    "near-black \(x) pt in, \(y) pt down")
             }
-            var largestStep = 0.0
-            for y in (corner - perPoint)..<(corner + 8 * perPoint) {
-                for x in (corner - 4 * perPoint)..<(corner + 4 * perPoint) where !isHairline(x, y) {
-                    for (nextX, nextY) in [(x + 1, y), (x, y + 1)] where !isHairline(nextX, nextY) {
-                        let first = pixels.color(x: x, y: y), second = pixels.color(x: nextX, y: nextY)
-                        largestStep = max(
-                            largestStep, abs(first.red - second.red), abs(first.green - second.green),
-                            abs(first.blue - second.blue)
-                        )
-                    }
-                }
-            }
-            XCTAssertLessThan(largestStep, 0.03, "the shading turns the \(name) corner without a step")
-            let nearCorner = pixels.color(x: sideColumn + outward, y: corner + 1)
-            XCTAssertGreaterThan(stone.red - nearCorner.red, 0.05, "the \(name) corner is shaded")
-            try assertColor(
-                pixels.color(x: sideColumn + outward * (3 * perPoint + 2), y: corner + 3 * perPoint),
-                equals: NotebookTheme.backdropStone, "beside the \(name) corner, past the side band"
-            )
-            try assertColor(
-                pixels.color(x: sideColumn + outward * perPoint, y: corner + 6 * perPoint + 2),
-                equals: NotebookTheme.backdropStone, "below the \(name) corner, past the bottom band"
-            )
         }
     }
 
@@ -369,7 +350,7 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    func testZoomedOutPaperSitsOnStoneWithEdgesAndShading() async throws {
+    func testZoomedOutPaperSitsOnStoneAndNearBlackWithEdgesAndShading() async throws {
         let settings = AccessibilitySettings()
         settings.increasesContrast = true
         let paper = NotebookPaperView(
@@ -396,14 +377,14 @@ final class NotebookMaterialsTests: XCTestCase {
         try assertColor(row(pixel(98)), equals: NotebookTheme.paperIvory, "the head margin above page 1")
         try assertColor(row(pixel(20)), equals: NotebookTheme.paperIvory, "the head margin reaches the top")
         try assertColor(row(pixel(661.5) - 1), equals: NotebookTheme.paperIvory, "inside the bottom edge")
-        try assertColor(row(pixel(661.5) + 7), equals: NotebookTheme.backdropStone, "below the shading")
+        try assertColor(row(pixel(663)), equals: NotebookTheme.backdropBelowPaper, "near-black below the edge")
+        try assertColor(row(pixel(661.5) + 7), equals: NotebookTheme.backdropBelowPaper, "unshaded")
 
         let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
         let ivory = try XCTUnwrap(SRGBPixels.components(NotebookTheme.paperIvory.uiColor))
         for (name, edge, shade) in [
             ("leading", column(pixel(218.5) - 1), column(pixel(218.5) - 2)),
-            ("trailing", column(pixel(615.5)), column(pixel(615.5) + 1)),
-            ("bottom", row(pixel(661.5)), row(pixel(661.5) + 1))
+            ("trailing", column(pixel(615.5)), column(pixel(615.5) + 1))
         ] {
             let contrast = SRGBPixels.contrastRatio(edge, stone)
             XCTAssertGreaterThan(contrast, 1.8, "the \(name) edge shows against the stone")
@@ -416,7 +397,12 @@ final class NotebookMaterialsTests: XCTestCase {
         let pageTop = SRGBPixels.mean(of: [row(pixel(100) - 1), row(pixel(100))])
         let dividerContrast = SRGBPixels.contrastRatio(pageTop, ivory)
         XCTAssertGreaterThan(dividerContrast, 1.03, "a divider marks the top of page 1")
-        XCTAssertLessThan(dividerContrast, SRGBPixels.contrastRatio(row(pixel(661.5)), ivory), "fainter than the edge")
+        XCTAssertLessThan(dividerContrast, SRGBPixels.contrastRatio(column(pixel(218.5) - 1), ivory), "fainter than the edge")
+        let bottomEdge = row(pixel(661.5))
+        let nearBlack = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropBelowPaper.uiColor))
+        XCTAssertGreaterThan(SRGBPixels.relativeLuminance(bottomEdge), SRGBPixels.relativeLuminance(nearBlack),
+            "the bottom edge frames the page on the near-black")
+        XCTAssertLessThan(SRGBPixels.relativeLuminance(bottomEdge), SRGBPixels.relativeLuminance(ivory))
     }
 
     /// The paper must never show a band of stone above page 1. Drives the real controller at
@@ -556,16 +542,16 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertLessThan(before.meanDifference(to: after), 0.001)
     }
 
-    func testSpaceBeyondThePaperEndIsPlainStone() async throws {
+    func testSpaceBeyondThePaperEndIsPlainNearBlack() async throws {
         await ready(.shared)
         let size = CGSize(width: 300, height: 500)
         let paper = NotebookPaperView(frame: CGRect(origin: .zero, size: size), accessibility: AccessibilitySettings().source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        // 10 pt past the end of the paper, clear of its shading.
+        // 10 pt past the end of the paper, clear of its edge.
         paper.setViewport(scale: 1, offset: CGPoint(x: 0, y: 1_133))
         let pixels = try render(paper, scale: 2)
         XCTAssertLessThan(pixels.luminanceRange, 0.001, "No fibres past the paper, so it never reads as writable.")
-        try assertMeanColor(of: pixels, equals: NotebookTheme.backdropStone)
+        try assertMeanColor(of: pixels, equals: NotebookTheme.backdropBelowPaper)
     }
 
     func testBackdropStaysPlainStoneWhateverTheMaterialsAndSettings() async throws {
@@ -613,6 +599,7 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertEqual(paper.headMarginLayer.backgroundColor, NotebookTheme.paperIvory.cgColor)
         XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
         XCTAssertTrue(NotebookPaperView.backdropColor === NotebookTheme.backdropStone.uiColor)
+        XCTAssertEqual(paper.belowPaperLayer.backgroundColor, NotebookTheme.backdropBelowPaper.cgColor)
         let traits = paper.traitCollection
         XCTAssertEqual(paper.edgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor(for: traits))
         XCTAssertEqual(paper.leadingEdgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor(for: traits))
@@ -803,8 +790,10 @@ final class NotebookMaterialsTests: XCTestCase {
     }
 
     /// The card is the panel shell: lit along its top and shaded along its foot, with rounded
-    /// corners and the baked shadow beneath it. Under Increase Contrast it turns flat with a dark
-    /// outline and keeps its shadow, following the setting while shown.
+    /// corners. On the near-black below the page it stands out far past the 3:1 a control's
+    /// boundary needs, and the shell's baked umber shadow lifts the near-black around it too
+    /// little to show as a halo. Under Increase Contrast it turns flat with a dark outline,
+    /// following the setting while shown.
     func testEndCardIsTheShellAndTurnsFlatWithAnOutlineUnderIncreaseContrast() async throws {
         let fixture = try await presentCardRevealed()
         defer { fixture.close() }
@@ -821,19 +810,27 @@ final class NotebookMaterialsTests: XCTestCase {
         let outline = try XCTUnwrap(SRGBPixels.components(
             NotebookTheme.panelLowerEdge.uiColor.resolvedColor(with: UITraitCollection(accessibilityContrast: .high))
         ))
-        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
+        let nearBlack = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropBelowPaper.uiColor))
+        func assertOnTheNearBlack(_ render: CardRender, _ name: String) {
+            assertColor(render.color(at: beyond), matches: nearBlack, "\(name): the card lies on the near-black")
+            XCTAssertLessThan(
+                SRGBPixels.difference(render.color(at: below), render.color(at: beyond)), 0.02,
+                "\(name): no halo beneath the card"
+            )
+            XCTAssertGreaterThan(
+                SRGBPixels.contrastRatio(render.color(at: face), render.color(at: beyond)), 10,
+                "\(name): the card stands out"
+            )
+        }
 
         let standard = try renderCard(of: controller, margin: 24)
         assertColor(standard.color(at: face), matches: shell, "the shell")
         assertColor(standard.color(at: side), matches: shell, "no edge down the sides")
         XCTAssertLessThan(
             SRGBPixels.relativeLuminance(standard.color(at: CGPoint(x: 0.25, y: 0.25))),
-            SRGBPixels.relativeLuminance(stone) + 0.005, "The corners are rounded."
+            SRGBPixels.relativeLuminance(nearBlack) + 0.01, "The corners are rounded."
         )
-        XCTAssertLessThan(
-            SRGBPixels.relativeLuminance(standard.color(at: below)),
-            SRGBPixels.relativeLuminance(standard.color(at: beyond)) - 0.005, "The shadow lies beneath the card."
-        )
+        assertOnTheNearBlack(standard, "standard")
         for contrast in [UIAccessibilityContrast.high, .normal] {
             controller.traitOverrides.accessibilityContrast = contrast
             try await NotebookTestFixtures.waitUntil {
@@ -849,10 +846,7 @@ final class NotebookMaterialsTests: XCTestCase {
                 return render.flatMap { Self.matches($0.color(at: face), expected) ? $0 : nil }
             }
             assertColor(render.color(at: side), matches: increased ? outline : shell, "\(name): side")
-            XCTAssertLessThan(
-                SRGBPixels.relativeLuminance(render.color(at: below)),
-                SRGBPixels.relativeLuminance(render.color(at: beyond)) - 0.005, "\(name): the shadow stays"
-            )
+            assertOnTheNearBlack(render, name)
         }
     }
 
@@ -1147,11 +1141,10 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    /// The page-top divider, the edges and the shading around the paper.
+    /// The page-top divider, the edges, the shading beside the paper and the near-black below it.
     private static func linesAndShading(of paper: NotebookPaperView) -> [CALayer] {
         [paper.pageTopLayer, paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer]
-            + [paper.bottomShadowLayer, paper.leadingShadowLayer, paper.trailingShadowLayer]
-            + [paper.leadingCornerShadowLayer, paper.trailingCornerShadowLayer]
+            + [paper.leadingShadowLayer, paper.trailingShadowLayer, paper.belowPaperLayer]
     }
 
     private static func endOffset(of canvas: UIScrollView) -> CGFloat {

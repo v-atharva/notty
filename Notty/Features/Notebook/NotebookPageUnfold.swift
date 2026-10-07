@@ -24,9 +24,9 @@ import UIKit
 /// `finish()` cuts to the end, for instance when the canvas is torn down.
 @MainActor
 final class NotebookPageUnfold {
-    /// Under Reduce Motion the page's arrival is a fade from the stone to the page instead of the
-    /// frost's sweep down it, as the header and tools only fade there. The new page still reads
-    /// as new, without movement.
+    /// Under Reduce Motion the page's arrival is a fade to the page from the near-black it is
+    /// added over, instead of the frost's sweep down it, as the header and tools only fade there.
+    /// The new page still reads as new, without movement.
     static let reducedMotionFadeDuration: CFTimeInterval = 0.15
     /// Frames the GPU may hold at once. Past this a display frame is skipped rather than wait for a
     /// drawable on the main thread, so a busy GPU shows up as a slow frame.
@@ -70,17 +70,25 @@ final class NotebookPageUnfold {
     private let queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState?
     private var preparation: Task<Void, Never>?
-    private let prefersReducedMotion: @MainActor () -> Bool
+    private let readsReducedMotion: @MainActor () -> Bool
     private let accounting = FrameAccounting()
     private var playback: Playback?
     private var displayLink: CADisplayLink?
 
     var isPlaying: Bool { playback != nil }
+    /// When the frost now playing will have cleared, unless it is cut short; nil without one.
+    var clearingEnd: CFTimeInterval? {
+        guard let playback, case .frost = playback.mode else { return nil }
+        return playback.start + PageUnfoldTimeline.clearingDuration / 1_000
+    }
+    /// Whether Reduce Motion is on, read afresh: a page then fades in where it lies, and nothing
+    /// scrolls to show it.
+    var prefersReducedMotion: Bool { readsReducedMotion() }
     /// Whether the shaders are ready to draw the frost; until they are, a page simply appears.
     var isReady: Bool { pipeline != nil }
     /// Whether a `play` now would draw the frost over its source. Reduce Motion's fade, and a
     /// play that shows nothing, need none, so the caller can skip drawing one.
-    var needsSource: Bool { device != nil && isReady && !prefersReducedMotion() }
+    var needsSource: Bool { device != nil && isReady && !prefersReducedMotion }
 
     /// - Parameters:
     ///   - device: the GPU to draw with; nil where there is no Metal, and then nothing ever plays.
@@ -90,7 +98,7 @@ final class NotebookPageUnfold {
         prefersReducedMotion: @escaping @MainActor () -> Bool = { UIAccessibility.isReduceMotionEnabled }
     ) {
         self.device = device
-        self.prefersReducedMotion = prefersReducedMotion
+        readsReducedMotion = prefersReducedMotion
         queue = device?.makeCommandQueue()
         guard let device else { return }
         // The shaders compile off the main thread, so creating the frost never holds up a notebook.
@@ -134,9 +142,9 @@ final class NotebookPageUnfold {
             return false
         }
         let start = CACurrentMediaTime()
-        if prefersReducedMotion() {
+        if prefersReducedMotion {
             let layer = install(page: page, in: host, above: sibling)
-            withoutActions { layer.backgroundColor = NotebookTheme.backdropStone.cgColor }
+            withoutActions { layer.backgroundColor = NotebookTheme.backdropBelowPaper.cgColor }
             let fade = Playback.Mode.fade(opacity: 1, duration: Self.reducedMotionFadeDuration, start: start)
             playback = Playback(mode: fade, pageSize: page.size, start: start, lastFrame: start, completion: completion)
             startDisplayLink()
@@ -327,10 +335,10 @@ final class NotebookPageUnfold {
         return try? await device.makeRenderPipelineState(descriptor: descriptor)
     }
 
-    /// The stone the page is laid on, shown wherever the glass misses the page.
+    /// The near-black the page is added over, shown wherever the glass misses the page.
     private static var glass: SIMD4<Float> {
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-        NotebookTheme.backdropStone.uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        NotebookTheme.backdropBelowPaper.uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return SIMD4(Float(red), Float(green), Float(blue), 1)
     }
 
