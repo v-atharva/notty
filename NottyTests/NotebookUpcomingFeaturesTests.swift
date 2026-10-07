@@ -275,7 +275,7 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         window.makeKeyAndVisible()
         do {
             var controller: NotebookViewController?
-            try await NotebookTestFixtures.waitUntil(seconds: 10) {
+            try await NotebookTestFixtures.waitUntil {
                 controller = NotebookTestFixtures.notebookController(in: hosting)
                 return controller?.isCanvasVisible == true && store.isToolbarAvailable
             }

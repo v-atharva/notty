@@ -31,10 +31,8 @@ final class NotebookLimitsTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while session.canvasOwnerID == nil || notebookController(in: hosting)?.isCanvasVisible != true {
-            guard ContinuousClock.now < deadline else { throw FixtureFailure.readiness }
-            try await Task.sleep(for: .milliseconds(5))
+        try await NotebookTestFixtures.waitUntil {
+            session.canvasOwnerID != nil && self.notebookController(in: hosting)?.isCanvasVisible == true
         }
         hosting.view.layoutIfNeeded()
         let owner = try XCTUnwrap(session.canvasOwnerID)
@@ -152,8 +150,6 @@ final class NotebookLimitsTests: XCTestCase {
         }
         return nil
     }
-
-    private enum FixtureFailure: Error { case readiness }
 }
 
 private actor LimitsSaveTrace {

@@ -45,10 +45,9 @@ final class NotebookSaveThroughputTests: XCTestCase {
         XCTAssertNotNil(forwarded.openForEditing)
         XCTAssertNotNil(forwarded.captureHistoryPin)
         XCTAssertNotNil(forwarded.auditHistory)
-        try await requireReady {
-            if case .verified = session.integrityModel.state { return true }
-            return false
-        }
+        // The opening audit reads all 2,000 stroke assets at utility priority, far longer than other waits.
+        try await NotebookTestFixtures.waitUntil(seconds: 60) { session.integrityModel.state != .checking }
+        XCTAssertEqual(session.integrityModel.state, .verified(revisions: first.sequence))
         let seed = session.makeCanvasSeed()
         let controller = NotebookViewController(
             pageCount: seed.pageCount, initialDrawing: seed.drawing
@@ -80,13 +79,13 @@ final class NotebookSaveThroughputTests: XCTestCase {
         )
         controller.onDetach = { session.detachCanvas(ownerID: seed.ownerID) }
         controller.setInputGate(session.inputGate)
-        let window = present(controller)
+        let window = try NotebookTestFixtures.window(showing: controller)
         var didTearDown = false
         defer {
             if !didTearDown { controller.tearDown() }
             window.isHidden = true
         }
-        try await requireReady {
+        try await NotebookTestFixtures.waitUntil {
             controller.view.window === window && controller.canvasView.isFirstResponder
                 && controller.canvasView.delegate === controller
                 && session.canvasOwnerID == seed.ownerID
@@ -139,7 +138,7 @@ final class NotebookSaveThroughputTests: XCTestCase {
             let admissionStarted = clock.now
             if !session.canEdit {
                 blockedOffers += 1
-                try await requireReady { session.canEdit }
+                try await NotebookTestFixtures.waitUntil { session.canEdit }
             }
             admissionWaits.append(ThroughputMetrics.microseconds(
                 admissionStarted.duration(to: clock.now)
@@ -163,7 +162,9 @@ final class NotebookSaveThroughputTests: XCTestCase {
             controller.canvasView.drawing = sourceDrawing
             controller.view.layoutIfNeeded()
             CATransaction.flush()
-            let completion = await XCTWaiter.fulfillment(of: [callback], timeout: 5)
+            let completion = await XCTWaiter.fulfillment(
+                of: [callback], timeout: NotebookTestFixtures.readinessTimeout
+            )
             guard completion == .completed else { throw ThroughputFailure.readiness }
             try await waitForRenderedFrames()
             XCTAssertGreaterThan(observed.count, countBefore)
@@ -300,31 +301,8 @@ final class NotebookSaveThroughputTests: XCTestCase {
         let link = CADisplayLink(target: waiter, selector: #selector(ThroughputFrameWaiter.advance(_:)))
         link.add(to: .main, forMode: .common)
         defer { link.invalidate() }
-        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 5)
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: NotebookTestFixtures.readinessTimeout)
         guard result == .completed else { throw ThroughputFailure.readiness }
-    }
-
-    private func requireReady(_ predicate: () -> Bool) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(5))
-        while !predicate() {
-            guard clock.now < deadline else { throw ThroughputFailure.readiness }
-            try await clock.sleep(for: .milliseconds(5))
-        }
-    }
-
-    private func present(_ controller: NotebookViewController) -> UIWindow {
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
-        window.rootViewController = controller
-        window.makeKeyAndVisible()
-        controller.view.layoutIfNeeded()
-        return window
     }
 
     private func verifyArchivedState(

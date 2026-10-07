@@ -20,17 +20,21 @@ final class NotebookSceneToolStore: ObservableObject {
     @Published private(set) var isToolbarAvailable = false
     /// Incremented when an Apple Pencil gesture asks for the tools to be shown.
     @Published private(set) var revealRequest: UInt64 = 0
-    /// Publishes tool use apart from the store, so a pen going down or up invalidates only the
-    /// views that wait for it, never the toolbar's controls.
-    let activity = NotebookToolActivity()
-    /// How far a floating toolbar reaches in from each canvas edge, in canvas points. The
-    /// owning canvas adds the top and bottom as scrollable space so no page end stays covered.
-    /// It is handed to the canvas directly; no view draws it, so it is not published.
+    /// True while the owning canvas has a stroke or other tool use in progress. Not published,
+    /// so a pen going down or up never invalidates the toolbar's controls.
+    private(set) var isToolActive = false
+    /// How far the toolbar reaches in from the top or bottom of the control area, the canvas
+    /// less its chrome. The canvas it is drawn over adds it to the chrome as scroll space,
+    /// whether or not it owns the tools, so no page end stays covered. It is handed to the
+    /// canvas directly; no view draws it, so it is not published.
     private(set) var overlayObstruction = UIEdgeInsets.zero
 
     let toolDefaultsKey: String
     private let defaults: UserDefaults
     private weak var activeController: NotebookViewController?
+    /// The canvas the toolbar is drawn over. A paused canvas never owns the tools, yet the
+    /// toolbar still covers its first lines.
+    private weak var coveredController: NotebookViewController?
 
     init(identifier: String, defaults: UserDefaults) {
         self.defaults = defaults
@@ -58,10 +62,6 @@ final class NotebookSceneToolStore: ObservableObject {
         resetOwnerState()
     }
 
-    /// True while the owning canvas has a stroke or other tool use in progress. Layout
-    /// changes that would move the canvas wait until it ends.
-    var isToolActive: Bool { activity.isToolActive }
-
     func belongs(to controller: NotebookViewController) -> Bool {
         activeController === controller
     }
@@ -72,10 +72,25 @@ final class NotebookSceneToolStore: ObservableObject {
         resetOwnerState()
     }
 
-    /// Assigns only real changes, so observing toolbar views are not invalidated for nothing.
+    /// Records the canvas shown under the toolbar, which reserves the toolbar's obstruction.
+    func cover(_ controller: NotebookViewController) {
+        coveredController = controller
+    }
+
+    func uncover(_ controller: NotebookViewController) {
+        guard coveredController === controller else { return }
+        coveredController = nil
+    }
+
+    func covers(_ controller: NotebookViewController) -> Bool {
+        coveredController === controller
+    }
+
+    /// Clears what the previous owner reported. Availability is published, so it is assigned
+    /// only when it changes and the toolbar's views are not invalidated for nothing.
     private func resetOwnerState() {
         if isToolbarAvailable { isToolbarAvailable = false }
-        if activity.isToolActive { activity.isToolActive = false }
+        isToolActive = false
     }
 
     func setToolbarAvailable(_ available: Bool, for controller: NotebookViewController) {
@@ -84,14 +99,19 @@ final class NotebookSceneToolStore: ObservableObject {
     }
 
     func setToolActive(_ active: Bool, for controller: NotebookViewController) {
-        guard activeController === controller, activity.isToolActive != active else { return }
-        activity.isToolActive = active
+        guard activeController === controller else { return }
+        isToolActive = active
     }
 
-    func setOverlayObstruction(_ insets: UIEdgeInsets) {
+    /// - Parameter followingResize: true when the toolbar was re-measured because the control
+    ///   area changed size, not because the toolbar moved.
+    func setOverlayObstruction(_ insets: UIEdgeInsets, followingResize: Bool = false) {
         guard insets != overlayObstruction else { return }
         overlayObstruction = insets
-        activeController?.applyOverlayObstruction()
+        activeController?.applyOverlayObstruction(followingResize: followingResize)
+        if coveredController !== activeController {
+            coveredController?.applyOverlayObstruction(followingResize: followingResize)
+        }
     }
 
     /// Removes tools stored for scene sessions that no longer exist, keeping the last choice
@@ -130,10 +150,4 @@ final class NotebookSceneToolStore: ObservableObject {
         update { reveal = $0.handlePencilDoubleTap(preference) }
         if reveal { revealRequest &+= 1 }
     }
-}
-
-/// Whether the owning canvas has a stroke or other tool use in progress.
-@MainActor
-final class NotebookToolActivity: ObservableObject {
-    @Published fileprivate(set) var isToolActive = false
 }

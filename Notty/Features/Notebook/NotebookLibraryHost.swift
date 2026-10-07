@@ -208,6 +208,10 @@ struct NotebookLibraryHost: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Every state sits on the editor's light paper, so opening never flashes the system appearance.
+        .background { NotebookTheme.paperIvory.color.ignoresSafeArea() }
+        .preferredColorScheme(.light)
         .task { await model.load() }
     }
 }

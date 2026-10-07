@@ -137,12 +137,17 @@ public struct EditorToolbarPreferences: Equatable, Sendable {
     public private(set) var isCollapsed: Bool
     /// Newest first.
     public private(set) var customSwatches: [EditorInkColor]
+    public private(set) var chromeMode: EditorChromeMode
 
     /// A floating position that is not finite falls back to the standard dock.
-    public init(placement: EditorToolbarPlacement, isCollapsed: Bool, customSwatches: [EditorInkColor]) {
+    public init(
+        placement: EditorToolbarPlacement, isCollapsed: Bool, customSwatches: [EditorInkColor],
+        chromeMode: EditorChromeMode = .focus
+    ) {
         self.placement = Self.sanitized(placement)
         self.isCollapsed = false
         self.customSwatches = []
+        self.chromeMode = chromeMode
         setCollapsed(isCollapsed)
         setCustomSwatches(customSwatches)
     }
@@ -156,6 +161,10 @@ public struct EditorToolbarPreferences: Equatable, Sendable {
     /// Collapses or expands a floating toolbar; a docked toolbar always stays expanded.
     public mutating func setCollapsed(_ collapsed: Bool) {
         if case .floating = placement { isCollapsed = collapsed } else { isCollapsed = false }
+    }
+
+    public mutating func setChromeMode(_ mode: EditorChromeMode) {
+        chromeMode = mode
     }
 
     /// Adds a picked colour at the front of the custom swatches, rounded to 8-bit channels.
@@ -177,14 +186,16 @@ public struct EditorToolbarPreferences: Equatable, Sendable {
         return .floating(CGPoint(x: max(0, min(point.x, 1)), y: max(0, min(point.y, 1))))
     }
 
-    /// Decodes stored preferences. Missing, corrupt or unknown-version data yields `standard`.
+    /// Decodes stored preferences. Missing, corrupt or unknown-version data yields `standard`;
+    /// a missing or unknown writing mode yields focus and keeps everything else.
     public static func decode(_ data: Data?) -> EditorToolbarPreferences {
         guard let data, let stored = try? JSONDecoder().decode(Stored.self, from: data),
               stored.version == currentVersion, let placement = stored.placement.resolved else { return .standard }
         return EditorToolbarPreferences(
             placement: placement,
             isCollapsed: stored.collapsed,
-            customSwatches: stored.swatches.compactMap(EditorInkColor.init(components:))
+            customSwatches: stored.swatches.compactMap(EditorInkColor.init(components:)),
+            chromeMode: stored.chromeMode.flatMap(EditorChromeMode.init(rawValue:)) ?? .focus
         )
     }
 
@@ -193,7 +204,8 @@ public struct EditorToolbarPreferences: Equatable, Sendable {
             version: Self.currentVersion,
             placement: Stored.Placement(placement),
             collapsed: isCollapsed,
-            swatches: customSwatches.map(\.components)
+            swatches: customSwatches.map(\.components),
+            chromeMode: chromeMode.rawValue
         )
         // Placements and colours are always finite, which is all JSON encoding requires.
         return (try? JSONEncoder().encode(stored)) ?? Data()
@@ -227,5 +239,7 @@ public struct EditorToolbarPreferences: Equatable, Sendable {
         let placement: Placement
         let collapsed: Bool
         let swatches: [[Double]]
+        /// Added within version 1, so preferences stored before writing modes lack it.
+        let chromeMode: String?
     }
 }

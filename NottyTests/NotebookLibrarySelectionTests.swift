@@ -1,6 +1,7 @@
 import Foundation
 import NottyCore
 import PencilKit
+import SwiftUI
 import UIKit
 import XCTest
 @testable import Notty
@@ -37,7 +38,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         )
         let task = Task { await model.load() }
         do {
-            try await waitUntil { await gate.entered }
+            try await NotebookTestFixtures.waitUntil { await gate.entered }
             guard case .creatingFirstNotebook = model.state else { throw FixtureFailure.unexpectedState }
             XCTAssertTrue(model.isCreating)
             await gate.release()
@@ -68,6 +69,55 @@ final class NotebookLibrarySelectionTests: XCTestCase {
 
     func testLibraryStatusSymbolsExistInTheSystemSet() {
         XCTAssertNotNil(UIImage(systemName: "exclamationmark.triangle"))
+    }
+
+    func testLaunchScreenIsPaperIvoryInEveryAppearance() throws {
+        let launch = try XCTUnwrap(Bundle.main.object(forInfoDictionaryKey: "UILaunchScreen") as? [String: Any])
+        XCTAssertEqual(launch["UIColorName"] as? String, "LaunchBackground")
+        let color = try XCTUnwrap(UIColor(named: "LaunchBackground", in: .main, compatibleWith: nil))
+        let light = components(of: color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)))
+        XCTAssertEqual(components(of: color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))), light)
+        for (actual, expected) in zip(light, components(of: NotebookTheme.paperIvory.uiColor)) {
+            XCTAssertEqual(actual, expected, accuracy: 1 / 255)
+        }
+    }
+
+    func testLibraryHostStaysLightOnPaperInADarkWindow() async throws {
+        XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "UIUserInterfaceStyle") as? String, "Light")
+        let gate = LibrarySelectionGate()
+        let model = NotebookLibraryModel(openLibrary: {
+            await gate.suspend()
+            throw NotebookSaveFailure.storageUnavailable
+        })
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
+        window.overrideUserInterfaceStyle = .dark
+        let control = UIHostingController(rootView: Color.clear)
+        window.rootViewController = control
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        // The window must outrank the app's light style, or the checks below prove nothing.
+        XCTAssertEqual(control.traitCollection.userInterfaceStyle, .dark)
+        let hosting = UIHostingController(rootView: NotebookLibraryHost(model: model))
+        window.rootViewController = hosting
+        hosting.view.layoutIfNeeded()
+        do {
+            try await NotebookTestFixtures.waitUntil { await gate.entered }
+            guard case .loading = model.state else { throw FixtureFailure.unexpectedState }
+            try await assertLightPaper(hosting)
+        } catch {
+            await gate.release()
+            throw error
+        }
+        await gate.release()
+        try await NotebookTestFixtures.waitUntil {
+            if case .failed = model.state { return true }
+            return false
+        }
+        try await assertLightPaper(hosting)
     }
 
     func testExistingLegacyNoteIsOpenedWithoutCreatingAnotherNotebook() async throws {
@@ -169,7 +219,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         await old.load()
         let task = Task { await model.startNewNotebook() }
         do {
-            try await waitUntil { await gate.entered }
+            try await NotebookTestFixtures.waitUntil { await gate.entered }
             try healthyHead.write(to: head)
             let repairedBytes = try fixture.snapshot(fixture.noteURL(oldID))
             await old.load()
@@ -203,7 +253,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         await old.load()
         let task = Task { await model.startNewNotebook() }
         do {
-            try await waitUntil { await gate.entered }
+            try await NotebookTestFixtures.waitUntil { await gate.entered }
             let seed = old.makeCanvasSeed()
             old.attachCanvas(ownerID: seed.ownerID, observations: { nil })
             await gate.release()
@@ -272,15 +322,36 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         return session
     }
 
-    private func waitUntil(_ predicate: () async -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while !(await predicate()) {
-            guard ContinuousClock.now < deadline else { throw FixtureFailure.timeout }
-            try await Task.sleep(for: .milliseconds(5))
+    /// Waits for the light appearance, then checks opposite corners of the window show the paper.
+    private func assertLightPaper(
+        _ hosting: UIViewController, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try await NotebookTestFixtures.waitUntil(file: file, line: line) {
+            hosting.traitCollection.userInterfaceStyle == .light
+        }
+        let view = try XCTUnwrap(hosting.view)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        let pixels = try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 1)
+        let paper = components(of: NotebookTheme.paperIvory.uiColor).map { Int(($0 * 255).rounded()) }
+        for point in [CGPoint(x: 4, y: 4), CGPoint(x: view.bounds.maxX - 4, y: view.bounds.maxY - 4)] {
+            let rendered = pixels.rgba(at: point).map(Int.init)
+            for (actual, expected) in zip(rendered, paper) {
+                XCTAssertEqual(actual, expected, accuracy: 2, "\(rendered) at \(point)", file: file, line: line)
+            }
         }
     }
 
-    private enum FixtureFailure: Error { case unexpectedState, timeout }
+    private func components(of color: UIColor) -> [CGFloat] {
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+        color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return [red, green, blue, alpha]
+    }
+
+    private enum FixtureFailure: Error { case unexpectedState }
 }
 
 private struct LibraryFixture: Sendable {

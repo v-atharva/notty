@@ -10,7 +10,7 @@ struct NotebookToolbarHost<Content: View>: View {
     private let content: Content
     private let extendsCanvasUnderChrome: Bool
     @State private var sceneStore: NotebookSceneToolStore?
-    @State private var canvasFrame = CGRect.zero
+    @State private var chrome = NotebookCanvasChrome.none
 
     /// - Parameters:
     ///   - store: a store to use instead of the window scene's, for tests.
@@ -29,15 +29,23 @@ struct NotebookToolbarHost<Content: View>: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             content
-                .onGeometryChange(for: CGRect.self) {
-                    $0.frame(in: .named(NotebookToolbarLayer.coordinateSpace))
-                } action: { canvasFrame = $0 }
+                // Every canvas reserves the chrome and the toolbar drawn over it, whether or not
+                // it owns the tools.
+                .environment(\.notebookCanvasChrome, chrome)
+                .environment(\.notebookToolbarStore, store)
+                // One measurement gives the canvas and the control area together, so the chrome
+                // never passes through a value mixing an old size with a new one.
+                .onGeometryChange(for: NotebookCanvasChrome.self) {
+                    NotebookCanvasChrome(
+                        canvasSize: $0.size, controlArea: $0.bounds(of: .named(NotebookToolbarLayer.coordinateSpace))
+                    )
+                } action: { chrome = $0 }
                 // Toolbar movement never animates the canvas viewport.
                 .transaction { $0.animation = nil }
                 // Measure the expanded canvas inside the safe-area modifier, not its safe proposal.
                 .ignoresSafeArea(extendsCanvasUnderChrome ? .container : .keyboard)
             if let store {
-                NotebookToolbarLayer(store: store, canvasFrame: canvasFrame)
+                NotebookToolbarLayer(store: store)
                     // The toolbar is read before the canvas, as it sits above it.
                     .accessibilityElement(children: .contain)
                     .accessibilitySortPriority(1)
@@ -108,29 +116,68 @@ struct NotebookToolbarDragResolver: Equatable {
     }
 }
 
-/// How much of the canvas a toolbar takes from the page end it sits against, as
-/// extra scroll space for that end. A toolbar further from both edges than its own height
-/// leaves room to scroll any covered writing past it, so it reserves nothing; this also
+/// The canvas edges the status bar and navigation header cover at the top and the home indicator
+/// covers at the bottom: where the canvas reaches past the area the host lays its controls out
+/// in. Every canvas reserves them as scroll space whatever its input gate, so its first and last
+/// lines can always be scrolled clear.
+struct NotebookCanvasChrome: Equatable {
+    static let none = NotebookCanvasChrome(top: 0, bottom: 0, canvasSize: .zero)
+
+    let top: CGFloat
+    let bottom: CGFloat
+    /// The canvas size this was measured for, which tells a re-measure after a resize apart
+    /// from other changes.
+    let canvasSize: CGSize
+}
+
+extension NotebookCanvasChrome {
+    /// - Parameter controlArea: the host's control area in the canvas's own coordinates.
+    init(canvasSize: CGSize, controlArea: CGRect?) {
+        guard let controlArea, canvasSize.width > 0, canvasSize.height > 0 else {
+            self = .none
+            return
+        }
+        self.init(
+            top: max(controlArea.minY, 0), bottom: max(canvasSize.height - controlArea.maxY, 0),
+            canvasSize: canvasSize
+        )
+    }
+}
+
+extension EnvironmentValues {
+    /// The chrome over the canvas, as the toolbar host last measured it.
+    @Entry var notebookCanvasChrome = NotebookCanvasChrome.none
+    /// The store whose toolbar the host draws over the canvas.
+    @Entry var notebookToolbarStore: NotebookSceneToolStore?
+}
+
+/// How much of the control area a toolbar takes from the end it sits against, as extra scroll
+/// space for that end on top of the chrome. A toolbar further from both edges than its own
+/// height leaves room to scroll any covered writing past it, so it reserves nothing; this also
 /// keeps a notebook opening with its first page at the top.
 enum NotebookToolbarObstruction {
-    static func insets(toolbar: CGRect, canvas: CGRect, usable: CGRect? = nil) -> UIEdgeInsets {
-        if let usable {
-            guard !canvas.isEmpty else { return .zero }
-            let overlay = insets(toolbar: toolbar, canvas: usable)
-            return UIEdgeInsets(
-                top: max(usable.minY - canvas.minY, 0) + overlay.top, left: 0,
-                bottom: max(canvas.maxY - usable.maxY, 0) + overlay.bottom, right: 0
-            )
+    /// A toolbar's obstruction together with the size of the area it was measured in, so a
+    /// re-measure for a resized control area can be told apart from the toolbar moving.
+    struct Measurement: Equatable {
+        let insets: UIEdgeInsets
+        let area: CGSize
+
+        init(toolbar: CGRect, area: CGRect) {
+            insets = NotebookToolbarObstruction.insets(toolbar: toolbar, area: area)
+            self.area = area.size
         }
-        guard toolbar.intersects(canvas) else { return .zero }
-        let topGap = toolbar.minY - canvas.minY
-        let bottomGap = canvas.maxY - toolbar.maxY
+    }
+
+    static func insets(toolbar: CGRect, area: CGRect) -> UIEdgeInsets {
+        guard toolbar.intersects(area) else { return .zero }
+        let topGap = toolbar.minY - area.minY
+        let bottomGap = area.maxY - toolbar.maxY
         if topGap <= bottomGap {
             guard topGap < toolbar.height else { return .zero }
-            return UIEdgeInsets(top: toolbar.maxY - canvas.minY, left: 0, bottom: 0, right: 0)
+            return UIEdgeInsets(top: toolbar.maxY - area.minY, left: 0, bottom: 0, right: 0)
         }
         guard bottomGap < toolbar.height else { return .zero }
-        return UIEdgeInsets(top: 0, left: 0, bottom: canvas.maxY - toolbar.minY, right: 0)
+        return UIEdgeInsets(top: 0, left: 0, bottom: area.maxY - toolbar.minY, right: 0)
     }
 }
 
@@ -201,8 +248,6 @@ private struct NotebookToolbarLayer: View {
     private static let snap = Animation.spring(duration: 0.35, bounce: 0.2)
 
     @ObservedObject var store: NotebookSceneToolStore
-    /// The canvas, in this layer's coordinate space.
-    let canvasFrame: CGRect
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var drag = NotebookToolbarDragSession()
@@ -224,12 +269,9 @@ private struct NotebookToolbarLayer: View {
                     .modifier(NotebookToolbarDragPosition(drag: drag, restingFrame: resting))
             }
             .onChange(
-                of: NotebookToolbarObstruction.insets(
-                    toolbar: resting, canvas: canvasFrame, usable: usable
-                ),
-                initial: true
-            ) { _, insets in
-                store.setOverlayObstruction(insets)
+                of: NotebookToolbarObstruction.Measurement(toolbar: resting, area: usable), initial: true
+            ) { old, new in
+                store.setOverlayObstruction(new.insets, followingResize: new.area != old.area)
             }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: dockSnaps)
@@ -376,8 +418,8 @@ private struct NotebookDockTargets: View {
         }
     }
 
-    /// Targets lie over leather when docked and over paper when floating, so a pale fill and
-    /// dark dashes keep them readable on both.
+    /// Targets lie over paper, or over the stone backdrop beside a zoomed-out page, so a pale
+    /// fill and dark dashes keep them readable on both.
     private func target(_ frame: CGRect, fill: Double) -> some View {
         let shape = RoundedRectangle(cornerRadius: NotebookTheme.toolbarCornerRadius, style: .continuous)
         return shape

@@ -311,21 +311,12 @@ final class NotebookSessionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         await probe.setSaveFailure(nil)
         let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
-        window.rootViewController = hosting
-        window.makeKeyAndVisible()
-        hosting.view.layoutIfNeeded()
+        let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
         }
-        try await waitForUI {
+        try await NotebookTestFixtures.waitUntil {
             session.renderDiagnostics.screenBodyCount > 0
                 && session.renderDiagnostics.canvasUpdateCount > 0
                 && self.notebookController(in: hosting) != nil
@@ -349,7 +340,7 @@ final class NotebookSessionTests: XCTestCase {
             await session.waitUntilSettled()
             XCTAssertEqual(session.inputGate, .open)
         }
-        try await waitForUI { session.statusModel.state.status == session.saveState }
+        try await NotebookTestFixtures.waitUntil { session.statusModel.state.status == session.saveState }
         // Let two display frames drain queued SwiftUI updates before checking counters.
         try await Task.sleep(for: .milliseconds(80))
         hosting.view.layoutIfNeeded()
@@ -432,14 +423,4 @@ final class NotebookSessionTests: XCTestCase {
         }
         return nil
     }
-
-    private func waitForUI(_ ready: @escaping @MainActor () -> Bool) async throws {
-        for _ in 0..<100 {
-            if ready() { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTFail("Notebook UI did not become ready within two seconds.")
-        throw NotebookSaveFailure.unexpected
-    }
-
 }

@@ -533,33 +533,38 @@ final class NotebookControllerTests: XCTestCase {
     func testAttachAndDetachPublishOnlyRealChanges() {
         let store = NotebookTestFixtures.toolStore()
         let controller = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        let other = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
         let changes = ChangeCounter(store)
-        let activity = ChangeCounter(store.activity)
         store.attach(controller)
         store.detach(controller)
         XCTAssertEqual(changes.count, 0, "an unavailable toolbar stays unavailable without a change notification")
-        XCTAssertEqual(activity.count, 0)
         store.attach(controller)
         store.setToolbarAvailable(true, for: controller)
         XCTAssertEqual(changes.count, 1)
         store.setToolActive(true, for: controller)
+        XCTAssertTrue(store.isToolActive)
         XCTAssertEqual(changes.count, 1, "a pen going down never invalidates the views that show the tools")
-        XCTAssertEqual(activity.count, 1)
+        store.setToolActive(true, for: other)
+        store.setToolActive(false, for: other)
+        XCTAssertTrue(store.isToolActive, "only the owning canvas reports tool use")
         store.setToolActive(false, for: controller)
+        XCTAssertFalse(store.isToolActive)
         store.setToolActive(true, for: controller)
         XCTAssertEqual(changes.count, 1, "nor does a pen coming up")
-        XCTAssertEqual(activity.count, 3)
         store.detach(controller)
         XCTAssertEqual(changes.count, 2)
-        XCTAssertEqual(activity.count, 4)
         XCTAssertFalse(store.isToolbarAvailable)
-        XCTAssertFalse(store.isToolActive)
+        XCTAssertFalse(store.isToolActive, "detaching ends the owner's tool use")
         store.detach(controller)
         store.attach(controller)
         XCTAssertEqual(changes.count, 2)
-        XCTAssertEqual(activity.count, 4)
+        store.setToolActive(true, for: controller)
+        store.attach(other)
+        XCTAssertFalse(store.isToolActive, "a new owner starts without tool use")
+        XCTAssertEqual(changes.count, 2)
         store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 80, right: 0))
         XCTAssertEqual(changes.count, 2, "the obstruction goes to the canvas, not to the toolbar's views")
+        other.tearDown()
         controller.tearDown()
     }
 
@@ -1004,11 +1009,49 @@ final class NotebookControllerTests: XCTestCase {
         unowned.loadViewIfNeeded()
         unowned.view.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
         unowned.view.layoutIfNeeded()
-        XCTAssertEqual(unowned.canvasView.contentInset.bottom, 0, "only the owning canvas reserves the toolbar's space")
+        XCTAssertEqual(unowned.canvasView.contentInset.bottom, 0, "a canvas the toolbar is not drawn over keeps its full range")
         unowned.tearDown()
     }
 
     func testOverlayScrollRangeDoesNotPushThePageBelowTheToolbar() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(UIEdgeInsets(top: 90, left: 0, bottom: 0, right: 0))
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        let window = try await present(controller)
+        defer {
+            controller.tearDown()
+            window.isHidden = true
+        }
+        let canvas = controller.canvasView
+        XCTAssertEqual(canvas.contentInset.top, 90)
+        XCTAssertEqual(canvas.contentOffset.y, 0, "a notebook opens with its first page beneath the toolbar")
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 130)
+        XCTAssertEqual(canvas.contentOffset.y, 0, "adding scroll range keeps the paper behind the overlay")
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -130), animated: false)
+        store.setOverlayObstruction(UIEdgeInsets(top: 170, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 170)
+        XCTAssertEqual(canvas.contentOffset.y, -130, "a toolbar moving down never pushes a revealed page below it")
+
+        // A resize in the order the toolbar host delivers it: the toolbar is re-measured for its
+        // new area before the canvas is laid out at its new size.
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -170), animated: false)
+        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_300)
+        controller.view.frame = window.bounds
+        store.setOverlayObstruction(UIEdgeInsets(top: 200, left: 0, bottom: 0, right: 0), followingResize: true)
+        XCTAssertEqual(canvas.contentInset.top, 200)
+        XCTAssertEqual(canvas.contentOffset.y, -170, "the re-measure alone never moves the page")
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentOffset.y, -200, accuracy: 0.5, "after the resize a revealed page stays revealed")
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentOffset.y, 300, "a page scrolled away from its top stays where it is")
+    }
+
+    func testTopInsetReductionDuringAStrokeWaitsForTheStrokeToEnd() async throws {
         let store = NotebookTestFixtures.toolStore()
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
         let window = try await present(controller)
@@ -1017,20 +1060,253 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top, "a notebook opens at the top of its first page")
-
-        store.setOverlayObstruction(UIEdgeInsets(top: 90, left: 0, bottom: 0, right: 0))
-        XCTAssertEqual(canvas.contentInset.top, 90)
-        XCTAssertEqual(canvas.contentOffset.y, 0, "adding scroll range keeps the paper behind the overlay")
+        store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
+        let revealed = CGPoint(x: canvas.contentOffset.x, y: -130)
+        canvas.setContentOffset(revealed, animated: false)
 
         controller.canvasViewDidBeginUsingTool(canvas)
-        store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
-        XCTAssertEqual(canvas.contentOffset.y, 0, "the page never moves under a stroke in progress")
-        controller.canvasViewDidEndUsingTool(canvas)
-
-        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 300), animated: false)
         store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
-        XCTAssertEqual(canvas.contentOffset.y, 300, "a page scrolled away from its top stays where it is")
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentInset.top, 130, "the space is held until the stroke ends")
+        XCTAssertEqual(canvas.verticalScrollIndicatorInsets.top, 130)
+        XCTAssertEqual(canvas.contentOffset, revealed, "the page never moves under a stroke in progress")
+
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(canvas.contentInset.top, 60)
+        XCTAssertEqual(canvas.verticalScrollIndicatorInsets.top, 60)
+        XCTAssertEqual(canvas.contentOffset.x, revealed.x)
+        XCTAssertEqual(canvas.contentOffset.y, -60, accuracy: 0.5, "the page moves only onto the new top of its range")
+
+        store.setOverlayObstruction(UIEdgeInsets(top: 130, left: 0, bottom: 0, right: 0))
+        canvas.setContentOffset(CGPoint(x: revealed.x, y: 200), animated: false)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 130)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(canvas.contentInset.top, 60)
+        XCTAssertEqual(canvas.contentOffset.y, 200, "a page inside the smaller range stays where it is")
+    }
+
+    func testEveryCanvasReservesTheChromeAndTheToolbarDrawnOverIt() async throws {
+        let size = CGSize(width: 1_024, height: 1_366)
+        let chrome = NotebookCanvasChrome(top: 74, bottom: 20, canvasSize: size)
+        let toolbar = UIEdgeInsets(top: 120, left: 0, bottom: 40, right: 0)
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(toolbar)
+        let owner = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        owner.applyChrome(chrome)
+        let window = try await present(owner)
+        defer {
+            owner.tearDown()
+            window.isHidden = true
+        }
+        XCTAssertEqual(owner.canvasView.contentInset.top, 194, "the owner adds the toolbar it takes its tools from")
+        XCTAssertEqual(owner.canvasView.contentInset.bottom, 60)
+        XCTAssertEqual(owner.canvasView.contentOffset.y, 0, "the page opens beneath the header and toolbar")
+
+        for gate in [NotebookInputGate.failed, .recovering, .readOnly] {
+            let paused = NotebookViewController(
+                pageCount: 3, initialDrawing: PKDrawing(), toolStore: store, allowsEditing: gate != .readOnly
+            )
+            paused.setInputGate(gate)
+            paused.applyChrome(chrome)
+            paused.placeUnderToolbar(of: store)
+            let pausedWindow = try await present(paused, ownsTools: false)
+            XCTAssertNil(paused.drawingToolStore, "\(gate): the gate keeps a shown canvas from taking the tools")
+            XCTAssertTrue(store.belongs(to: owner), "\(gate)")
+            let canvas = paused.canvasView
+            XCTAssertEqual(canvas.contentInset.top, 194, "\(gate): the header and the toolbar over it are reserved")
+            XCTAssertEqual(canvas.contentInset.bottom, 60, "\(gate)")
+            XCTAssertEqual(canvas.contentOffset.y, 0, "\(gate): the page opens beneath them")
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -194), animated: false)
+            XCTAssertEqual(canvas.contentOffset.y, -194, "\(gate): the first line scrolls clear of both")
+
+            store.setOverlayObstruction(UIEdgeInsets(top: 150, left: 0, bottom: 40, right: 0))
+            XCTAssertEqual(canvas.contentInset.top, 224, "\(gate): the toolbar moving reaches the canvas under it")
+            XCTAssertEqual(canvas.contentOffset.y, -194, "\(gate): and never pushes its page")
+            store.setOverlayObstruction(toolbar)
+
+            paused.canvasViewDidBeginUsingTool(canvas)
+            paused.applyChrome(NotebookCanvasChrome(top: 50, bottom: 20, canvasSize: size))
+            XCTAssertEqual(canvas.contentInset.top, 194, "\(gate): a stroke admitted before the pause holds the space")
+            paused.canvasViewDidEndUsingTool(canvas)
+            XCTAssertEqual(canvas.contentInset.top, 170, "\(gate): the space is released when the stroke ends")
+            paused.tearDown()
+            XCTAssertFalse(store.covers(paused), "\(gate): a retired canvas no longer takes the toolbar's space")
+            pausedWindow.isHidden = true
+        }
+        XCTAssertTrue(store.belongs(to: owner))
+
+        // A pause for capacity keeps the toolbar, so the canvas takes the tools as well.
+        let capacityStore = NotebookTestFixtures.toolStore()
+        capacityStore.setOverlayObstruction(toolbar)
+        let capacity = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: capacityStore)
+        capacity.setInputGate(.capacity)
+        capacity.applyChrome(chrome)
+        let capacityWindow = try await present(capacity)
+        defer {
+            capacity.tearDown()
+            capacityWindow.isHidden = true
+        }
+        XCTAssertEqual(capacity.inputGate, .capacity)
+        XCTAssertTrue(capacity.drawingToolStore === capacityStore)
+        XCTAssertEqual(capacity.canvasView.contentInset.top, 194)
+        XCTAssertEqual(capacity.canvasView.contentInset.bottom, 60)
+    }
+
+    func testResizeKeepsARevealedFirstLineClearOfTheHeader() {
+        let landscape = CGSize(width: 1_366, height: 1_024)
+        let portrait = CGSize(width: 1_024, height: 1_366)
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        defer { controller.tearDown() }
+        controller.loadViewIfNeeded()
+        let canvas = controller.canvasView
+        func resize(to size: CGSize) {
+            controller.view.frame = CGRect(origin: .zero, size: size)
+            controller.view.layoutIfNeeded()
+        }
+        resize(to: landscape)
+        controller.applyChrome(NotebookCanvasChrome(top: 74, bottom: 20, canvasSize: landscape))
+        XCTAssertEqual(canvas.contentOffset.y, 0, "the first measurement leaves the opening page beneath the header")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -74), animated: false)
+
+        // The canvas is laid out at its new size before the chrome measured for that size reaches
+        // it, the order the notebook screen delivers a resize in.
+        resize(to: portrait)
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentInset.top, 110)
+        XCTAssertEqual(canvas.contentOffset.y, -110, "a revealed first line stays clear after a resize")
+
+        controller.applyChrome(NotebookCanvasChrome(top: 140, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentOffset.y, -110, "a taller header without a resize never pushes the page down")
+
+        // The chrome measured for the new size reaches the canvas before it is laid out at that size.
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -140), animated: false)
+        controller.view.frame = CGRect(origin: .zero, size: landscape)
+        controller.applyChrome(NotebookCanvasChrome(top: 170, bottom: 20, canvasSize: landscape))
+        XCTAssertEqual(canvas.contentOffset.y, -170)
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentOffset.y, -170, accuracy: 0.5)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 600), animated: false)
+        resize(to: portrait)
+        let midPage = canvas.contentOffset
+        controller.applyChrome(NotebookCanvasChrome(top: 120, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentOffset, midPage, "a page scrolled into its writing keeps its place")
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -120), animated: false)
+        resize(to: landscape)
+        controller.canvasViewDidBeginUsingTool(canvas)
+        controller.applyChrome(NotebookCanvasChrome(top: 150, bottom: 20, canvasSize: landscape))
+        XCTAssertEqual(canvas.contentOffset.y, -120, "the page never moves under a stroke in progress")
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(canvas.contentOffset.y, -120, "nor when that stroke ends")
+    }
+
+    func testResizeMovesOnlyAPageThatRestedAtItsRevealedTop() {
+        let landscape = CGSize(width: 1_366, height: 1_024)
+        let portrait = CGSize(width: 1_024, height: 1_366)
+        let taller = CGSize(width: 1_024, height: 1_400)
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        defer { controller.tearDown() }
+        controller.loadViewIfNeeded()
+        controller.placeUnderToolbar(of: store)
+        let canvas = controller.canvasView
+        // A resize in the order the toolbar host delivers it: the toolbar is re-measured for its
+        // new area, the canvas is laid out at its new size, and the chrome measured for it follows.
+        func resize(to size: CGSize, toolbarTop: CGFloat, headerTop: CGFloat) {
+            controller.view.frame = CGRect(origin: .zero, size: size)
+            store.setOverlayObstruction(UIEdgeInsets(top: toolbarTop, left: 0, bottom: 0, right: 0), followingResize: true)
+            controller.view.layoutIfNeeded()
+            controller.applyChrome(NotebookCanvasChrome(top: headerTop, bottom: 20, canvasSize: size))
+        }
+        controller.view.frame = CGRect(origin: .zero, size: landscape)
+        controller.view.layoutIfNeeded()
+        controller.applyChrome(NotebookCanvasChrome(top: 74, bottom: 20, canvasSize: landscape))
+        XCTAssertEqual(canvas.contentInset.top, 134)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -124), animated: false)
+
+        // Keeping the centre of this page, which showed its first lines under the toolbar, clamps
+        // it onto its revealed top in the narrower layout.
+        resize(to: portrait, toolbarTop: 60, headerTop: 74)
+        XCTAssertEqual(canvas.contentInset.top, 134)
+        XCTAssertEqual(canvas.contentOffset.y, -134, accuracy: 0.5)
+
+        // The next resize reserves more space for the toolbar before the canvas is laid out.
+        controller.view.frame = CGRect(origin: .zero, size: landscape)
+        store.setOverlayObstruction(UIEdgeInsets(top: 100, left: 0, bottom: 0, right: 0), followingResize: true)
+        XCTAssertEqual(canvas.contentInset.top, 174)
+        XCTAssertEqual(canvas.contentOffset.y, -134, accuracy: 0.5, "the re-measure alone never moves the page")
+        controller.view.layoutIfNeeded()
+        controller.applyChrome(NotebookCanvasChrome(top: 74, bottom: 20, canvasSize: landscape))
+        XCTAssertEqual(canvas.contentOffset.y, -174, accuracy: 0.5,
+            "a page resting at its revealed top when a resize begins stays there, however it came to rest")
+
+        // A page only near its top: the toolbar re-measured for the next size reserves less space,
+        // which clamps the page onto its top, and the chrome measured after the layout reserves more.
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -160), animated: false)
+        controller.view.frame = CGRect(origin: .zero, size: portrait)
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0), followingResize: true)
+        XCTAssertEqual(canvas.contentOffset.y, -134, accuracy: 0.5)
+        controller.view.layoutIfNeeded()
+        let laidOut = canvas.contentOffset
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentInset.top, 170)
+        XCTAssertEqual(canvas.contentOffset, laidOut,
+            "a page that was only near its top when the resize began is not moved to the new top")
+        XCTAssertGreaterThan(canvas.contentOffset.y, -canvas.contentInset.top + 0.5)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -170), animated: false)
+        store.setOverlayObstruction(UIEdgeInsets(top: 100, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 210)
+        XCTAssertEqual(canvas.contentOffset.y, -170, accuracy: 0.5, "a toolbar moving down never pushes the page")
+        resize(to: taller, toolbarTop: 100, headerTop: 110)
+        XCTAssertGreaterThan(canvas.contentOffset.y, -canvas.contentInset.top + 0.5,
+            "the page the toolbar moved over no longer rests at its top, so a resize leaves it off its top")
+    }
+
+    func testControlAreaChangeWithoutAResizeNeverPushesThePage() {
+        let portrait = CGSize(width: 1_024, height: 1_366)
+        let shorter = CGSize(width: 1_024, height: 1_300)
+        let store = NotebookTestFixtures.toolStore()
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0))
+        let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), allowsEditing: false)
+        defer { controller.tearDown() }
+        controller.loadViewIfNeeded()
+        controller.placeUnderToolbar(of: store)
+        let canvas = controller.canvasView
+        controller.view.frame = CGRect(origin: .zero, size: portrait)
+        controller.view.layoutIfNeeded()
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentInset.top, 170)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -170), animated: false)
+
+        // A shorter header at the same canvas size: a floating toolbar near the top follows the
+        // larger control area down, and its re-measure arrives before the chrome.
+        store.setOverlayObstruction(UIEdgeInsets(top: 75, left: 0, bottom: 0, right: 0), followingResize: true)
+        XCTAssertEqual(canvas.contentInset.top, 185)
+        XCTAssertEqual(canvas.contentOffset.y, -170, "the toolbar's re-measure never pushes the page")
+        controller.applyChrome(NotebookCanvasChrome(top: 80, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentInset.top, 155)
+        XCTAssertEqual(canvas.contentOffset.y, -155, accuracy: 0.5, "the smaller top only clamps the page onto it")
+
+        // A taller header again: the toolbar reaching less far clamps the page, the header leaves it.
+        store.setOverlayObstruction(UIEdgeInsets(top: 60, left: 0, bottom: 0, right: 0), followingResize: true)
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: portrait))
+        XCTAssertEqual(canvas.contentInset.top, 170)
+        XCTAssertEqual(canvas.contentOffset.y, -140, accuracy: 0.5,
+            "a taller header at the same canvas size never pushes the page")
+
+        // The page rested at its top when that re-measure arrived, but the header change it
+        // belonged to has passed, so a later resize finds the page off its top and keeps its centre.
+        controller.view.frame = CGRect(origin: .zero, size: shorter)
+        controller.view.layoutIfNeeded()
+        controller.applyChrome(NotebookCanvasChrome(top: 110, bottom: 20, canvasSize: shorter))
+        XCTAssertEqual(canvas.contentOffset.y, -140 + (portrait.height - shorter.height) / 2, accuracy: 0.5,
+            "a page left off its top by a header change is not moved to its top by a later resize")
     }
 
     func testMovingTopAnchorsDoesNotPushThePageDown() async throws {
@@ -1082,7 +1358,9 @@ final class NotebookControllerTests: XCTestCase {
         canvas.interactions.compactMap { $0 as? UIPencilInteraction }
     }
 
-    private func present(_ controller: NotebookViewController) async throws -> UIWindow {
+    /// Shows `controller` in its own window and waits until it appears and, when `ownsTools`,
+    /// until it has taken the tools.
+    private func present(_ controller: NotebookViewController, ownsTools: Bool = true) async throws -> UIWindow {
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
         window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
         window.rootViewController = controller
@@ -1090,8 +1368,9 @@ final class NotebookControllerTests: XCTestCase {
         controller.view.layoutIfNeeded()
         do {
             try await NotebookTestFixtures.waitUntil {
-                controller.isCanvasVisible && controller.view.window === window
-                    && controller.drawingToolStore?.isToolbarAvailable == true && controller.canvasView.isFirstResponder
+                guard controller.isCanvasVisible, controller.view.window === window else { return false }
+                return !ownsTools
+                    || controller.drawingToolStore?.isToolbarAvailable == true && controller.canvasView.isFirstResponder
             }
         } catch {
             controller.tearDown()

@@ -87,6 +87,11 @@ final class EditorToolbarLayoutTests: XCTestCase {
 }
 
 final class EditorToolbarPreferencesTests: XCTestCase {
+    private let customized = EditorToolbarPreferences(
+        placement: .floating(CGPoint(x: 0.25, y: 0.75)), isCollapsed: true,
+        customSwatches: [EditorInkColor(red: 0.2, green: 0.4, blue: 0.6)]
+    )
+
     func testMissingOrCorruptDataFallsBackToTheStandardPreferences() {
         XCTAssertEqual(EditorToolbarPreferences.decode(nil), .standard)
         XCTAssertEqual(EditorToolbarPreferences.decode(Data("{".utf8)), .standard)
@@ -183,6 +188,74 @@ final class EditorToolbarPreferencesTests: XCTestCase {
         XCTAssertEqual(decoded.placement, .floating(CGPoint(x: 0.25, y: 0.75)))
         XCTAssertTrue(decoded.isCollapsed)
         XCTAssertEqual(decoded.customSwatches, [EditorInkColor(red: 0.2, green: 0.4, blue: 0.6)])
+    }
+
+    func testStandardPreferencesUseFocusMode() {
+        XCTAssertEqual(EditorToolbarPreferences.standard.chromeMode, .focus)
+        XCTAssertEqual(customized.chromeMode, .focus)
+    }
+
+    func testRoundTripsEveryWritingMode() {
+        for mode in EditorChromeMode.allCases {
+            var preferences = customized
+            preferences.setChromeMode(mode)
+            let decoded = EditorToolbarPreferences.decode(preferences.encoded())
+            XCTAssertEqual(decoded, preferences, mode.rawValue)
+            XCTAssertEqual(decoded.chromeMode, mode)
+        }
+    }
+
+    func testWritesTheWritingModeWithoutChangingTheVersion() throws {
+        var preferences = customized
+        preferences.setChromeMode(.overlay)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: preferences.encoded()) as? [String: Any])
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["chromeMode"] as? String, "overlay")
+    }
+
+    func testReadsEveryStoredWritingMode() {
+        let modes: [String: EditorChromeMode] = ["focus": .focus, "pinned": .pinned, "overlay": .overlay]
+        XCTAssertEqual(Set(modes.values), Set(EditorChromeMode.allCases))
+        for (name, mode) in modes {
+            let json = #"{"version":1,"placement":{"dock":"topLeading"},"collapsed":false,"swatches":[],"chromeMode":"\#(name)"}"#
+            XCTAssertEqual(EditorToolbarPreferences.decode(Data(json.utf8)).chromeMode, mode, name)
+        }
+    }
+
+    func testPreferencesStoredBeforeWritingModesKeepTheirValuesInFocusMode() {
+        let json = #"""
+        {"version":1,"placement":{"floating":{"x":0.25,"y":0.75}},"collapsed":true,"swatches":[[0.2,0.4,0.6,1]]}
+        """#
+        XCTAssertEqual(EditorToolbarPreferences.decode(Data(json.utf8)), customized)
+    }
+
+    func testUnknownOrMisspelledWritingModeFallsBackToFocusKeepingTheRest() {
+        for mode in [#""zen""#, #""""#, #""Pinned""#, "null"] {
+            let json = #"""
+            {"version":1,"placement":{"floating":{"x":0.25,"y":0.75}},"collapsed":true,"swatches":[[0.2,0.4,0.6,1]],"chromeMode":\#(mode)}
+            """#
+            XCTAssertEqual(EditorToolbarPreferences.decode(Data(json.utf8)), customized, mode)
+        }
+    }
+
+    func testOtherVersionsAreNotReadEvenWithAKnownWritingMode() {
+        for version in [0, 2] {
+            let json = #"{"version":\#(version),"placement":{"dock":"topLeading"},"collapsed":false,"swatches":[],"chromeMode":"pinned"}"#
+            XCTAssertEqual(EditorToolbarPreferences.decode(Data(json.utf8)), .standard, "\(version)")
+        }
+    }
+
+    func testMovingOrCollapsingKeepsTheWritingModeAndChoosingAModeKeepsTheRest() {
+        var preferences = customized
+        preferences.setChromeMode(.pinned)
+        XCTAssertEqual(preferences.placement, customized.placement)
+        XCTAssertTrue(preferences.isCollapsed)
+        XCTAssertEqual(preferences.customSwatches, customized.customSwatches)
+
+        preferences.setCollapsed(false)
+        preferences.place(.docked(.topTrailing))
+        preferences.addCustomSwatch(EditorInkColor(red: 0.9, green: 0.1, blue: 0.5))
+        XCTAssertEqual(preferences.chromeMode, .pinned)
     }
 }
 

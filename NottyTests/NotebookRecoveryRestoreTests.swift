@@ -26,7 +26,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let restored = await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id)
         XCTAssertTrue(restored)
         do {
-            try await waitUntil { await trace.saveEntered }
+            try await NotebookTestFixtures.waitUntil { await trace.saveEntered }
             let pending = try XCTUnwrap(session.pendingEdits.first)
             XCTAssertNotEqual(pending.id, fixture.state.id)
             XCTAssertNotEqual(pending.stamp, fixture.state.stamp)
@@ -153,7 +153,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let originalGeneration = session.canvasGeneration
         let task = Task { await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id) }
         do {
-            try await waitUntil { await trace.targetEntered }
+            try await NotebookTestFixtures.waitUntil { await trace.targetEntered }
             XCTAssertEqual(session.inputGate, .recovering)
             let late = PKDrawing(strokes: [NotebookTestFixtures.stroke(x: 350)])
             session.recordObservation(
@@ -161,7 +161,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
                                           capturedAt: Date(timeIntervalSince1970: 30), uptime: 30), ownerID: owner
             )
             let pendingID = try XCTUnwrap(session.pendingEdits.first?.id)
-            try await waitUntil { session.pendingEdits.isEmpty }
+            try await NotebookTestFixtures.waitUntil { session.pendingEdits.isEmpty }
             XCTAssertTrue(session.pendingEdits.isEmpty)
             let selectedBeforeRelease = try await fixture.repository.load(id: fixture.notebookID)
             XCTAssertEqual(selectedBeforeRelease?.content.strokes.map(\.id), late.strokes.map(\.id))
@@ -196,7 +196,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let original = session.workingDrawing.strokes.map(\.id)
         let task = Task { await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id) }
         do {
-            try await waitUntil { await trace.targetEntered }
+            try await NotebookTestFixtures.waitUntil { await trace.targetEntered }
             task.cancel()
             await trace.releaseAll()
             let restored = await task.value
@@ -439,7 +439,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         window.rootViewController = hosting
         window.makeKeyAndVisible()
         do {
-            try await waitUntil {
+            try await NotebookTestFixtures.waitUntil {
                 guard let controller = self.notebookController(in: hosting) else { return false }
                 return controller.isCanvasVisible && controller.canvasView.window != nil
                     && controller.canvasView.isFirstResponder && session.canvasOwnerID != nil
@@ -462,7 +462,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
             XCTAssertFalse(manager.canRedo)
             XCTAssertFalse(old.isCanvasVisible)
             XCTAssertNotEqual(session.canvasGeneration, oldGeneration)
-            try await waitUntil {
+            try await NotebookTestFixtures.waitUntil {
                 guard let controller = self.notebookController(in: hosting), controller !== old else { return false }
                 return controller.isCanvasVisible && session.canvasOwnerID != nil
             }
@@ -509,7 +509,7 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
         let restored = await session.restoreRecoveryEdit(copyID: fixture.receipt.id, editID: fixture.state.id)
         XCTAssertTrue(restored)
         do {
-            try await waitUntil { await trace.saveEntered }
+            try await NotebookTestFixtures.waitUntil { await trace.saveEntered }
             let pending = try XCTUnwrap(session.pendingEdits.first)
             let foreign = try await fixture.repository.save(
                 id: fixture.notebookID,
@@ -544,16 +544,6 @@ final class NotebookRecoveryRestoreTests: XCTestCase {
             throw error
         }
     }
-
-    private func waitUntil(_ predicate: () async -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while !(await predicate()) {
-            guard ContinuousClock.now < deadline else { throw FixtureFailure.timeout }
-            try await Task.sleep(for: .milliseconds(5))
-        }
-    }
-
-    private enum FixtureFailure: Error { case timeout }
 }
 
 @MainActor
@@ -621,11 +611,7 @@ private final class RestoreFixture {
         let session = NotebookSession(notebookID: notebookID, openStorage: { supplied })
         await session.load()
         XCTAssertEqual(session.loadState, .ready)
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while session.integrityModel.state == .checking {
-            guard ContinuousClock.now < deadline else { throw NotebookSaveFailure.storageUnavailable }
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        try await NotebookTestFixtures.waitUntil { session.integrityModel.state != .checking }
         let seed = session.makeCanvasSeed()
         session.attachCanvas(ownerID: seed.ownerID, observations: { nil })
         return session

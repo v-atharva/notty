@@ -86,24 +86,52 @@ enum NotebookTestFixtures {
 // MARK: - Windows and waiting
 
 extension NotebookTestFixtures {
+    /// How long a hosted test waits for asynchronous work before failing. History audits run on a
+    /// utility-priority queue and can stall for many seconds behind other work on a busy host;
+    /// waits return as soon as their condition holds, so only a hang reaches this ceiling. It stays
+    /// below CI's 60-second per-test allowance so a hang reports its own condition.
+    static let readinessTimeout: TimeInterval = 30
+
     @MainActor
     static func windowScene() throws -> UIWindowScene {
         try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
     }
 
+    /// Shows `root` in a new window on the host's scene, laid out and key.
+    @MainActor
+    static func window(showing root: UIViewController, width: CGFloat = 1_024) throws -> UIWindow {
+        let window = UIWindow(windowScene: try windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: width, height: 1_366)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        root.view.layoutIfNeeded()
+        return window
+    }
+
     /// Polls `ready` on the main actor until it holds, failing the test after `seconds`.
     @MainActor
     static func waitUntil(
-        seconds: Int = 5, file: StaticString = #filePath, line: UInt = #line,
-        _ ready: @escaping @MainActor () -> Bool
+        seconds: TimeInterval = readinessTimeout, file: StaticString = #filePath, line: UInt = #line,
+        _ ready: @MainActor () async -> Bool
     ) async throws {
+        try await waitForValue(seconds: seconds, file: file, line: line) { await ready() ? () : nil }
+    }
+
+    /// Polls `value` on the main actor until it produces a result, failing the test after `seconds`.
+    @MainActor
+    @discardableResult
+    static func waitForValue<Value>(
+        seconds: TimeInterval = readinessTimeout, file: StaticString = #filePath, line: UInt = #line,
+        _ value: @MainActor () async -> Value?
+    ) async throws -> Value {
         let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
-        while !ready() {
+        while true {
+            if let result = await value() { return result }
             guard ContinuousClock.now < deadline else {
-                XCTFail("The condition did not hold within \(seconds) seconds.", file: file, line: line)
+                XCTFail("The condition did not hold within \(seconds.formatted()) seconds.", file: file, line: line)
                 throw NotebookFixtureFailure.timeout
             }
-            try await Task.sleep(for: .milliseconds(10))
+            try await Task.sleep(for: .milliseconds(5))
         }
     }
 
@@ -139,11 +167,7 @@ extension NotebookTestFixtures {
                 .environment(\.horizontalSizeClass, horizontalSizeClass)
         )
         hosting.safeAreaRegions = []
-        let window = UIWindow(windowScene: try windowScene())
-        window.frame = CGRect(x: 0, y: 0, width: width, height: 1_366)
-        window.rootViewController = hosting
-        window.makeKeyAndVisible()
-        hosting.view.layoutIfNeeded()
+        let window = try Self.window(showing: hosting, width: width)
         let fixture = NotebookToolbarHostFixture(hosting: hosting, window: window, controller: controller, store: store)
         do {
             try await waitUntil {

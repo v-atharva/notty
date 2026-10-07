@@ -532,7 +532,7 @@ final class NotebookWritingComfortTests: XCTestCase {
         let link = CADisplayLink(target: waiter, selector: #selector(FrameWaiter.advance(_:)))
         link.add(to: .main, forMode: .common)
         defer { link.invalidate() }
-        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 5)
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: NotebookTestFixtures.readinessTimeout)
         guard result == .completed else { throw FixtureFailure.readiness }
     }
 
@@ -566,15 +566,10 @@ final class NotebookWritingComfortTests: XCTestCase {
     private func waitForAppearance(
         _ controller: NotebookViewController, window: UIWindow, expectsToolbar: Bool
     ) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while !controller.isCanvasVisible || controller.view.window !== window
-            || (expectsToolbar && (controller.drawingToolStore?.isToolbarAvailable != true
-                || !controller.canvasView.isFirstResponder)) {
-            guard ContinuousClock.now < deadline else {
-                XCTFail("The scene-backed canvas did not become visible and ready.")
-                throw FixtureFailure.readiness
-            }
-            try await Task.sleep(for: .milliseconds(5))
+        try await NotebookTestFixtures.waitUntil {
+            controller.isCanvasVisible && controller.view.window === window
+                && (!expectsToolbar || (controller.drawingToolStore?.isToolbarAvailable == true
+                    && controller.canvasView.isFirstResponder))
         }
     }
 

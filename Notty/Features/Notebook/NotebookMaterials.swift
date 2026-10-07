@@ -1,42 +1,33 @@
 import CoreImage
 import CoreImage.CIFilterBuiltins
-import SwiftUI
 import UIKit
 
-/// Procedural leather and paper-fibre tiles. Both are rendered once per process on a utility
-/// task, never on the main thread, and shared by every view; strokes, scrolling, zooming and
-/// saves never regenerate texture. Until the tiles exist, views show the flat theme colours.
+/// The procedural paper-fibre tile. It is rendered once per process on a utility task, never on
+/// the main thread, and shared by every view; strokes, scrolling, zooming and saves never
+/// regenerate texture. Until the tile exists, views show the flat paper colour.
 @MainActor
-final class NotebookMaterials: ObservableObject {
-    /// Tiles as rendered; nil where Core Image could not render one.
-    struct RenderedTiles: Sendable {
-        let leather: CGImage?
-        let paperFibre: CGImage?
-    }
-
+final class NotebookMaterials {
     static let shared = NotebookMaterials()
 
-    /// Side of each square tile in points; the pattern repeats once per tile.
+    /// Side of the square tile in points; the pattern repeats once per tile.
     nonisolated static let tileSide: CGFloat = 256
-    /// Every supported iPad has a 2x display; one fixed scale keeps a single tile per material.
+    /// Every supported iPad has a 2x display, so one tile at a fixed scale serves them all.
     nonisolated static let tileScale: CGFloat = 2
 
-    @Published private(set) var leatherTile: UIImage?
     /// Pattern colour of the fibre tile; Core Animation repeats it without a layer-sized bitmap.
     private(set) var paperFibrePattern: CGColor?
-    /// Pattern colour of the leather tile for the surround around the page.
-    private(set) var leatherPattern: CGColor?
 
-    private let render: @Sendable () -> RenderedTiles
+    private let render: @Sendable () -> CGImage?
     private var hasStartedPreparation = false
     private var readyHandlers: [@MainActor (NotebookMaterials) -> Void] = []
 
-    /// - Parameter render: called once, off the main thread, to produce both tiles.
-    init(render: @escaping @Sendable () -> RenderedTiles = NotebookMaterials.renderTiles) {
+    /// - Parameter render: called once, off the main thread, to produce the fibre tile; nil
+    ///   when Core Image cannot render it, in which case a flat tile stands in.
+    init(render: @escaping @Sendable () -> CGImage? = NotebookMaterials.renderFibreTile) {
         self.render = render
     }
 
-    /// Starts rendering both tiles in the background the first time it is called; returns at once.
+    /// Starts rendering the tile in the background the first time it is called; returns at once.
     func prepare() {
         guard !hasStartedPreparation else { return }
         hasStartedPreparation = true
@@ -47,7 +38,7 @@ final class NotebookMaterials: ObservableObject {
         }
     }
 
-    /// Calls `handler` once both tiles exist: immediately when they already do. Callers capture
+    /// Calls `handler` once the tile exists: immediately when it already does. Callers capture
     /// their views weakly, so a pending handler never keeps one alive.
     func whenReady(_ handler: @escaping @MainActor (NotebookMaterials) -> Void) {
         if paperFibrePattern != nil {
@@ -58,27 +49,13 @@ final class NotebookMaterials: ObservableObject {
         prepare()
     }
 
-    /// Where a tiled pattern starts inside a view whose origin is `origin` in window coordinates,
-    /// so that every leather surface continues one pattern anchored to the window.
-    nonisolated static func patternPhase(at origin: CGPoint) -> CGPoint {
-        func phase(_ value: CGFloat) -> CGFloat {
-            let remainder = value.truncatingRemainder(dividingBy: tileSide)
-            return remainder < 0 ? remainder + tileSide : remainder
-        }
-        return CGPoint(x: phase(origin.x), y: phase(origin.y))
+    nonisolated static func renderFibreTile() -> CGImage? {
+        renderTile(paperFibres())
     }
 
-    nonisolated static func renderTiles() -> RenderedTiles {
-        RenderedTiles(leather: renderTile(leatherGrain()), paperFibre: renderTile(paperFibres()))
-    }
-
-    private func install(_ rendered: RenderedTiles) {
-        let leather = rendered.leather.map { UIImage(cgImage: $0, scale: Self.tileScale, orientation: .up) }
-            ?? Self.flatTile(NotebookTheme.leatherMid.uiColor)
-        let fibre = rendered.paperFibre.map { UIImage(cgImage: $0, scale: Self.tileScale, orientation: .up) }
+    private func install(_ tile: CGImage?) {
+        let fibre = tile.map { UIImage(cgImage: $0, scale: Self.tileScale, orientation: .up) }
             ?? Self.flatTile(NotebookTheme.paperIvory.uiColor)
-        leatherTile = leather
-        leatherPattern = UIColor(patternImage: leather).cgColor
         paperFibrePattern = UIColor(patternImage: fibre).cgColor
         let handlers = readyHandlers
         readyHandlers.removeAll()
@@ -87,12 +64,12 @@ final class NotebookMaterials: ObservableObject {
 
     nonisolated private static var pixelSide: Int { Int(tileSide * tileScale) }
 
-    /// Renders one tile; nil if Core Image cannot, in which case a flat tile stands in.
+    /// Renders `image` as one tile; nil if Core Image cannot.
     nonisolated private static func renderTile(_ image: CIImage) -> CGImage? {
         let side = CGFloat(pixelSide)
         let bounds = CGRect(x: 0, y: 0, width: side, height: side)
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        // Working in gamma-encoded sRGB keeps the colour ramps perceptually centred on the theme tones.
+        // Working in gamma-encoded sRGB keeps the shading perceptually centred on the paper tone.
         let context = CIContext(options: [
             .workingColorSpace: space, .outputColorSpace: space, .cacheIntermediates: false
         ])
@@ -108,15 +85,6 @@ final class NotebookMaterials: ObservableObject {
             color.setFill()
             canvas.fill(canvas.format.bounds)
         }
-    }
-
-    nonisolated private static func leatherGrain() -> CIImage {
-        // Zero crossings of blurred noise become dark creases between rounded pebbles.
-        let relief = distanceFromMidGray(blurred(noise(.leatherRelief), radius: 4))
-        let creases = blurred(contrast(relief, gain: 30, pivot: 0), radius: 0.8)
-        let pores = blurred(noise(.leatherPores), radius: 0.7)
-        let grain = contrast(mix(creases, pores, amount: 0.3), gain: 0.7, pivot: 0.5)
-        return ramp(grain, from: NotebookTheme.leatherDeep.uiColor, to: NotebookTheme.leatherHighlight.uiColor)
     }
 
     /// Paper texture: soft fibres of several lengths and directions over a fine tooth and a faint
@@ -173,8 +141,6 @@ final class NotebookMaterials: ObservableObject {
 
     /// Mutually independent random fields, one per texture ingredient.
     enum NoiseField: CaseIterable {
-        case leatherRelief
-        case leatherPores
         case paperLightFibresLong
         case paperLightFibresMedium
         case paperLightFibresShort
@@ -187,8 +153,8 @@ final class NotebookMaterials: ObservableObject {
         /// Generator channel the field reads; never alpha, which Core Image premultiplies.
         fileprivate var channel: Int {
             switch self {
-            case .leatherRelief, .paperDarkFibresLong, .paperLightFibresMedium, .paperTooth: 0
-            case .leatherPores, .paperLightFibresShort, .paperDarkFibresShort, .paperFormation: 1
+            case .paperDarkFibresLong, .paperLightFibresMedium, .paperTooth: 0
+            case .paperLightFibresShort, .paperDarkFibresShort, .paperFormation: 1
             case .paperLightFibresLong, .paperDarkFibresMedium: 2
             }
         }
@@ -198,7 +164,7 @@ final class NotebookMaterials: ObservableObject {
         /// they never use the same orientation in the same quadrant.
         fileprivate var quadrantOrientations: [NoiseOrientation] {
             switch self {
-            case .leatherRelief, .leatherPores, .paperLightFibresLong: NoiseOrientation.rotations
+            case .paperLightFibresLong: NoiseOrientation.rotations
             case .paperLightFibresShort: NoiseOrientation.rotations.cycled(by: 1)
             case .paperDarkFibresMedium: NoiseOrientation.rotations.cycled(by: 2)
             case .paperDarkFibresLong: NoiseOrientation.flips
@@ -269,21 +235,6 @@ final class NotebookMaterials: ObservableObject {
         return filter.outputImage ?? image
     }
 
-    /// |value - 0.5| per channel, computed as the square root of (value - 0.5)².
-    nonisolated private static func distanceFromMidGray(_ image: CIImage) -> CIImage {
-        let square = CIFilter.colorPolynomial()
-        square.inputImage = image
-        let coefficients = CIVector(x: 0.25, y: -1, z: 1, w: 0)
-        square.redCoefficients = coefficients
-        square.greenCoefficients = coefficients
-        square.blueCoefficients = coefficients
-        square.alphaCoefficients = CIVector(x: 0, y: 1, z: 0, w: 0)
-        let root = CIFilter.gammaAdjust()
-        root.inputImage = square.outputImage
-        root.power = 0.5
-        return root.outputImage ?? image
-    }
-
     /// Scales values around `pivot` and clamps them to the unit range.
     nonisolated private static func contrast(_ image: CIImage, gain: CGFloat, pivot: CGFloat) -> CIImage {
         clamped(image, gain: gain, bias: pivot - pivot * gain)
@@ -328,14 +279,6 @@ final class NotebookMaterials: ObservableObject {
         return filter.outputImage ?? image
     }
 
-    nonisolated private static func ramp(_ image: CIImage, from dark: UIColor, to light: UIColor) -> CIImage {
-        let filter = CIFilter.falseColor()
-        filter.inputImage = image
-        filter.color0 = CIColor(color: dark)
-        filter.color1 = CIColor(color: light)
-        return filter.outputImage ?? image
-    }
-
     /// Maps mid-grey to `color` and the ends of the unit range to `color` minus and plus `spread`
     /// in every component. A false-colour ramp would clamp its light end colour to white, which for
     /// paper whose red lies within `spread` of white would pull mid-grey, and so the page, off its hue.
@@ -377,41 +320,6 @@ struct NotebookMaterialAccessibility {
 
     var prefersPlainMaterials: Bool {
         isReduceTransparencyEnabled() || isIncreaseContrastEnabled()
-    }
-}
-
-/// Tiled leather for the toolbar band and the navigation band. The pattern is anchored to the
-/// window, like the canvas surround, so neighbouring leather surfaces continue one another
-/// without a seam.
-struct NotebookLeatherSurface: View {
-    @ObservedObject private var materials = NotebookMaterials.shared
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorSchemeContrast) private var contrast
-    @State private var originInWindow = CGPoint.zero
-
-    static func usesFlatFill(reduceTransparency: Bool, contrast: ColorSchemeContrast) -> Bool {
-        reduceTransparency || contrast == .increased
-    }
-
-    var body: some View {
-        Group {
-            if let tile = materials.leatherTile,
-               !Self.usesFlatFill(reduceTransparency: reduceTransparency, contrast: contrast) {
-                let phase = NotebookMaterials.patternPhase(at: originInWindow)
-                // One spare tile past the trailing and bottom edges leaves room to shift into phase.
-                Image(uiImage: tile)
-                    .resizable(resizingMode: .tile)
-                    .padding(.bottom, -NotebookMaterials.tileSide)
-                    .padding(.trailing, -NotebookMaterials.tileSide)
-                    .offset(x: -phase.x, y: -phase.y)
-            } else {
-                NotebookTheme.leatherMid.color
-            }
-        }
-        .clipped()
-        .onGeometryChange(for: CGPoint.self) { $0.frame(in: .global).origin } action: { originInWindow = $0 }
-        .onAppear { materials.prepare() }
-        .accessibilityHidden(true)
     }
 }
 

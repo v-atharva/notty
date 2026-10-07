@@ -86,13 +86,13 @@ final class NotebookWritingStatusTests: XCTestCase {
         let (session, probe, root) = try await makeSession()
         defer { try? FileManager.default.removeItem(at: root) }
         let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-        let window = makeWindow(hosting)
+        let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
             window.rootViewController = nil
         }
-        try await waitForUI { self.notebookController(in: hosting) != nil }
+        try await NotebookTestFixtures.waitUntil { self.notebookController(in: hosting) != nil }
         hosting.view.layoutIfNeeded()
         let controller = try XCTUnwrap(notebookController(in: hosting))
         // This case controls session observations; native callback fixtures exercise the delegate separately.
@@ -114,7 +114,7 @@ final class NotebookWritingStatusTests: XCTestCase {
         )
         try await waitForSuspendedSave(probe, after: 0, session: session)
         do {
-            try await waitForUI { session.statusModel.displayedStatus == .saving }
+            try await NotebookTestFixtures.waitUntil { session.statusModel.displayedStatus == .saving }
             try await settleLayout(hosting)
             original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
         } catch {
@@ -124,7 +124,7 @@ final class NotebookWritingStatusTests: XCTestCase {
         }
         await probe.releaseSave()
         await session.waitUntilSettled()
-        try await waitForUI { session.statusModel.state.status == session.saveState }
+        try await NotebookTestFixtures.waitUntil { session.statusModel.state.status == session.saveState }
         try await settleLayout(hosting)
         original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
         XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
@@ -137,7 +137,7 @@ final class NotebookWritingStatusTests: XCTestCase {
             ), ownerID: owner
         )
         await session.waitUntilSettled()
-        try await waitForUI { session.statusModel.state.status == .failed(.storageFull) }
+        try await NotebookTestFixtures.waitUntil { session.statusModel.state.status == .failed(.storageFull) }
         try await settleLayout(hosting)
         original.assertSame(controller, generation: session.canvasGeneration, expectedGeneration: generation)
         XCTAssertEqual(notebookController(in: hosting).map(ObjectIdentifier.init), original.controllerID)
@@ -161,7 +161,7 @@ final class NotebookWritingStatusTests: XCTestCase {
             XCTAssertNotEqual(first, second)
             XCTAssertNotEqual(model.displayedStatus, .saving)
             await clock.release(second)
-            try await waitForUI { model.displayedStatus == .saving }
+            try await NotebookTestFixtures.waitUntil { model.displayedStatus == .saving }
             model.update(presentation(.failed(.storageFull)))
             XCTAssertEqual(model.displayedStatus, .failed(.storageFull))
             model.reset()
@@ -181,13 +181,13 @@ final class NotebookWritingStatusTests: XCTestCase {
             )
             defer { try? FileManager.default.removeItem(at: root) }
             let hosting = UIHostingController(rootView: NotebookScreen(session: session))
-            let window = makeWindow(hosting)
+            let window = try NotebookTestFixtures.window(showing: hosting)
             defer {
                 notebookController(in: hosting)?.tearDown()
                 window.isHidden = true
                 window.rootViewController = nil
             }
-            try await waitForUI { self.notebookController(in: hosting) != nil }
+            try await NotebookTestFixtures.waitUntil { self.notebookController(in: hosting) != nil }
             let controller = try XCTUnwrap(notebookController(in: hosting))
             controller.canvasView.delegate = nil
             let owner = try XCTUnwrap(session.canvasOwnerID)
@@ -220,7 +220,7 @@ final class NotebookWritingStatusTests: XCTestCase {
             let canvasBefore = session.renderDiagnostics.canvasUpdateCount
             let controllerID = ObjectIdentifier(controller)
             await clock.release(newExpiry)
-            try await waitForUI { session.recoveryMessage == nil }
+            try await NotebookTestFixtures.waitUntil { session.recoveryMessage == nil }
             try await settleLayout(hosting)
             XCTAssertNil(session.recoveryFailure)
             XCTAssertEqual(session.renderDiagnostics.screenBodyCount, screenBefore)
@@ -262,7 +262,7 @@ final class NotebookWritingStatusTests: XCTestCase {
             try await settleTasks()
             XCTAssertEqual(session.recoveryMessage, reopenedMessage)
             await clock.release(reopenedExpiry)
-            try await waitForUI { session.recoveryMessage == nil }
+            try await NotebookTestFixtures.waitUntil { session.recoveryMessage == nil }
             XCTAssertNil(session.recoveryFailure)
             await clock.releaseAll()
         } catch {
@@ -740,7 +740,7 @@ final class NotebookWritingStatusTests: XCTestCase {
         do {
             try await waitForSuspendedSave(probe, after: 0, session: session)
             await gate.release()
-            try await waitForUI { session.inputGate == .readOnly }
+            try await NotebookTestFixtures.waitUntil { session.inputGate == .readOnly }
             let later = nearEndDrawing(x: 120)
             session.recordObservation(
                 NotebookCanvasObservation(generation: 2, drawing: later,
@@ -780,13 +780,13 @@ final class NotebookWritingStatusTests: XCTestCase {
             pageCount: seed.pageCount, initialDrawing: seed.drawing,
             toolStore: NotebookTestFixtures.toolStore()
         )
-        let window = makeWindow(controller)
+        let window = try NotebookTestFixtures.window(showing: controller)
         defer {
             controller.tearDown()
             window.isHidden = true
             window.rootViewController = nil
         }
-        try await waitForUI {
+        try await NotebookTestFixtures.waitUntil {
             controller.isCanvasVisible
                 && controller.view.window?.windowScene != nil
                 && controller.drawingToolStore != nil
@@ -875,14 +875,14 @@ final class NotebookWritingStatusTests: XCTestCase {
     private func waitForRequest(
         _ clock: WritingFeedbackClock, duration: Duration, excluding: Set<UUID> = []
     ) async throws -> UUID {
-        for _ in 0..<100 {
-            let requests = await clock.requests(for: duration)
-            if let request = requests.first(where: { !excluding.contains($0) }) { return request }
-            try await Task.sleep(for: .milliseconds(20))
+        do {
+            return try await NotebookTestFixtures.waitForValue {
+                await clock.requests(for: duration).first(where: { !excluding.contains($0) })
+            }
+        } catch {
+            await clock.releaseAll()
+            throw error
         }
-        await clock.releaseAll()
-        XCTFail("The feedback timer did not begin within two seconds.")
-        throw NotebookSaveFailure.unexpected
     }
 
     private func settleTasks() async throws {
@@ -893,12 +893,7 @@ final class NotebookWritingStatusTests: XCTestCase {
         _ probe: NotebookStorageProbe, after previousCalls: Int, session: NotebookSession
     ) async throws {
         do {
-            for _ in 0..<100 {
-                if await probe.saveCalls > previousCalls { return }
-                try await Task.sleep(for: .milliseconds(20))
-            }
-            XCTFail("The retried save did not begin within two seconds.")
-            throw NotebookSaveFailure.unexpected
+            try await NotebookTestFixtures.waitUntil { await probe.saveCalls > previousCalls }
         } catch {
             await probe.releaseSave()
             await session.waitUntilSettled()
@@ -924,20 +919,6 @@ final class NotebookWritingStatusTests: XCTestCase {
         return (session, probe, root)
     }
 
-    private func makeWindow(_ hosting: UIViewController) -> UIWindow {
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
-        window.rootViewController = hosting
-        window.makeKeyAndVisible()
-        hosting.view.layoutIfNeeded()
-        return window
-    }
-
     private func notebookController(in controller: UIViewController) -> NotebookViewController? {
         if let notebook = controller as? NotebookViewController { return notebook }
         for child in controller.children {
@@ -949,15 +930,6 @@ final class NotebookWritingStatusTests: XCTestCase {
     private func settleLayout(_ hosting: UIViewController) async throws {
         try await Task.sleep(for: .milliseconds(100))
         hosting.view.layoutIfNeeded()
-    }
-
-    private func waitForUI(_ ready: @escaping @MainActor () -> Bool) async throws {
-        for _ in 0..<100 {
-            if ready() { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTFail("Writing status UI did not become ready within two seconds.")
-        throw NotebookSaveFailure.unexpected
     }
 }
 

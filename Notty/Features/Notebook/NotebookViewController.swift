@@ -72,6 +72,23 @@ final class NotebookViewController: UIViewController {
     private var isAdjustingLayout = false
     private var observesToolStore = false
     private var toolbarKeepsAccess = false
+    private var chrome = NotebookCanvasChrome.none
+    /// The store whose toolbar the host draws over this canvas.
+    private weak var overlayStore: NotebookSceneToolStore?
+    private var resizeCapture: ResizeCapture?
+
+    /// Whether the page rested at its revealed top when a resize began. It is taken at the first
+    /// sign of the resize, before any of its changes apply, and every layout and inset change of
+    /// that resize reads it: an inset change or layout clamp within the resize can move a page
+    /// that was merely near its top onto it.
+    private struct ResizeCapture {
+        /// The size the canvas was laid out at when the resize began.
+        let from: CGSize
+        let restedAtRevealedTop: Bool
+        /// False while the only sign is a toolbar re-measured for a new control area, which a
+        /// header change at the same canvas size causes as well.
+        var isConfirmed: Bool
+    }
 
     private var logicalHeight: CGFloat {
         CGFloat(geometry.pageHeight) * CGFloat(pageCount)
@@ -99,7 +116,7 @@ final class NotebookViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = NotebookTheme.leatherMid.uiColor
+        view.backgroundColor = NotebookTheme.backdropStone.uiColor
         view.clipsToBounds = true
         // The paper is always light; PencilKit would otherwise adapt ink colours for dark mode.
         overrideUserInterfaceStyle = .light
@@ -162,7 +179,14 @@ final class NotebookViewController: UIViewController {
         }
 
         let hadViewport = previousViewportSize.width > 0
-        let restsAtTop = hadViewport && isAtTopOfPaper
+        // A resize the toolbar or chrome measurement announced was captured before it changed
+        // the insets; otherwise this layout is its first sign.
+        var capture = resizeCapture.flatMap { $0.from == previousViewportSize ? $0 : nil }
+            ?? ResizeCapture(
+                from: previousViewportSize, restedAtRevealedTop: hadViewport && isAtTopOfPaper, isConfirmed: true
+            )
+        capture.isConfirmed = true
+        let restsAtTop = hadViewport && capture.restedAtRevealedTop
         let oldScale = max(canvas.zoomScale, 0.001)
         let oldFit = previousViewportSize.width / logicalWidth
         let wasWidthFitted = !hadViewport || abs(oldScale - oldFit) < 0.01
@@ -197,7 +221,9 @@ final class NotebookViewController: UIViewController {
         }
         canvas.setContentOffset(clampedOffset(proposedOffset), animated: false)
         previousViewportSize = newSize
+        resizeCapture = hadViewport ? capture : nil
         isAdjustingLayout = false
+        finishResizeIfSettled()
         updatePaperViewport()
         paperView.finishZoom()
     }
@@ -381,12 +407,11 @@ final class NotebookViewController: UIViewController {
         toolBeginGeneration = nil
         setToolActive(false)
         if let pendingTool { applyTool(pendingTool) }
-        applyOverlayObstruction()
+        releaseHeldInsets()
         publishUndoAvailability()
     }
 
-    /// The store mirrors tool use so the toolbar host can hold back layout changes that
-    /// would move the canvas under a stroke.
+    /// The store is scene-wide, so only its owner's tool use is mirrored there.
     private func setToolActive(_ active: Bool) {
         canvas.hasActiveTool = active
         if ownsToolStore { toolStore?.setToolActive(active, for: self) }
@@ -471,6 +496,8 @@ final class NotebookViewController: UIViewController {
         onDetach = nil
         toolStore?.detach(self)
         observesToolStore = false
+        overlayStore?.uncover(self)
+        overlayStore = nil
         if let pencilInteraction {
             pencilInteraction.delegate = nil
             canvas.removeInteraction(pencilInteraction)
@@ -511,22 +538,96 @@ final class NotebookViewController: UIViewController {
         paperView.setViewport(scale: canvas.zoomScale, offset: canvas.contentOffset)
     }
 
-    /// Reserves the canvas edges a floating toolbar covers as scroll space. Reserving space
-    /// leaves the visible page where it is, except that a page resting at its top moves to the
-    /// new top, below the toolbar; releasing space can only move a page scrolled past the new
-    /// end back to that end.
-    func applyOverlayObstruction() {
-        guard isViewLoaded, !isTornDown, ownsToolStore else { return }
+    /// Reserves the canvas edges the toolbar covers as scroll space, on top of the chrome.
+    /// - Parameter followingResize: true when the toolbar was re-measured for a new control area
+    ///   rather than moved. That re-measure arrives before the canvas is laid out at its new size,
+    ///   and a header change at the same canvas size causes it too, so it only opens a resize
+    ///   for the layout or chrome measurement that follows to confirm.
+    func applyOverlayObstruction(followingResize: Bool) {
+        guard !isTornDown else { return }
+        if !followingResize {
+            resizeCapture = nil
+        } else if resizeCapture == nil, previousViewportSize.width > 0 {
+            resizeCapture = ResizeCapture(
+                from: previousViewportSize, restedAtRevealedTop: isAtTopOfPaper, isConfirmed: false
+            )
+        }
+        updateInsets(followingResize: followingResize)
+    }
+
+    /// Reserves the toolbar the host draws over this canvas whether or not the canvas owns the
+    /// tools, as a paused canvas can neither move nor collapse it.
+    func placeUnderToolbar(of store: NotebookSceneToolStore?) {
+        guard !isTornDown, store !== overlayStore else { return }
+        overlayStore?.uncover(self)
+        overlayStore = store
+        store?.cover(self)
         updateInsets()
     }
 
-    private func updateInsets() {
+    /// The owner reserves the toolbar it takes its tools from, and a canvas shown under the
+    /// toolbar reserves it without owning the tools.
+    private var toolbarObstruction: UIEdgeInsets {
+        if ownsToolStore, let toolStore { return toolStore.overlayObstruction }
+        if let overlayStore, overlayStore.covers(self) { return overlayStore.overlayObstruction }
+        return .zero
+    }
+
+    /// Reserves the canvas edges the status bar, navigation header and home indicator cover as
+    /// scroll space. Every canvas applies them, whatever its gate or toolbar ownership.
+    func applyChrome(_ chrome: NotebookCanvasChrome) {
+        guard !isTornDown, chrome != self.chrome else { return }
+        let previous = self.chrome.canvasSize
+        self.chrome = chrome
+        let resized = previous != .zero && chrome.canvasSize != .zero && !Self.matches(previous, chrome.canvasSize)
+        if !resized {
+            // The header or home indicator changed, or was measured for the first time.
+            resizeCapture = nil
+        } else if var capture = resizeCapture, Self.matches(capture.from, previous) {
+            capture.isConfirmed = true
+            resizeCapture = capture
+        } else if Self.matches(previousViewportSize, previous) {
+            // Measured before the canvas is laid out at its new size, so nothing has moved yet.
+            resizeCapture = ResizeCapture(
+                from: previousViewportSize, restedAtRevealedTop: isAtTopOfPaper, isConfirmed: true
+            )
+        } else {
+            // Laid out at the new size already, and the resize has ended since, as when the toolbar moved.
+            resizeCapture = nil
+        }
+        updateInsets(followingResize: resized)
+        finishResizeIfSettled()
+    }
+
+    /// Ends a resize once the canvas is laid out at its new size and the chrome, when the host
+    /// measures it, has caught up.
+    private func finishResizeIfSettled() {
+        guard let capture = resizeCapture, capture.isConfirmed, previousViewportSize != capture.from,
+              chrome.canvasSize == .zero || Self.matches(chrome.canvasSize, previousViewportSize) else { return }
+        resizeCapture = nil
+    }
+
+    /// The host's measured size and the size UIKit lays the canvas out at may differ by pixel rounding.
+    private static func matches(_ size: CGSize, _ other: CGSize) -> Bool {
+        abs(size.width - other.width) < 0.5 && abs(size.height - other.height) < 0.5
+    }
+
+    /// Applies insets held back while a stroke was in progress.
+    private func releaseHeldInsets() {
+        guard !isTornDown else { return }
+        updateInsets()
+    }
+
+    /// Edge insets add scroll range to reveal covered writing. Reserving range never moves the
+    /// page; releasing it only pulls a page scrolled past the new end back to that end, and
+    /// waits until a stroke in progress ends. The one exception is a confirmed resize: a page
+    /// that rested at its revealed top when the resize began stays there instead of ending up
+    /// under the header or toolbar. Horizontally the page stays centred.
+    private func updateInsets(followingResize: Bool = false) {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
-        // Overlay edges add scroll range to reveal covered writing without moving the page.
-        // Horizontally the page stays centred.
-        let obstruction = ownsToolStore ? toolStore?.overlayObstruction ?? .zero : .zero
-        var top = max(obstruction.top, 0)
-        var bottom = max(obstruction.bottom, 0)
+        let obstruction = toolbarObstruction
+        var top = max(chrome.top, 0) + max(obstruction.top, 0)
+        var bottom = max(chrome.bottom, 0) + max(obstruction.bottom, 0)
         if canvas.hasActiveTool {
             // A smaller inset pulls an offset beyond it back into range, which would move the
             // page under the stroke; the space is released when the stroke ends.
@@ -541,6 +642,10 @@ final class NotebookViewController: UIViewController {
         let indicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
         if canvas.verticalScrollIndicatorInsets != indicatorInsets {
             canvas.verticalScrollIndicatorInsets = indicatorInsets
+        }
+        if followingResize, let resizeCapture, resizeCapture.isConfirmed, resizeCapture.restedAtRevealedTop,
+           !canvas.hasActiveTool, !isAtTopOfPaper {
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -top), animated: false)
         }
     }
 
@@ -585,7 +690,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         toolBeginGeneration = nil
         setToolActive(false)
         if let pendingTool { applyTool(pendingTool) }
-        applyOverlayObstruction()
+        releaseHeldInsets()
         publishUndoAvailability()
         if let begin, let end = lastDeliveredSignature, let beginGeneration,
            begin.constructionWork.nativeDrawingFallbackSnapshots == 0,

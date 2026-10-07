@@ -1,26 +1,23 @@
 import CoreImage
 import NottyCore
 import PencilKit
-import SwiftUI
 import UIKit
 import XCTest
 @testable import Notty
 
 @MainActor
 final class NotebookMaterialsTests: XCTestCase {
-    func testTilesAreRenderedOnceAcrossManyUses() async {
+    func testTileIsRenderedOnceAcrossManyUses() async {
         let probe = RenderProbe()
         let materials = probe.materials()
         XCTAssertEqual(probe.renderCount, 0)
         await ready(materials)
-        XCTAssertEqual(probe.renderCount, 1, "One render produces both tiles.")
-        let leather = materials.leatherTile
+        XCTAssertEqual(probe.renderCount, 1)
         let fibre = materials.paperFibrePattern
-        XCTAssertNotNil(leather)
+        XCTAssertNotNil(fibre)
         let settings = AccessibilitySettings()
         for _ in 0..<200 {
             materials.prepare()
-            XCTAssertTrue(materials.leatherTile === leather)
             XCTAssertTrue(materials.paperFibrePattern === fibre)
         }
         await ready(materials)
@@ -54,39 +51,33 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertTrue(paper.grainLayer.animationKeys()?.isEmpty ?? true)
     }
 
-    func testFailedRenderingFallsBackToFlatTiles() async throws {
-        let materials = NotebookMaterials { NotebookMaterials.RenderedTiles(leather: nil, paperFibre: nil) }
-        let settings = AccessibilitySettings()
-        let paper = NotebookPaperView(frame: .zero, materials: materials, accessibility: settings.source)
+    func testFailedRenderingFallsBackToFlatPaper() async throws {
+        let materials = NotebookMaterials { nil }
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 300, height: 200), materials: materials,
+            accessibility: AccessibilitySettings().source
+        )
+        paper.setGeometry(width: 794, height: 1_123, boundaries: [])
+        paper.setViewport(scale: 1, offset: CGPoint(x: 40, y: 20))
         await ready(materials)
-        let leather = try SRGBPixels(try XCTUnwrap(materials.leatherTile))
-        XCTAssertLessThan(leather.luminanceRange, 0.001)
-        let expected = try XCTUnwrap(SRGBPixels.components(NotebookTheme.leatherMid.uiColor))
-        XCTAssertEqual(leather.meanColor.red, expected.red, accuracy: 0.01)
-        XCTAssertEqual(leather.meanColor.green, expected.green, accuracy: 0.01)
-        XCTAssertEqual(leather.meanColor.blue, expected.blue, accuracy: 0.01)
         XCTAssertNotNil(paper.grainLayer.backgroundColor?.pattern)
+        let pixels = try render(paper, scale: 2)
+        XCTAssertLessThan(pixels.luminanceRange, 0.001, "A failed render leaves flat paper, not a pattern.")
+        try assertMeanColor(of: pixels, equals: NotebookTheme.paperIvory)
     }
 
     func testTilePixelSizesAndMemoryAreBounded() async throws {
         let probe = RenderProbe()
         let materials = probe.materials()
         await ready(materials)
-        let rendered = try XCTUnwrap(probe.lastOutput)
-        var totalBytes = 0
-        for image in [try XCTUnwrap(rendered.leather), try XCTUnwrap(rendered.paperFibre)] {
-            XCTAssertEqual(image.width, 512)
-            XCTAssertEqual(image.height, 512)
-            totalBytes += image.bytesPerRow * image.height
-        }
-        let leather = try XCTUnwrap(materials.leatherTile)
-        XCTAssertEqual(leather.size, CGSize(width: NotebookMaterials.tileSide, height: NotebookMaterials.tileSide))
-        XCTAssertEqual(leather.scale, NotebookMaterials.tileScale)
-        XCTAssertLessThan(totalBytes, 8 * 1_024 * 1_024)
+        let fibre = try XCTUnwrap(probe.lastOutput)
+        XCTAssertEqual(fibre.width, 512)
+        XCTAssertEqual(fibre.height, 512)
+        XCTAssertLessThanOrEqual(fibre.bytesPerRow * fibre.height, 1_024 * 1_024, "One RGBA tile, nothing more.")
     }
 
     func testFibreTileIsVisibleButStaysCloseToThePaperColour() async throws {
-        let pixels = try SRGBPixels(await Self.renderedTiles().fibre)
+        let pixels = try SRGBPixels(await Self.renderedFibreTile())
         let paper = try XCTUnwrap(SRGBPixels.components(NotebookPaperView.paperColor))
         let paperLuminance = SRGBPixels.relativeLuminance(paper)
         let deviations = pixels.colors.map { abs(SRGBPixels.relativeLuminance($0) - paperLuminance) }
@@ -102,60 +93,84 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertEqual(mean.blue, paper.blue, accuracy: 0.004)
     }
 
-    func testLeatherTileKeepsTheWarmThemeTone() async throws {
-        let pixels = try SRGBPixels(await Self.renderedTiles().leather)
-        let theme = try XCTUnwrap(SRGBPixels.components(NotebookTheme.leatherMid.uiColor))
-        let mean = pixels.meanColor
-        XCTAssertEqual(mean.red, theme.red, accuracy: 0.03)
-        XCTAssertEqual(mean.green, theme.green, accuracy: 0.03)
-        XCTAssertEqual(mean.blue, theme.blue, accuracy: 0.03)
-        for color in pixels.colors {
-            XCTAssertGreaterThanOrEqual(color.red, color.green)
-            XCTAssertGreaterThanOrEqual(color.green, color.blue)
+    func testTileWrapsWithoutVisibleSeams() async throws {
+        let pixels = try SRGBPixels(await Self.renderedFibreTile())
+        let last = pixels.width - 1
+        let middle = pixels.width / 2
+        let horizontalSeam = pixels.meanDifference { (pixels.color(x: 0, y: $0), pixels.color(x: last, y: $0)) }
+        let horizontalInterior = pixels.meanDifference {
+            (pixels.color(x: middle, y: $0), pixels.color(x: middle - 1, y: $0))
         }
+        let verticalSeam = pixels.meanDifference { (pixels.color(x: $0, y: 0), pixels.color(x: $0, y: last)) }
+        let verticalInterior = pixels.meanDifference {
+            (pixels.color(x: $0, y: middle), pixels.color(x: $0, y: middle - 1))
+        }
+        XCTAssertLessThanOrEqual(horizontalSeam, horizontalInterior * 1.5 + 0.001)
+        XCTAssertLessThanOrEqual(verticalSeam, verticalInterior * 1.5 + 0.001)
     }
 
-    func testTilesWrapWithoutVisibleSeams() async throws {
-        let tiles = await Self.renderedTiles()
-        for tile in [tiles.leather, tiles.fibre] {
-            let pixels = try SRGBPixels(tile)
-            let last = pixels.width - 1
-            let middle = pixels.width / 2
-            let horizontalSeam = pixels.meanDifference { (pixels.color(x: 0, y: $0), pixels.color(x: last, y: $0)) }
-            let horizontalInterior = pixels.meanDifference {
-                (pixels.color(x: middle, y: $0), pixels.color(x: middle - 1, y: $0))
-            }
-            let verticalSeam = pixels.meanDifference { (pixels.color(x: $0, y: 0), pixels.color(x: $0, y: last)) }
-            let verticalInterior = pixels.meanDifference {
-                (pixels.color(x: $0, y: middle), pixels.color(x: $0, y: middle - 1))
-            }
-            XCTAssertLessThanOrEqual(horizontalSeam, horizontalInterior * 1.5 + 0.001)
-            XCTAssertLessThanOrEqual(verticalSeam, verticalInterior * 1.5 + 0.001)
-        }
-    }
-
-    func testGrainLayerSitsInsideContentBelowDividersAndEdge() async throws {
+    func testGrainCoversHeadMarginAndPagesBelowEveryLineAndShade() async throws {
         await ready(.shared)
         let paper = NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source)
         paper.setGeometry(width: 794, height: 3_369, boundaries: [1_123, 2_246])
         let sublayers = try XCTUnwrap(paper.contentLayer.sublayers)
         XCTAssertTrue(paper.grainLayer.superlayer === paper.contentLayer)
-        XCTAssertTrue(sublayers.first === paper.grainLayer)
+        XCTAssertTrue(sublayers.first === paper.headMarginLayer, "the opaque grain must lie over the head margin")
+        XCTAssertTrue(sublayers.dropFirst().first === paper.grainLayer)
         let grainIndex = try XCTUnwrap(sublayers.firstIndex { $0 === paper.grainLayer })
-        let edgeIndex = try XCTUnwrap(sublayers.firstIndex { $0 === paper.edgeLayer })
-        XCTAssertLessThan(grainIndex, edgeIndex)
-        for divider in paper.boundaryLayers {
-            XCTAssertLessThan(grainIndex, try XCTUnwrap(sublayers.firstIndex { $0 === divider }))
+        for line in Self.linesAndShading(of: paper) + paper.boundaryLayers {
+            XCTAssertLessThan(grainIndex, try XCTUnwrap(sublayers.firstIndex { $0 === line }))
         }
-        XCTAssertEqual(paper.grainLayer.frame, CGRect(x: 0, y: 0, width: 794, height: 3_369))
+        XCTAssertEqual(paper.grainLayer.frame, CGRect(x: 0, y: -600, width: 794, height: 3_969))
         XCTAssertFalse(paper.grainLayer.isHidden)
         XCTAssertNil(paper.grainLayer.contents)
         XCTAssertNotNil(paper.grainLayer.backgroundColor?.pattern)
 
         paper.setGeometry(width: 794, height: 4_492, boundaries: [1_123, 2_246, 3_369])
-        XCTAssertEqual(paper.grainLayer.frame, CGRect(x: 0, y: 0, width: 794, height: 4_492))
-        XCTAssertTrue(paper.contentLayer.sublayers?.first === paper.grainLayer)
+        XCTAssertEqual(paper.grainLayer.frame, CGRect(x: 0, y: -600, width: 794, height: 5_092))
+        XCTAssertTrue(paper.contentLayer.sublayers?.dropFirst().first === paper.grainLayer)
         XCTAssertTrue(paper.grainLayer.animationKeys()?.isEmpty ?? true)
+    }
+
+    func testHeadMarginContinuesThePaperAbovePageOne() async throws {
+        await ready(.shared)
+        let settings = AccessibilitySettings()
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 834, height: 700), accessibility: settings.source
+        )
+        let window = try hostInWindow(paper)
+        defer { window.close() }
+        paper.setGeometry(width: 794, height: 2_246, boundaries: [1_123])
+        XCTAssertEqual(paper.headMarginLayer.frame, CGRect(x: 0, y: -600, width: 794, height: 600))
+        XCTAssertEqual(paper.headMarginLayer.backgroundColor, NotebookTheme.paperIvory.cgColor)
+        XCTAssertFalse(paper.headMarginLayer.isHidden)
+        XCTAssertEqual(paper.pageTopLayer.position, .zero, "page 1 begins at a divider, like every page")
+        XCTAssertEqual(paper.pageTopLayer.backgroundColor, NotebookTheme.paperDivider.cgColor)
+
+        // Width fit with page 1 starting 400 pt down: everything above it is the head margin.
+        let scale = paper.traitCollection.displayScale
+        paper.setViewport(scale: 834 / 794, offset: CGPoint(x: 0, y: -400))
+        paper.finishZoom()
+        let margin = 0..<Int((398 * scale).rounded())
+        let textured = try render(paper, scale: scale)
+        let texturedMargin = textured.region(rows: margin)
+        XCTAssertGreaterThan(texturedMargin.luminanceRange, 0.01, "The fibres continue through the head margin.")
+        try assertMeanColor(of: texturedMargin, equals: NotebookTheme.paperIvory)
+
+        settings.reducesTransparency = true
+        settings.post(UIAccessibility.reduceTransparencyStatusDidChangeNotification)
+        let plain = try render(paper, scale: scale).region(rows: margin)
+        XCTAssertLessThan(try largestDifference(in: plain, from: NotebookTheme.paperIvory), 0.01, "Plain paper, no stone.")
+
+        // Zoomed far out the head margin spans only 240 pt, and stone shows above it.
+        paper.setViewport(scale: 0.4, offset: CGPoint(x: -258.2, y: -300))
+        paper.finishZoom()
+        let farOut = try render(paper, scale: scale)
+        let pageColumns = Int((270 * scale).rounded())..<Int((560 * scale).rounded())
+        let stone = farOut.region(rows: 0..<Int((55 * scale).rounded()), columns: pageColumns)
+        XCTAssertLessThan(try largestDifference(in: stone, from: NotebookTheme.backdropStone), 0.01)
+        let head = farOut.region(rows: Int((65 * scale).rounded())..<Int((295 * scale).rounded()), columns: pageColumns)
+        XCTAssertLessThan(try largestDifference(in: head, from: NotebookTheme.paperIvory), 0.01)
     }
 
     func testThousandViewportUpdatesNeverRedrawOrReplaceTheGrain() async throws {
@@ -190,6 +205,251 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertTrue(paper.contentLayer.animationKeys()?.isEmpty ?? true)
     }
 
+    func testViewportUpdatesNeverMoveOrRedrawThePageEdges() async throws {
+        let paper = PaperDrawSpy(frame: .zero, accessibility: AccessibilitySettings().source)
+        let fixture = try await presentController(paperView: paper)
+        defer { fixture.close() }
+        try await waitForRenderedFrames()
+        let layers = [paper.headMarginLayer, paper.grainLayer] + Self.linesAndShading(of: paper)
+        let frames = layers.map(\.frame)
+        let drawCallsBefore = paper.drawCalls
+        let thicknessBefore = paper.thicknessUpdates
+        for step in 1...1_000 {
+            let offset = CGPoint(x: CGFloat(step % 13), y: CGFloat(step))
+            paper.setViewport(scale: 0.5 + CGFloat(step % 9) * 0.25, offset: offset)
+        }
+        try await waitForRenderedFrames()
+        XCTAssertEqual(paper.drawCalls, drawCallsBefore)
+        XCTAssertEqual(paper.thicknessUpdates, thicknessBefore, "Edge thickness changes only when a zoom ends.")
+        XCTAssertEqual(layers.map(\.frame), frames)
+        for layer in layers {
+            XCTAssertNil(layer.contents)
+            XCTAssertTrue(layer.animationKeys()?.isEmpty ?? true)
+        }
+    }
+
+    func testPageEdgesLieJustOutsideThePaperOneDevicePixelThick() throws {
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 834, height: 600), accessibility: AccessibilitySettings().source
+        )
+        let window = try hostInWindow(paper)
+        defer { window.close() }
+        let width: CGFloat = 794
+        for (pages, scale) in [(1, CGFloat(0.4)), (3, 1), (4, 2.5)] {
+            let height = 1_123 * CGFloat(pages)
+            paper.setGeometry(width: width, height: height, boundaries: (1..<pages).map { 1_123 * CGFloat($0) })
+            paper.setViewport(scale: scale, offset: .zero)
+            paper.finishZoom()
+            let pixel = 1 / paper.traitCollection.displayScale
+            let bottom = paper.edgeLayer.frame
+            let leading = paper.leadingEdgeLayer.frame
+            let trailing = paper.trailingEdgeLayer.frame
+            let pageTop = paper.pageTopLayer.frame
+            XCTAssertEqual(bottom.minX, 0, accuracy: 0.001)
+            XCTAssertEqual(bottom.width, width, accuracy: 0.001)
+            XCTAssertEqual(bottom.minY, height, accuracy: 0.001, "The bottom edge sits below the last page.")
+            XCTAssertEqual(bottom.height * scale, pixel, accuracy: 0.001)
+            XCTAssertEqual(leading.maxX, 0, accuracy: 0.001, "The leading edge sits beside the paper.")
+            XCTAssertEqual(trailing.minX, width, accuracy: 0.001, "The trailing edge sits beside the paper.")
+            for side in [leading, trailing] {
+                XCTAssertEqual(side.width * scale, pixel, accuracy: 0.001)
+                XCTAssertEqual(side.minY, -600, accuracy: 0.001, "The sides run up the head margin.")
+                XCTAssertEqual(side.maxY, bottom.maxY, accuracy: 0.001, "The sides close the lower corners.")
+            }
+            XCTAssertEqual(pageTop.midY, 0, accuracy: 0.001)
+            XCTAssertEqual(pageTop.width, width, accuracy: 0.001)
+            XCTAssertEqual(pageTop.height * scale, pixel, accuracy: 0.001)
+            for edge in [paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer] {
+                XCTAssertFalse(edge.isHidden)
+                XCTAssertEqual(edge.backgroundColor, NotebookTheme.paperEdge.cgColor)
+            }
+            XCTAssertEqual(paper.bottomShadowLayer.frame, CGRect(x: 0, y: height, width: width, height: 6))
+            XCTAssertEqual(paper.leadingShadowLayer.frame, CGRect(x: -3, y: -600, width: 3, height: height + 600))
+            XCTAssertEqual(paper.trailingShadowLayer.frame, CGRect(x: width, y: -600, width: 3, height: height + 600))
+            XCTAssertEqual(paper.leadingCornerShadowLayer.frame, CGRect(x: -3, y: height, width: 3, height: 6))
+            XCTAssertEqual(paper.trailingCornerShadowLayer.frame, CGRect(x: width, y: height, width: 3, height: 6))
+        }
+        let tone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.toolbarShadowTone.uiColor))
+        for (shadow, opacity): (CAGradientLayer, CGFloat) in [
+            (paper.bottomShadowLayer, 0.18), (paper.leadingShadowLayer, 0.12), (paper.trailingShadowLayer, 0.12),
+            (paper.leadingCornerShadowLayer, 0.15), (paper.trailingCornerShadowLayer, 0.15)
+        ] {
+            let colors = try XCTUnwrap(shadow.colors as? [CGColor])
+            XCTAssertEqual(colors.count, 2)
+            XCTAssertEqual(colors.first?.alpha ?? 0, opacity, accuracy: 0.000_1, "darkest against the paper")
+            XCTAssertEqual(colors.last?.alpha, 0, "fading out")
+            for color in colors {
+                let opaque = try XCTUnwrap(color.copy(alpha: 1))
+                let components = try XCTUnwrap(SRGBPixels.components(UIColor(cgColor: opaque)))
+                XCTAssertEqual(components.red, tone.red, accuracy: 0.001, "a warm fade that never passes through gray")
+                XCTAssertEqual(components.blue, tone.blue, accuracy: 0.001)
+            }
+            XCTAssertFalse(shadow.isHidden)
+        }
+        XCTAssertEqual(paper.leadingShadowLayer.startPoint.x, 1, "the leading band is darkest at the paper")
+        XCTAssertEqual(paper.trailingShadowLayer.startPoint.x, 0, "the trailing band is darkest at the paper")
+        XCTAssertEqual(paper.bottomShadowLayer.startPoint.y, 0, "the bottom band is darkest at the paper")
+        XCTAssertEqual(paper.leadingCornerShadowLayer.type, .radial)
+        XCTAssertEqual(paper.trailingCornerShadowLayer.type, .radial)
+    }
+
+    /// The bottom and side bands meet outside each lower corner of the paper. The shading must
+    /// turn the corner with no step between neighbouring pixels off the hairlines, and must not
+    /// spread past the bands' depths.
+    func testShadingTurnsTheLowerCornersWithoutAStep() throws {
+        let settings = AccessibilitySettings()
+        // Flat colours, so every step between neighbouring pixels comes from the shading.
+        settings.increasesContrast = true
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 200, height: 200), accessibility: settings.source
+        )
+        let window = try hostInWindow(paper)
+        defer { window.close() }
+        paper.setGeometry(width: 794, height: 1_123, boundaries: [])
+        let zoom: CGFloat = 4
+        let scale = paper.traitCollection.displayScale
+        let perPoint = Int((zoom * scale).rounded())
+        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
+        for (name, cornerX, outward) in [("leading", CGFloat(0), -1), ("trailing", CGFloat(794), 1)] {
+            // The page corner lands in the middle of the view, on a device pixel boundary.
+            paper.setViewport(scale: zoom, offset: CGPoint(x: cornerX * zoom - 100, y: 1_123 * zoom - 100))
+            paper.finishZoom()
+            let pixels = try render(paper, scale: scale)
+            let corner = Int((100 * scale).rounded())
+            // The side hairline is the pixel column just outside the page and ends on the bottom
+            // hairline, the pixel row just below it.
+            let sideColumn = outward < 0 ? corner - 1 : corner
+            func isHairline(_ x: Int, _ y: Int) -> Bool {
+                (x == sideColumn && y <= corner) || (y == corner && (outward < 0 ? x > sideColumn : x < sideColumn))
+            }
+            var largestStep = 0.0
+            for y in (corner - perPoint)..<(corner + 8 * perPoint) {
+                for x in (corner - 4 * perPoint)..<(corner + 4 * perPoint) where !isHairline(x, y) {
+                    for (nextX, nextY) in [(x + 1, y), (x, y + 1)] where !isHairline(nextX, nextY) {
+                        let first = pixels.color(x: x, y: y), second = pixels.color(x: nextX, y: nextY)
+                        largestStep = max(
+                            largestStep, abs(first.red - second.red), abs(first.green - second.green),
+                            abs(first.blue - second.blue)
+                        )
+                    }
+                }
+            }
+            XCTAssertLessThan(largestStep, 0.03, "the shading turns the \(name) corner without a step")
+            let nearCorner = pixels.color(x: sideColumn + outward, y: corner + 1)
+            XCTAssertGreaterThan(stone.red - nearCorner.red, 0.05, "the \(name) corner is shaded")
+            try assertColor(
+                pixels.color(x: sideColumn + outward * (3 * perPoint + 2), y: corner + 3 * perPoint),
+                equals: NotebookTheme.backdropStone, "beside the \(name) corner, past the side band"
+            )
+            try assertColor(
+                pixels.color(x: sideColumn + outward * perPoint, y: corner + 6 * perPoint + 2),
+                equals: NotebookTheme.backdropStone, "below the \(name) corner, past the bottom band"
+            )
+        }
+    }
+
+    func testWidthFittedPageDrawsNoEdgeAlongTheScreenBorder() throws {
+        let settings = AccessibilitySettings()
+        // Flat colours, so a single edge pixel in a border column stands out.
+        settings.increasesContrast = true
+        for viewWidth: CGFloat in [744, 834, 1_032, 1_376] {
+            let paper = NotebookPaperView(
+                frame: CGRect(x: 0, y: 0, width: viewWidth, height: 300), accessibility: settings.source
+            )
+            let window = try hostInWindow(paper)
+            defer { window.close() }
+            paper.setGeometry(width: 794, height: 1_123, boundaries: [])
+            paper.setViewport(scale: viewWidth / 794, offset: CGPoint(x: 0, y: 200))
+            paper.finishZoom()
+            let pixels = try render(paper, scale: paper.traitCollection.displayScale)
+            for x in [0, 1, pixels.width - 2, pixels.width - 1] {
+                let column = SRGBPixels.mean(of: (0..<pixels.height).map { pixels.color(x: x, y: $0) })
+                try assertColor(column, equals: NotebookTheme.paperIvory, "column \(x) at width \(viewWidth)")
+            }
+        }
+    }
+
+    func testZoomedOutPaperSitsOnStoneWithEdgesAndShading() throws {
+        let settings = AccessibilitySettings()
+        settings.increasesContrast = true
+        let paper = NotebookPaperView(
+            frame: CGRect(x: 0, y: 0, width: 834, height: 800), accessibility: settings.source
+        )
+        let window = try hostInWindow(paper)
+        defer { window.close() }
+        // Half scale puts the paper edges on whole device pixels: 397 pt wide, 218.5 pt from
+        // either side, page 1 from 100 to 661.5 pt down.
+        paper.setGeometry(width: 794, height: 1_123, boundaries: [])
+        paper.setViewport(scale: 0.5, offset: CGPoint(x: -218.5, y: -100))
+        paper.finishZoom()
+        let scale = paper.traitCollection.displayScale
+        let pixels = try render(paper, scale: scale)
+        func pixel(_ point: CGFloat) -> Int { Int((point * scale).rounded()) }
+        let rows = pixel(200)..<pixel(400)
+        let columns = pixel(300)..<pixel(500)
+        func column(_ x: Int) -> SRGBPixels.Color { SRGBPixels.mean(of: rows.map { pixels.color(x: x, y: $0) }) }
+        func row(_ y: Int) -> SRGBPixels.Color { SRGBPixels.mean(of: columns.map { pixels.color(x: $0, y: y) }) }
+
+        try assertColor(column(pixel(100)), equals: NotebookTheme.backdropStone, "beside the paper")
+        try assertColor(column(pixel(218.5)), equals: NotebookTheme.paperIvory, "inside the leading edge")
+        try assertColor(column(pixel(615.5) - 1), equals: NotebookTheme.paperIvory, "inside the trailing edge")
+        try assertColor(row(pixel(98)), equals: NotebookTheme.paperIvory, "the head margin above page 1")
+        try assertColor(row(pixel(20)), equals: NotebookTheme.paperIvory, "the head margin reaches the top")
+        try assertColor(row(pixel(661.5) - 1), equals: NotebookTheme.paperIvory, "inside the bottom edge")
+        try assertColor(row(pixel(661.5) + 7), equals: NotebookTheme.backdropStone, "below the shading")
+
+        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
+        let ivory = try XCTUnwrap(SRGBPixels.components(NotebookTheme.paperIvory.uiColor))
+        for (name, edge, shade) in [
+            ("leading", column(pixel(218.5) - 1), column(pixel(218.5) - 2)),
+            ("trailing", column(pixel(615.5)), column(pixel(615.5) + 1)),
+            ("bottom", row(pixel(661.5)), row(pixel(661.5) + 1))
+        ] {
+            let contrast = SRGBPixels.contrastRatio(edge, stone)
+            XCTAssertGreaterThan(contrast, 1.8, "the \(name) edge shows against the stone")
+            XCTAssertLessThan(contrast, 2.6, "the \(name) edge stays a hairline")
+            let edgeLuminance = SRGBPixels.relativeLuminance(edge)
+            let shadeLuminance = SRGBPixels.relativeLuminance(shade)
+            XCTAssertLessThan(shadeLuminance, SRGBPixels.relativeLuminance(stone) - 0.01, "the \(name) shading shows")
+            XCTAssertGreaterThan(shadeLuminance, edgeLuminance, "the \(name) shading stays softer than the edge")
+        }
+        let pageTop = SRGBPixels.mean(of: [row(pixel(100) - 1), row(pixel(100))])
+        let dividerContrast = SRGBPixels.contrastRatio(pageTop, ivory)
+        XCTAssertGreaterThan(dividerContrast, 1.03, "a divider marks the top of page 1")
+        XCTAssertLessThan(dividerContrast, SRGBPixels.contrastRatio(row(pixel(661.5)), ivory), "fainter than the edge")
+    }
+
+    /// The paper must never show a band of stone above page 1. Drives the real controller at
+    /// width fit with the top space a header and docked toolbar reserve, through each way the
+    /// page comes to rest at its revealed top: scrolling there, pulling past it, and rotating.
+    /// Each state is checked with the textured and with the plain materials.
+    func testRealControllerShowsOnlyPaperAbovePageOneAtItsRevealedTop() async throws {
+        await ready(.shared)
+        let settings = AccessibilitySettings()
+        let store = NotebookTestFixtures.toolStore()
+        let fixture = try await presentController(
+            paperView: NotebookPaperView(frame: .zero, accessibility: settings.source), toolStore: store,
+            size: CGSize(width: 834, height: 1_194)
+        )
+        defer { fixture.close() }
+        let controller = fixture.controller
+        let canvas = controller.canvasView
+        store.setOverlayObstruction(UIEdgeInsets(top: 205, left: 0, bottom: 34, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, 205)
+
+        canvas.setContentOffset(CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top), animated: false)
+        try await assertOnlyPaperAbovePageOne(in: controller, settings: settings, "at the revealed top")
+        canvas.setContentOffset(CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top - 150), animated: false)
+        try await assertOnlyPaperAbovePageOne(in: controller, settings: settings, "pulled past the revealed top")
+
+        canvas.setContentOffset(CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top), animated: false)
+        fixture.window.frame = CGRect(x: 0, y: 0, width: 1_194, height: 834)
+        controller.view.frame = fixture.window.bounds
+        controller.view.layoutIfNeeded()
+        XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top, accuracy: 0.5, "the page still rests at its top")
+        try await assertOnlyPaperAbovePageOne(in: controller, settings: settings, "after rotating")
+    }
+
     func testGrainHidesWhileReduceTransparencyOrIncreaseContrastIsOn() {
         let settings = AccessibilitySettings()
         let paper = NotebookPaperView(frame: .zero, accessibility: settings.source)
@@ -218,26 +478,7 @@ final class NotebookMaterialsTests: XCTestCase {
         let paper = NotebookPaperView(frame: .zero, accessibility: settings.source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
         XCTAssertTrue(paper.grainLayer.isHidden)
-        XCTAssertEqual(paper.grainLayer.frame.height, 1_123)
-    }
-
-    func testLeatherSurfaceFallsBackToFlatColourForAccessibility() {
-        XCTAssertFalse(NotebookLeatherSurface.usesFlatFill(reduceTransparency: false, contrast: .standard))
-        XCTAssertTrue(NotebookLeatherSurface.usesFlatFill(reduceTransparency: true, contrast: .standard))
-        XCTAssertTrue(NotebookLeatherSurface.usesFlatFill(reduceTransparency: false, contrast: .increased))
-        XCTAssertTrue(NotebookLeatherSurface.usesFlatFill(reduceTransparency: true, contrast: .increased))
-    }
-
-    func testLeatherSurfaceRendersFlatUnderIncreasedContrast() async throws {
-        await ready(.shared)
-        let textured = try await renderLeather(contrast: .normal)
-        let flat = try await renderLeather(contrast: .high)
-        XCTAssertGreaterThan(textured.luminanceRange, 0.005, "The standard surface shows the leather grain.")
-        XCTAssertLessThan(flat.luminanceRange, 0.001, "Increased contrast shows one flat leather colour.")
-        let expected = try XCTUnwrap(SRGBPixels.components(NotebookTheme.leatherMid.uiColor))
-        XCTAssertEqual(flat.meanColor.red, expected.red, accuracy: 0.01)
-        XCTAssertEqual(flat.meanColor.green, expected.green, accuracy: 0.01)
-        XCTAssertEqual(flat.meanColor.blue, expected.blue, accuracy: 0.01)
+        XCTAssertEqual(paper.grainLayer.frame.height, 1_723)
     }
 
     func testMaterialsLeaveTheDrawingArchiveByteIdentical() async throws {
@@ -274,7 +515,7 @@ final class NotebookMaterialsTests: XCTestCase {
     }
 
     func testThinInkKeepsMostOfItsContrastOnTheDarkestFibre() async throws {
-        let pixels = try SRGBPixels(await Self.renderedTiles().fibre)
+        let pixels = try SRGBPixels(await Self.renderedFibreTile())
         let paper = try XCTUnwrap(SRGBPixels.components(NotebookPaperView.paperColor))
         let darkest = try XCTUnwrap(pixels.colors.min { SRGBPixels.relativeLuminance($0) < SRGBPixels.relativeLuminance($1) })
         for ink in Self.catalogInks {
@@ -285,18 +526,15 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    func testTilesRepeatOnlyOncePerTile() async throws {
-        let tiles = await Self.renderedTiles()
-        for tile in [tiles.leather, tiles.fibre] {
-            let pixels = try SRGBPixels(tile)
-            let half = pixels.width / 2
-            let unrelatedX = pixels.meanDifference(shiftedBy: 97, 0)
-            let unrelatedY = pixels.meanDifference(shiftedBy: 0, 97)
-            XCTAssertGreaterThan(unrelatedX, 0)
-            XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: half, 0), unrelatedX * 0.75)
-            XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: 0, half), unrelatedY * 0.75)
-            XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: half, half), unrelatedX * 0.75)
-        }
+    func testFibresRepeatOnlyOncePerTile() async throws {
+        let pixels = try SRGBPixels(await Self.renderedFibreTile())
+        let half = pixels.width / 2
+        let unrelatedX = pixels.meanDifference(shiftedBy: 97, 0)
+        let unrelatedY = pixels.meanDifference(shiftedBy: 0, 97)
+        XCTAssertGreaterThan(unrelatedX, 0)
+        XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: half, 0), unrelatedX * 0.75)
+        XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: 0, half), unrelatedY * 0.75)
+        XCTAssertGreaterThanOrEqual(pixels.meanDifference(shiftedBy: half, half), unrelatedX * 0.75)
     }
 
     func testGrainStaysAnchoredToTheDocumentWhenThePaperGrows() async throws {
@@ -318,75 +556,73 @@ final class NotebookMaterialsTests: XCTestCase {
         XCTAssertLessThan(before.meanDifference(to: after), 0.001)
     }
 
-    func testStackedLeatherSurfacesContinueOnePattern() async throws {
-        await ready(.shared)
-        let size = CGSize(width: 300, height: 400)
-        let continuous = try await renderSwiftUI(NotebookLeatherSurface(), size: size)
-        let stacked = try await renderSwiftUI(
-            VStack(spacing: 0) {
-                NotebookLeatherSurface().frame(height: 132)
-                NotebookLeatherSurface()
-            },
-            size: size
-        )
-        XCTAssertGreaterThan(continuous.luminanceRange, 0.005)
-        let misaligned = continuous.meanDifference(shiftedBy: 0, 9)
-        XCTAssertLessThan(stacked.meanDifference(to: continuous), misaligned * 0.1)
-    }
-
-    func testCanvasMarginsStayIvoryWhenThePageIsScrolledOutOfView() async throws {
+    func testSpaceBeyondThePaperEndIsPlainStone() async throws {
         await ready(.shared)
         let size = CGSize(width: 300, height: 500)
         let paper = NotebookPaperView(frame: CGRect(origin: .zero, size: size), accessibility: AccessibilitySettings().source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        paper.setViewport(scale: 1, offset: CGPoint(x: 2_000, y: 0))
+        // 10 pt past the end of the paper, clear of its shading.
+        paper.setViewport(scale: 1, offset: CGPoint(x: 0, y: 1_133))
         let pixels = try render(paper, scale: 2)
-        let expected = try XCTUnwrap(SRGBPixels.components(NotebookTheme.paperIvory.uiColor))
-        XCTAssertEqual(pixels.meanColor.red, expected.red, accuracy: 0.02)
-        XCTAssertEqual(pixels.meanColor.green, expected.green, accuracy: 0.02)
-        XCTAssertEqual(pixels.meanColor.blue, expected.blue, accuracy: 0.02)
-        XCTAssertGreaterThan(pixels.luminanceRange, 0.005)
+        XCTAssertLessThan(pixels.luminanceRange, 0.001, "No fibres past the paper, so it never reads as writable.")
+        try assertMeanColor(of: pixels, equals: NotebookTheme.backdropStone)
     }
 
-    func testIvorySurroundsThePageAndFlattensForAccessibility() async throws {
+    func testBackdropStaysPlainStoneWhateverTheMaterialsAndSettings() async throws {
         let materials = NotebookMaterials()
         let settings = AccessibilitySettings()
         let paper = NotebookPaperView(frame: .zero, materials: materials, accessibility: settings.source)
         paper.setGeometry(width: 794, height: 1_123, boundaries: [])
-        XCTAssertEqual(paper.backgroundColor, NotebookTheme.paperIvory.uiColor, "flat ivory until the tile is ready")
-        XCTAssertNil(paper.backdropLayer.backgroundColor)
-        XCTAssertTrue(paper.layer.sublayers?.first === paper.backdropLayer, "the ivory lies under the page")
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
+        XCTAssertTrue(paper.layer.sublayers?.first === paper.contentLayer, "nothing but the paper lies on the stone")
 
         await ready(materials)
-        let pattern = try XCTUnwrap(paper.backdropLayer.backgroundColor)
-        XCTAssertNotNil(pattern.pattern)
-        XCTAssertTrue(pattern === materials.paperFibrePattern, "textured ivory around the page")
-        XCTAssertFalse(paper.backdropLayer.isHidden)
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
+        XCTAssertFalse(paper.grainLayer.isHidden)
         settings.increasesContrast = true
         settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
-        XCTAssertTrue(paper.backdropLayer.isHidden, "flat ivory under Increase Contrast")
-        XCTAssertEqual(paper.backgroundColor, NotebookTheme.paperIvory.uiColor)
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
+        XCTAssertTrue(paper.grainLayer.isHidden)
         settings.increasesContrast = false
-        settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
-        XCTAssertFalse(paper.backdropLayer.isHidden)
         settings.reducesTransparency = true
         settings.post(UIAccessibility.reduceTransparencyStatusDidChangeNotification)
-        XCTAssertTrue(paper.backdropLayer.isHidden, "flat ivory under Reduce Transparency")
-        XCTAssertTrue(paper.backdropLayer.animationKeys()?.isEmpty ?? true)
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor, "plain materials keep the page apart")
+        XCTAssertTrue(paper.grainLayer.isHidden)
+        XCTAssertEqual(paper.headMarginLayer.backgroundColor, NotebookTheme.paperIvory.cgColor)
+        XCTAssertFalse(paper.headMarginLayer.isHidden)
+        XCTAssertEqual(paper.layer.sublayers?.count, 1)
+    }
+
+    func testBackdropIsAStepDarkerAndGreyerThanThePaper() throws {
+        let paper = try XCTUnwrap(SRGBPixels.components(NotebookTheme.paperIvory.uiColor))
+        let stone = try XCTUnwrap(SRGBPixels.components(NotebookTheme.backdropStone.uiColor))
+        let contrast = SRGBPixels.contrastRatio(paper, stone)
+        XCTAssertGreaterThan(contrast, 1.4, "The page must stand apart from the backdrop.")
+        XCTAssertLessThan(contrast, 1.6, "The backdrop stays a quiet step below the paper.")
+        func chroma(_ color: SRGBPixels.Color) -> Double {
+            max(color.red, color.green, color.blue) - min(color.red, color.green, color.blue)
+        }
+        XCTAssertLessThan(chroma(stone), chroma(paper), "The stone is greyer than the ivory.")
+        XCTAssertGreaterThan(stone.red, stone.blue, "The stone stays warm.")
     }
 
     func testPaperDrawsWithThemeTones() {
         let paper = NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source)
         paper.setGeometry(width: 794, height: 2_246, boundaries: [1_123])
         XCTAssertEqual(paper.contentLayer.backgroundColor, NotebookTheme.paperIvory.cgColor, "the page itself stays ivory")
+        XCTAssertEqual(paper.headMarginLayer.backgroundColor, NotebookTheme.paperIvory.cgColor)
+        XCTAssertEqual(paper.backgroundColor, NotebookTheme.backdropStone.uiColor)
+        XCTAssertTrue(NotebookPaperView.backdropColor === NotebookTheme.backdropStone.uiColor)
         XCTAssertEqual(paper.edgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor)
+        XCTAssertEqual(paper.leadingEdgeLayer.backgroundColor, NotebookTheme.paperEdge.cgColor)
+        XCTAssertEqual(paper.pageTopLayer.backgroundColor, NotebookTheme.paperDivider.cgColor)
         XCTAssertEqual(paper.boundaryLayers.first?.backgroundColor, NotebookTheme.paperDivider.cgColor)
     }
 
     /// PencilKit input cannot be synthesized in a unit test, and the stroke shown while the
-    /// Pencil is still down is not covered. This proves what decides the surround: at the
+    /// Pencil is still down is not covered. This proves what decides the backdrop: at the
     /// smallest zoom, touches beside and below the page reach the canvas, and the canvas keeps
-    /// ink lying wholly outside the page but never draws it, so no finished ink rests on the leather.
+    /// ink lying wholly outside the page but never draws it, so no finished ink rests on the stone.
     func testCanvasKeepsButNeverDrawsInkOutsideThePage() async throws {
         let charcoal = try XCTUnwrap(EditorInkCatalog.presets.first { $0.id == "charcoal-monoline" }).color
         let beside = Self.stroke(from: CGPoint(x: -230, y: 300), to: CGPoint(x: -110, y: 300), color: charcoal)
@@ -396,9 +632,11 @@ final class NotebookMaterialsTests: XCTestCase {
         drawing.strokes = [beside, below, onPage]
         await ready(.shared)
 
+        let ink = CGPoint(x: onPage.renderBounds.midX, y: onPage.renderBounds.midY)
+        let blank = CGPoint(x: 360, y: 360)
         let offPage = [beside, below].map { CGPoint(x: $0.renderBounds.midX, y: $0.renderBounds.midY) }
-        let pageOnly = try await renderZoomedOut(drawing: PKDrawing(strokes: [onPage])).pixels
-        let zoomedOut = try await renderZoomedOut(drawing: drawing, touching: offPage)
+        let pageOnly = try await renderZoomedOut(drawing: PKDrawing(strokes: [onPage]), inkAt: ink, blankAt: blank)
+        let zoomedOut = try await renderZoomedOut(drawing: drawing, inkAt: ink, blankAt: blank, touching: offPage)
         XCTAssertEqual(zoomedOut.drawing.dataRepresentation(), drawing.dataRepresentation(), "off-page ink is kept")
         XCTAssertEqual(zoomedOut.reachesCanvas, [true, true], "Touches beside and below the page reach the canvas.")
         for document in offPage {
@@ -406,15 +644,11 @@ final class NotebookMaterialsTests: XCTestCase {
             XCTAssertFalse(zoomedOut.page.contains(point), "The stroke must lie outside the page.")
             XCTAssertTrue(zoomedOut.bounds.contains(point), "The stroke must be on screen.")
         }
-        let onPagePoint = zoomedOut.viewPoint(CGPoint(x: onPage.renderBounds.midX, y: onPage.renderBounds.midY))
-        let blankPaper = zoomedOut.viewPoint(CGPoint(x: 360, y: 360))
-        XCTAssertGreaterThanOrEqual(
-            SRGBPixels.contrastRatio(
-                zoomedOut.pixels.meanColor(around: onPagePoint), zoomedOut.pixels.meanColor(around: blankPaper)
-            ),
-            3, "The render must capture ink on the page."
+        XCTAssertGreaterThanOrEqual(pageOnly.inkContrast, 3, "The reference render must capture the ink on the page.")
+        XCTAssertGreaterThanOrEqual(zoomedOut.inkContrast, 3, "The render must capture the ink on the page.")
+        XCTAssertLessThan(
+            zoomedOut.pixels.meanDifference(to: pageOnly.pixels), 0.000_5, "ink outside the page is never drawn"
         )
-        XCTAssertLessThan(zoomedOut.pixels.meanDifference(to: pageOnly), 0.000_5, "ink outside the page is never drawn")
     }
 
     func testNoiseFieldsAreIndependentAndRepeatOncePerTile() throws {
@@ -443,8 +677,13 @@ final class NotebookMaterialsTests: XCTestCase {
     // MARK: - Helpers
 
     /// A controller at its smallest zoom with the page scrolled to its top-left corner, and
-    /// whether a touch at each of `documentPoints` reaches its canvas.
-    private func renderZoomedOut(drawing: PKDrawing, touching documentPoints: [CGPoint] = []) async throws -> ZoomedOutCanvas {
+    /// whether a touch at each of `documentPoints` reaches its canvas. PencilKit draws a newly
+    /// shown drawing asynchronously, and its first draw after an install also compiles Metal
+    /// shaders, which outlasts any fixed number of frames. So the render is taken once the ink at
+    /// `ink` shows against the blank paper at `blank` and two frames later the view looks the same.
+    private func renderZoomedOut(
+        drawing: PKDrawing, inkAt ink: CGPoint, blankAt blank: CGPoint, touching documentPoints: [CGPoint] = []
+    ) async throws -> ZoomedOutCanvas {
         let fixture = try await presentController(
             drawing: drawing, pageCount: 1,
             paperView: NotebookPaperView(frame: .zero, accessibility: AccessibilitySettings().source)
@@ -453,18 +692,86 @@ final class NotebookMaterialsTests: XCTestCase {
         let canvas = fixture.controller.canvasView
         canvas.setZoomScale(canvas.minimumZoomScale, animated: false)
         canvas.setContentOffset(CGPoint(x: -canvas.contentInset.left, y: -canvas.contentInset.top), animated: false)
-        try await waitForRenderedFrames()
-        try await waitForRenderedFrames()
         let view = try XCTUnwrap(fixture.controller.view)
-        let result = ZoomedOutCanvas(
-            pixels: try render(view, scale: 1), drawing: canvas.drawing, bounds: view.bounds,
-            origin: canvas.convert(CGPoint.zero, to: view), contentSize: canvas.contentSize, scale: canvas.zoomScale
-        )
+        func capture() throws -> ZoomedOutCanvas {
+            ZoomedOutCanvas(
+                pixels: try render(view, scale: 1), drawing: canvas.drawing, bounds: view.bounds,
+                origin: canvas.convert(CGPoint.zero, to: view), contentSize: canvas.contentSize,
+                scale: canvas.zoomScale, ink: ink, blank: blank
+            )
+        }
+        try await waitForRenderedFrames()
+        var result = try capture()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < deadline {
+            try await waitForRenderedFrames()
+            let next = try capture()
+            let settled = next.pixels.meanDifference(to: result.pixels) == 0
+            result = next
+            if settled, result.inkContrast >= 3 { break }
+        }
         let reaches = documentPoints.map { document in
             let point = view.convert(result.viewPoint(document), to: fixture.window)
             return fixture.window.hitTest(point, with: nil)?.isDescendant(of: canvas) ?? false
         }
         return result.touching(reaches)
+    }
+
+    /// Renders the paper of `controller` with textured and then plain materials, and checks that
+    /// it is width fitted, that everything above page 1 is paper, and that both screen-border
+    /// columns match the middle of the page. Leaves the materials textured.
+    private func assertOnlyPaperAbovePageOne(
+        in controller: NotebookViewController, settings: AccessibilitySettings, _ state: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let canvas = controller.canvasView
+        XCTAssertEqual(canvas.zoomScale, canvas.bounds.width / 794, accuracy: 0.000_1, "\(state)", file: file, line: line)
+        XCTAssertEqual(canvas.contentInset.left, 0, accuracy: 0.000_1, "\(state)", file: file, line: line)
+        let pageTop = -canvas.contentOffset.y
+        XCTAssertGreaterThanOrEqual(pageTop, 205, "\(state): page 1 starts below the reserved space", file: file, line: line)
+        let paper = controller.paperView
+        let scale = paper.traitCollection.displayScale
+        defer {
+            settings.increasesContrast = false
+            settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
+        }
+        for plain in [false, true] {
+            settings.increasesContrast = plain
+            settings.post(UIAccessibility.darkerSystemColorsStatusDidChangeNotification)
+            try await waitForRenderedFrames()
+            let materials = "\(state), \(plain ? "plain" : "textured")"
+            let pixels = try render(paper, scale: scale)
+            let above = pixels.region(rows: 0..<Int(((pageTop - 1) * scale).rounded(.down)))
+            // Fibres stray up to 0.03 per channel from the paper; stone lies 0.16 or more away.
+            XCTAssertLessThan(
+                try largestDifference(in: above, from: NotebookTheme.paperIvory, file: file, line: line),
+                plain ? 0.01 : 0.045, "\(materials): only paper above page 1", file: file, line: line
+            )
+            if !plain {
+                XCTAssertGreaterThan(above.luminanceRange, 0.01, "\(materials): fibres show", file: file, line: line)
+                try assertMeanColor(of: above, equals: NotebookTheme.paperIvory, file: file, line: line)
+            }
+            // Two fibre pixels differ by at most 0.18 over the three channels; even a half-covered
+            // edge pixel differs from the paper by more than 0.5.
+            let tolerance = plain ? 0.03 : 0.3
+            let middle = pixels.width / 2
+            for x in [0, 1, pixels.width - 2, pixels.width - 1] {
+                let differing = (0..<pixels.height).filter {
+                    SRGBPixels.difference(pixels.color(x: x, y: $0), pixels.color(x: middle, y: $0)) > tolerance
+                }
+                XCTAssertTrue(
+                    differing.isEmpty, "\(materials): column \(x) differs at rows \(differing.prefix(4))",
+                    file: file, line: line
+                )
+            }
+        }
+    }
+
+    /// The page-top divider, the edges and the shading around the paper.
+    private static func linesAndShading(of paper: NotebookPaperView) -> [CALayer] {
+        [paper.pageTopLayer, paper.edgeLayer, paper.leadingEdgeLayer, paper.trailingEdgeLayer]
+            + [paper.bottomShadowLayer, paper.leadingShadowLayer, paper.trailingShadowLayer]
+            + [paper.leadingCornerShadowLayer, paper.trailingCornerShadowLayer]
     }
 
     private func ready(_ materials: NotebookMaterials) async {
@@ -473,18 +780,17 @@ final class NotebookMaterialsTests: XCTestCase {
         }
     }
 
-    private static var cachedTiles: (leather: UIImage, fibre: UIImage)?
+    private static var cachedFibreTile: UIImage?
 
-    /// The production tiles, rendered once for the pixel tests.
-    private static func renderedTiles() async -> (leather: UIImage, fibre: UIImage) {
-        if let cachedTiles { return cachedTiles }
-        let rendered = await Task.detached { NotebookMaterials.renderTiles() }.value
-        func image(_ tile: CGImage?) -> UIImage {
-            tile.map { UIImage(cgImage: $0, scale: NotebookMaterials.tileScale, orientation: .up) } ?? UIImage()
-        }
-        let tiles = (leather: image(rendered.leather), fibre: image(rendered.paperFibre))
-        cachedTiles = tiles
-        return tiles
+    /// The production fibre tile, rendered once for the pixel tests.
+    private static func renderedFibreTile() async -> UIImage {
+        if let cachedFibreTile { return cachedFibreTile }
+        let rendered = await Task.detached { NotebookMaterials.renderFibreTile() }.value
+        let tile = rendered.map {
+            UIImage(cgImage: $0, scale: NotebookMaterials.tileScale, orientation: .up)
+        } ?? UIImage()
+        cachedFibreTile = tile
+        return tile
     }
 
     /// First-channel values of one 512 px tile of a single-channel image.
@@ -509,21 +815,30 @@ final class NotebookMaterialsTests: XCTestCase {
         return covariance / (varianceFirst * varianceSecond).squareRoot()
     }
 
-    private func renderLeather(contrast: UIAccessibilityContrast) async throws -> SRGBPixels {
-        try await renderSwiftUI(NotebookLeatherSurface(), size: CGSize(width: 300, height: 200), contrast: contrast)
+    private func assertMeanColor(
+        of pixels: SRGBPixels, equals tone: NotebookTheme.Tone, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        try assertColor(pixels.meanColor, equals: tone, file: file, line: line)
     }
 
-    private func renderSwiftUI(
-        _ content: some View, size: CGSize, contrast: UIAccessibilityContrast = .normal, scale: CGFloat = 1
-    ) async throws -> SRGBPixels {
-        let host = UIHostingController(rootView: content.ignoresSafeArea())
-        let window = try hostInWindow(host: host, size: size)
-        window.window.traitOverrides.accessibilityContrast = contrast
-        defer { window.close() }
-        host.view.frame = window.window.bounds
-        host.view.layoutIfNeeded()
-        try await waitForRenderedFrames()
-        return try render(host.view, scale: scale)
+    private func assertColor(
+        _ color: SRGBPixels.Color, equals tone: NotebookTheme.Tone, _ message: String = "",
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let expected = try XCTUnwrap(SRGBPixels.components(tone.uiColor), file: file, line: line)
+        XCTAssertEqual(color.red, expected.red, accuracy: 0.01, message, file: file, line: line)
+        XCTAssertEqual(color.green, expected.green, accuracy: 0.01, message, file: file, line: line)
+        XCTAssertEqual(color.blue, expected.blue, accuracy: 0.01, message, file: file, line: line)
+    }
+
+    /// The largest difference in any one channel between a pixel of `pixels` and `tone`.
+    private func largestDifference(
+        in pixels: SRGBPixels, from tone: NotebookTheme.Tone, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> Double {
+        let expected = try XCTUnwrap(SRGBPixels.components(tone.uiColor), file: file, line: line)
+        return pixels.colors.reduce(0) { largest, color in
+            max(largest, abs(color.red - expected.red), abs(color.green - expected.green), abs(color.blue - expected.blue))
+        }
     }
 
     private func render(_ view: UIView, scale: CGFloat) throws -> SRGBPixels {
@@ -575,19 +890,21 @@ final class NotebookMaterialsTests: XCTestCase {
         let link = CADisplayLink(target: waiter, selector: #selector(FrameWaiter.advance(_:)))
         link.add(to: .main, forMode: .common)
         defer { link.invalidate() }
-        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 5)
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: NotebookTestFixtures.readinessTimeout)
         guard result == .completed else { throw FixtureFailure.readiness }
     }
 
     private func presentController(
-        drawing: PKDrawing = PKDrawing(), pageCount: Int = 3, paperView: NotebookPaperView
+        drawing: PKDrawing = PKDrawing(), pageCount: Int = 3, paperView: NotebookPaperView,
+        toolStore: NotebookSceneToolStore = NotebookTestFixtures.toolStore(),
+        size: CGSize = CGSize(width: 1_366, height: 1_024)
     ) async throws -> Fixture {
         let controller = NotebookViewController(
-            pageCount: pageCount, initialDrawing: drawing, toolStore: NotebookTestFixtures.toolStore(),
+            pageCount: pageCount, initialDrawing: drawing, toolStore: toolStore,
             allowsEditing: true, paperView: paperView
         )
         let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
-        window.frame = CGRect(x: 0, y: 0, width: 1_366, height: 1_024)
+        window.frame = CGRect(origin: .zero, size: size)
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
@@ -620,9 +937,17 @@ final class NotebookMaterialsTests: XCTestCase {
         let origin: CGPoint
         let contentSize: CGSize
         let scale: CGFloat
+        /// Document points of a stroke on the page and of blank paper near it.
+        let ink: CGPoint
+        let blank: CGPoint
         var reachesCanvas: [Bool] = []
 
         var page: CGRect { CGRect(origin: origin, size: contentSize) }
+
+        /// Contrast between the rendered stroke at `ink` and the blank paper at `blank`.
+        var inkContrast: Double {
+            SRGBPixels.contrastRatio(pixels.meanColor(around: viewPoint(ink)), pixels.meanColor(around: viewPoint(blank)))
+        }
 
         func viewPoint(_ document: CGPoint) -> CGPoint {
             CGPoint(x: origin.x + document.x * scale, y: origin.y + document.y * scale)
@@ -650,25 +975,25 @@ final class NotebookMaterialsTests: XCTestCase {
         private let lock = NSLock()
         private var calls = 0
         private var onMainThread = false
-        private var output: NotebookMaterials.RenderedTiles?
+        private var output: CGImage?
 
         var renderCount: Int { lock.withLock { calls } }
         var renderedOnMainThread: Bool { lock.withLock { onMainThread } }
-        var lastOutput: NotebookMaterials.RenderedTiles? { lock.withLock { output } }
+        var lastOutput: CGImage? { lock.withLock { output } }
 
         @MainActor
         func materials() -> NotebookMaterials {
             NotebookMaterials { self.render() }
         }
 
-        private func render() -> NotebookMaterials.RenderedTiles {
-            let tiles = NotebookMaterials.renderTiles()
+        private func render() -> CGImage? {
+            let tile = NotebookMaterials.renderFibreTile()
             lock.withLock {
                 calls += 1
                 onMainThread = onMainThread || Thread.isMainThread
-                output = tiles
+                output = tile
             }
-            return tiles
+            return tile
         }
     }
 
@@ -717,7 +1042,20 @@ final class NotebookMaterialsTests: XCTestCase {
             }
         }
 
+        private init(width: Int, height: Int, colors: [Color]) {
+            self.width = width
+            self.height = height
+            self.colors = colors
+        }
+
         var meanColor: Color { Self.mean(of: colors) }
+
+        /// The pixels in `rows` and `columns`; all columns when `columns` is nil.
+        func region(rows: Range<Int>, columns: Range<Int>? = nil) -> SRGBPixels {
+            let columns = columns ?? 0..<width
+            let colors = rows.flatMap { y in columns.map { x in color(x: x, y: y) } }
+            return SRGBPixels(width: columns.count, height: rows.count, colors: colors)
+        }
 
         var luminanceRange: Double {
             let values = colors.map(Self.relativeLuminance)

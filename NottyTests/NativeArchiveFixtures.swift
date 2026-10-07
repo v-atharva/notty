@@ -101,12 +101,8 @@ final class NativeArchiveCanvas: NSObject, PKCanvasViewDelegate {
     private var renderExpectation: XCTestExpectation?
     private var expectedIDs: [UUID] = []
 
-    override init() {
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
-        }
+    init(windowScene: UIWindowScene) {
+        window = UIWindow(windowScene: windowScene)
         super.init()
         window.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
         window.rootViewController = controller
@@ -126,7 +122,7 @@ final class NativeArchiveCanvas: NSObject, PKCanvasViewDelegate {
         canvas.drawing = drawing
         canvas.setNeedsLayout()
         canvas.layoutIfNeeded()
-        let result = await XCTWaiter.fulfillment(of: [ready], timeout: 5)
+        let result = await XCTWaiter.fulfillment(of: [ready], timeout: NotebookTestFixtures.readinessTimeout)
         XCTAssertEqual(result, .completed)
         renderExpectation = nil
     }

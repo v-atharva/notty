@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 
 /// The single source of colours, metrics and typography for the retro notebook editor:
-/// a leather surround, ivory writing paper and a pale ivory-gray toolbar with shallow depth.
+/// ivory writing paper on a warm stone backdrop and a pale ivory-gray toolbar with shallow depth.
 /// Values are proposals for review on the device. The editor forces the light appearance,
 /// so each token has one value.
 enum NotebookTheme {
@@ -78,26 +78,27 @@ enum NotebookTheme {
         }
     }
 
-    // MARK: - Leather
+    // MARK: - Paper and backdrop
 
-    /// Darkest leather tone: grain shadows.
-    static let leatherDeep = Tone(red: 0.23, green: 0.16, blue: 0.11)
-    /// Base leather tone of the canvas surround, the dock band and the navigation band, and
-    /// their flat fill under Reduce Transparency or Increase Contrast.
-    static let leatherMid = Tone(red: 0.35, green: 0.24, blue: 0.16)
-    /// Raised leather grain.
-    static let leatherHighlight = Tone(red: 0.45, green: 0.33, blue: 0.23)
-    /// Titles and controls drawn directly on leather.
-    static let bandText = Tone(red: 0.95, green: 0.92, blue: 0.85)
-
-    // MARK: - Paper
-
-    /// Writing paper fill, and the colour the fibre texture averages to.
+    /// Writing paper, the head margin above page 1, and the colour the fibre texture averages to.
     static let paperIvory = Tone(red: 0.98, green: 0.96, blue: 0.91)
-    /// Bottom edge of the paper.
+    /// Hairline where the paper meets the backdrop, along its sides and below the last page.
     static let paperEdge = Tone(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.65)
-    /// Page divisions on the paper.
+    /// Page divisions, including the top of page 1 below the head margin.
     static let paperDivider = Tone(red: 0.47, green: 0.40, blue: 0.31, alpha: 0.30)
+    /// Flat stone wherever there is no paper, without fibres, so nothing outside a page reads
+    /// as writable.
+    static let backdropStone = Tone(red: 0.812, green: 0.792, blue: 0.749)
+    /// Paper continues this far above page 1, so the space reserved for the chrome, the status
+    /// bar and overscroll at the top all show paper rather than stone.
+    static let headMarginLength: CGFloat = 600
+    /// Gradient band below the last page; it zooms with the page, so nothing blurs per frame.
+    static let pageShadowDepth: CGFloat = 6
+    static let pageShadowOpacity: CGFloat = 0.18
+    /// Narrower, lighter bands along the page sides, seen only when the page is narrower than
+    /// the screen or pulled away from a side.
+    static let pageSideShadowDepth: CGFloat = 3
+    static let pageSideShadowOpacity: CGFloat = 0.12
     /// Tint of buttons and links on paper-toned surfaces, such as the screen behind the
     /// notebook and its sheets.
     static let paperControlTint = Tone(red: 0.36, green: 0.29, blue: 0.22)
@@ -106,11 +107,12 @@ enum NotebookTheme {
 
     /// Toolbar shell fill, a pale ivory-gray a step cooler than the paper so the two read apart.
     static let toolbarSurface = Tone(red: 0.93, green: 0.915, blue: 0.875)
-    /// One-point top edge highlight that lifts the shell off the leather.
+    /// One-point top edge highlight that lifts the shell off the paper.
     static let toolbarHighlight = Tone(red: 0.99, green: 0.98, blue: 0.96)
     /// Lower edge of the shell and of raised controls, giving the shallow bevel.
     static let toolbarLowerEdge = Tone(red: 0.80, green: 0.77, blue: 0.71)
-    /// Colour of the toolbar drop shadow; warm so it does not gray the leather.
+    /// Colour of the toolbar drop shadow and the page shading; warm so neither grays the paper
+    /// or the stone.
     static let toolbarShadowTone = Tone(red: 0.24, green: 0.17, blue: 0.11)
     /// Inset well behind the selected tool, swatch or width control.
     static let selectedWell = Tone(red: 0.79, green: 0.77, blue: 0.72)
@@ -203,9 +205,9 @@ enum NotebookTheme {
     // Berkeley Mono, bundled through UIAppFonts, is the typewriter face of the wordmark and
     // the note title. It never reaches controls or handwriting.
 
-    /// The "notty" wordmark at the leading end of the navigation band.
+    /// The "notty" wordmark at the leading end of the navigation bar.
     static let wordmark = Typeface(postScriptName: "BerkeleyMono-Medium", pointSize: 20, style: .title3, weight: .medium)
-    /// Note title on the navigation band.
+    /// Note title on the navigation bar.
     static let noteTitle = Typeface(postScriptName: "BerkeleyMono-SemiBold", pointSize: 17, style: .headline, weight: .semibold)
     /// Toolbar and menu labels; the system face keeps dense controls legible.
     static let controlLabel = Typeface(postScriptName: nil, pointSize: 13, style: .footnote, weight: .medium)

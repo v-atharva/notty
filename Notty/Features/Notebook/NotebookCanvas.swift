@@ -58,6 +58,8 @@ struct NotebookCanvas: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: NotebookViewController, context: Context) {
         session.renderDiagnostics.canvasUpdateCount += 1
         controller.setPageCount(pageCount)
+        controller.applyChrome(context.environment.notebookCanvasChrome)
+        controller.placeUnderToolbar(of: context.environment.notebookToolbarStore)
     }
 
     static func dismantleUIViewController(

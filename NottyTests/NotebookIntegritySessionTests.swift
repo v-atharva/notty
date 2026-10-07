@@ -29,16 +29,6 @@ final class NotebookIntegritySessionTests: XCTestCase {
         return Fixture(session: session, probe: probe, root: root, initial: initial)
     }
 
-    private func wait(_ condition: @escaping @MainActor () async -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while ContinuousClock.now < deadline {
-            if await condition() { return }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        XCTFail("The gated integrity operation did not become ready.")
-        throw NotebookSaveFailure.unexpected
-    }
-
     private func observe(
         _ session: NotebookSession, owner: UUID, generation: UInt64, drawing: PKDrawing = PKDrawing()
     ) {
@@ -52,14 +42,14 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testOpeningBecomesWritableBeforeGatedAuditFinishes() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         XCTAssertEqual(f.session.loadState, .ready)
         XCTAssertEqual(f.session.integrityModel.state, .checking)
         XCTAssertEqual(f.session.inputGate, .open)
         XCTAssertTrue(f.session.workingDrawing.strokes.isEmpty)
         let generation = f.session.canvasGeneration
         await f.probe.finishAudit(0)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
         XCTAssertEqual(f.session.canvasGeneration, generation)
         XCTAssertEqual(f.session.inputGate, .open)
     }
@@ -67,7 +57,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testOwnAppendKeepsOpeningAuditAndDamageSurvivesSuccessfulSave() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         let first = f.session.pendingEdits
@@ -76,7 +66,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
         let calls = await f.probe.capturedRevisions
         XCTAssertTrue(calls.isEmpty)
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { f.session.inputGate == .readOnly }
+        try await NotebookTestFixtures.waitUntil { f.session.inputGate == .readOnly }
         XCTAssertEqual(f.session.loadState, .ready)
         let generation = f.session.canvasGeneration
         // A late callback belongs to already accepted native input.
@@ -97,14 +87,14 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testVerifiedOpeningAuditRemainsValidAfterOwnedAppend() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         await f.session.waitUntilSettled()
         let selected = try await f.probe.current()
         XCTAssertNotEqual(selected?.revisionID, f.initial?.revisionID)
         await f.probe.finishAudit(0)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
         XCTAssertEqual(f.session.inputGate, .open)
         let counts = await f.probe.counts()
         XCTAssertEqual(counts.audits, 1)
@@ -114,9 +104,9 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testIncompleteAuditRemainsWritableAndCancelledAuditIsQuiet() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.finishAudit(0, outcome: .incomplete(.storageUnavailable))
-        try await wait { f.session.integrityModel.state == .incomplete(.storageUnavailable) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .incomplete(.storageUnavailable) }
         XCTAssertEqual(f.session.inputGate, .open)
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
@@ -126,9 +116,9 @@ final class NotebookIntegritySessionTests: XCTestCase {
 
         let cancelled = try await fixture()
         defer { try? FileManager.default.removeItem(at: cancelled.root) }
-        try await wait { await cancelled.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await cancelled.probe.auditCount == 1 }
         await cancelled.probe.finishAudit(0, outcome: .cancelled)
-        try await wait { cancelled.session.integrityModel.state == nil }
+        try await NotebookTestFixtures.waitUntil { cancelled.session.integrityModel.state == nil }
         XCTAssertEqual(cancelled.session.inputGate, .open)
         XCTAssertNil(cancelled.session.recoveryFailure)
     }
@@ -153,7 +143,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
         await f.probe.suspendSaves()
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         let seed = f.session.makeCanvasSeed()
         let controller = NotebookViewController(pageCount: seed.pageCount, initialDrawing: seed.drawing)
         controller.loadViewIfNeeded()
@@ -171,9 +161,9 @@ final class NotebookIntegritySessionTests: XCTestCase {
         let third = NotebookTestFixtures.stroke(x: 200)
         controller.canvasView.drawing = PKDrawing(strokes: [first])
         controller.canvasViewDrawingDidChange(controller.canvasView)
-        try await wait { await f.probe.hasSuspendedSave }
+        try await NotebookTestFixtures.waitUntil { await f.probe.hasSuspendedSave }
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { f.session.inputGate == .readOnly }
+        try await NotebookTestFixtures.waitUntil { f.session.inputGate == .readOnly }
         XCTAssertEqual(controller.inputGate, .readOnly)
         XCTAssertTrue(controller.canvasView.drawingGestureRecognizer.isEnabled)
         XCTAssertTrue(f.session.canPreserveRecovery)
@@ -204,13 +194,13 @@ final class NotebookIntegritySessionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: f.root) }
         await f.probe.suspendSaves()
         await f.probe.setSaveFailure(.ioFailure(28))
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1, drawing: PKDrawing(strokes: [NotebookTestFixtures.stroke()]))
-        try await wait { await f.probe.hasSuspendedSave }
+        try await NotebookTestFixtures.waitUntil { await f.probe.hasSuspendedSave }
         let original = f.session.pendingEdits
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { f.session.integrityModel.state == .damaged(.corruptData) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .damaged(.corruptData) }
         await f.probe.releaseSave()
         await f.session.waitUntilSettled()
         XCTAssertEqual(f.session.saveState, .failed(.storageFull))
@@ -228,7 +218,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testReopenCancelsOldAuditAndRejectsItsLateDamageWithoutReplacingNewOwner() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.setSaveFailure(.sizeLimitExceeded("Full."))
         let old = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: old, generation: 1)
@@ -237,14 +227,14 @@ final class NotebookIntegritySessionTests: XCTestCase {
         XCTAssertTrue(f.session.canReopenSaved)
         await f.probe.suspendRecoveryRead()
         let reopening = Task { await f.session.reopenSavedNotebook() }
-        try await wait { await f.probe.hasSuspendedRecoveryRead }
+        try await NotebookTestFixtures.waitUntil { await f.probe.hasSuspendedRecoveryRead }
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertNil(f.session.integrityModel.state)
         XCTAssertEqual(f.session.inputGate, .recovering)
         await f.probe.releaseRecoveryRead()
         await reopening.value
-        try await wait { await f.probe.auditCount == 2 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 2 }
         let generation = f.session.canvasGeneration
         let owner = f.session.makeCanvasSeed().ownerID
         XCTAssertEqual(f.session.integrityModel.state, .checking)
@@ -256,20 +246,20 @@ final class NotebookIntegritySessionTests: XCTestCase {
         XCTAssertEqual(f.session.canvasOwnerID, owner)
         XCTAssertEqual(f.session.canvasGeneration, generation)
         await f.probe.finishAudit(1)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
     }
 
     func testInitialPublicationCapturesOnePinAndLaterOrdinarySavesDoNotRecapture() async throws {
         let f = try await fixture(empty: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
         await f.session.waitUntilSettled()
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         XCTAssertNil(f.initial)
         let captured = await f.probe.capturedRevisions
         let current = try await f.probe.current()
         XCTAssertEqual(captured, [try XCTUnwrap(current).revisionID])
         await f.probe.finishAudit(0)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
         let owner = f.session.makeCanvasSeed().ownerID
         for index in 1...3 {
             observe(f.session, owner: owner, generation: UInt64(index))
@@ -284,13 +274,13 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testSuccessfulLegacySaveRetiresOldAuditAndPinsNewGeneration() async throws {
         let f = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         let old = try XCTUnwrap(f.initial)
         XCTAssertTrue(old.requiresFirstPublicationRefresh)
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         await f.session.waitUntilSettled()
-        try await wait { await f.probe.auditCount == 2 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 2 }
         let pins = await f.probe.auditPins
         XCTAssertFalse(pins[1].requiresFirstPublicationRefresh)
         XCTAssertFalse(old.hasSameHistoryGeneration(as: pins[1]))
@@ -301,7 +291,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertEqual(f.session.integrityModel.state, .checking)
         await f.probe.finishAudit(1)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 2) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 2) }
         XCTAssertTrue(f.session.pendingEdits.isEmpty)
         XCTAssertEqual(f.session.inputGate, .open)
     }
@@ -309,13 +299,13 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testFailedSaveAfterMigrationAnchorStillReplacesLegacyPinAndPreservesOriginalFailure() async throws {
         let f = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.failAfterMigration()
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         let original = f.session.pendingEdits
         await f.session.waitUntilSettled()
-        try await wait { await f.probe.auditCount == 2 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 2 }
         let pins = await f.probe.auditPins
         XCTAssertEqual(pins[1].revisionID, pins[0].revisionID)
         XCTAssertFalse(pins[1].requiresFirstPublicationRefresh)
@@ -328,7 +318,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertEqual(f.session.integrityModel.state, .checking)
         await f.probe.finishAudit(1)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
         XCTAssertEqual(f.session.saveState, .failed(.storageUnavailable))
         XCTAssertEqual(f.session.pendingEdits, original)
     }
@@ -336,7 +326,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testCaptureFailureLeavesPublishedAcknowledgmentIntactAndHistoryIncomplete() async throws {
         let legacy = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: legacy.root) }
-        try await wait { await legacy.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await legacy.probe.auditCount == 1 }
         await legacy.probe.setCaptureFailure(.corruptData("The new pin could not be read."))
         let owner = legacy.session.makeCanvasSeed().ownerID
         observe(legacy.session, owner: owner, generation: 1)
@@ -358,7 +348,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testCaptureFailurePreservesOriginalThrownSaveAndIndexedRejectionTail() async throws {
         let f = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.failAfterMigration()
         await f.probe.setCaptureFailure(.revisionConflict)
         let owner = f.session.makeCanvasSeed().ownerID
@@ -372,7 +362,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
 
         let partial = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: partial.root) }
-        try await wait { await partial.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await partial.probe.auditCount == 1 }
         await partial.probe.setCaptureFailure(.revisionConflict)
         await partial.probe.rejectAfterFirst()
         let partialOwner = partial.session.makeCanvasSeed().ownerID
@@ -395,7 +385,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
             try? FileManager.default.removeItem(at: f.root)
             try? FileManager.default.removeItem(at: other.root)
         }
-        try await wait {
+        try await NotebookTestFixtures.waitUntil {
             let first = await f.probe.auditCount
             let second = await other.probe.auditCount
             return first == 1 && second == 1
@@ -417,21 +407,12 @@ final class NotebookIntegritySessionTests: XCTestCase {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.root) }
         let hosting = UIHostingController(rootView: NotebookScreen(session: f.session))
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1_024, height: 1_366))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 1_024, height: 1_366)
-        window.rootViewController = hosting
-        window.makeKeyAndVisible()
-        hosting.view.layoutIfNeeded()
+        let window = try NotebookTestFixtures.window(showing: hosting)
         defer {
             notebookController(in: hosting)?.tearDown()
             window.isHidden = true
         }
-        try await wait {
+        try await NotebookTestFixtures.waitUntil {
             let audits = await f.probe.auditCount
             return f.session.renderDiagnostics.screenBodyCount > 0
                 && f.session.renderDiagnostics.canvasUpdateCount > 0
@@ -451,7 +432,7 @@ final class NotebookIntegritySessionTests: XCTestCase {
             await f.session.waitUntilSettled()
         }
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { controller.inputGate == .readOnly }
+        try await NotebookTestFixtures.waitUntil { controller.inputGate == .readOnly }
         try await Task.sleep(for: .milliseconds(80))
         hosting.view.layoutIfNeeded()
         XCTAssertEqual(f.session.renderDiagnostics.screenBodyCount, screen)
@@ -468,25 +449,25 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testAppliedLegacyDamageIsRetiredOnlyWhenMigrationChangesHistoryGeneration() async throws {
         let f = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.failAfterMigration()
         await f.probe.suspendMigrationOutcome()
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         let original = f.session.pendingEdits
-        try await wait { await f.probe.hasSuspendedMigration }
+        try await NotebookTestFixtures.waitUntil { await f.probe.hasSuspendedMigration }
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { f.session.integrityModel.state == .damaged(.corruptData) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .damaged(.corruptData) }
         await f.probe.releaseMigrationOutcome()
         await f.session.waitUntilSettled()
-        try await wait { await f.probe.auditCount == 2 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 2 }
         XCTAssertEqual(f.session.integrityModel.state, .checking)
         XCTAssertEqual(f.session.saveState, .failed(.storageUnavailable))
         XCTAssertEqual(f.session.pendingEdits, original)
         let pins = await f.probe.auditPins
         XCTAssertFalse(pins[0].hasSameHistoryGeneration(as: pins[1]))
         await f.probe.finishAudit(1)
-        try await wait { f.session.integrityModel.state == .verified(revisions: 1) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .verified(revisions: 1) }
         XCTAssertEqual(f.session.saveState, .failed(.storageUnavailable))
         XCTAssertEqual(f.session.pendingEdits, original)
     }
@@ -495,16 +476,16 @@ final class NotebookIntegritySessionTests: XCTestCase {
     func testLegacyWhitespaceChangeCannotClearAppliedDamage() async throws {
         let f = try await fixture(legacy: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        try await wait { await f.probe.auditCount == 1 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
         await f.probe.finishAudit(0, outcome: .damaged(.corruptData))
-        try await wait { f.session.integrityModel.state == .damaged(.corruptData) }
+        try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .damaged(.corruptData) }
         await f.probe.setSaveFailure(.ioFailure(5))
         try await f.probe.rewriteLegacyHeadWhitespace()
         let owner = f.session.makeCanvasSeed().ownerID
         observe(f.session, owner: owner, generation: 1)
         let original = f.session.pendingEdits
         await f.session.waitUntilSettled()
-        try await wait { await f.probe.auditCount == 2 }
+        try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 2 }
         let pins = await f.probe.auditPins
         XCTAssertTrue(pins[1].requiresFirstPublicationRefresh)
         XCTAssertTrue(pins[0].hasSameHistoryGeneration(as: pins[1]))
@@ -519,14 +500,14 @@ final class NotebookIntegritySessionTests: XCTestCase {
         for invalidAssets in [false, true] {
             let f = try await fixture()
             defer { try? FileManager.default.removeItem(at: f.root) }
-            try await wait { await f.probe.auditCount == 1 }
+            try await NotebookTestFixtures.waitUntil { await f.probe.auditCount == 1 }
             let pin = try XCTUnwrap(f.initial)
             await f.probe.finishAudit(0, outcome: .verified(NotebookHistoryAudit(
                 notebookID: pin.notebookID, headRevisionID: pin.revisionID,
                 revisionCount: invalidAssets ? pin.sequence : pin.sequence + 1,
                 verifiedAssetCount: invalidAssets ? -1 : 0
             )))
-            try await wait { f.session.integrityModel.state == .damaged(.corruptData) }
+            try await NotebookTestFixtures.waitUntil { f.session.integrityModel.state == .damaged(.corruptData) }
             XCTAssertEqual(f.session.inputGate, .readOnly)
         }
     }
