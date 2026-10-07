@@ -22,6 +22,11 @@ struct NotebookCanvasControls {
     /// Grows the paper for a page the user asked for, which the canvas brings into view. A host
     /// that passes none has the page added as the notebook's own, and nothing scrolls to it.
     let applyRequestedPageCount: (Int) -> Void
+    /// Deletes a page, counted from zero, as one edit the canvas can undo; false when the canvas
+    /// cannot delete one now. Nil for a host that offers no page deletion.
+    let deletePage: ((Int) -> Bool)?
+    /// The page filling the most of the paper in view, the one the Notebook menu offers to delete.
+    let mostVisiblePage: (() -> Int?)?
     let currentAvailability: () -> NotebookUndoAvailability
     let retire: (() -> Void)?
 
@@ -31,6 +36,8 @@ struct NotebookCanvasControls {
         setPaletteSuppressed: @escaping (Bool) -> Void,
         applyPageCount: @escaping (Int) -> Void,
         applyRequestedPageCount: ((Int) -> Void)? = nil,
+        deletePage: ((Int) -> Bool)? = nil,
+        mostVisiblePage: (() -> Int?)? = nil,
         currentAvailability: @escaping () -> NotebookUndoAvailability = { .unavailable },
         retire: (() -> Void)? = nil
     ) {
@@ -39,6 +46,8 @@ struct NotebookCanvasControls {
         self.setPaletteSuppressed = setPaletteSuppressed
         self.applyPageCount = applyPageCount
         self.applyRequestedPageCount = applyRequestedPageCount ?? applyPageCount
+        self.deletePage = deletePage
+        self.mostVisiblePage = mostVisiblePage
         self.currentAvailability = currentAvailability
         self.retire = retire
     }

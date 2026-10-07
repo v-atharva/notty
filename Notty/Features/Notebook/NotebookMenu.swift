@@ -60,9 +60,14 @@ struct NotebookMenuKey: View {
     let openRecoveryCopies: @MainActor () -> Void
     @State private var showsMenu = false
     @State private var handOff = NotebookMenuHandOff()
+    /// The page the menu offers to delete, chosen as it opens; the popover keeps the paper still.
+    @State private var pageToDelete: NotebookPageDeletionTarget?
 
     var body: some View {
-        Button { showsMenu = true } label: {
+        Button {
+            pageToDelete = Self.pageToDelete(openingMenuOver: session)
+            showsMenu = true
+        } label: {
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: NotebookTheme.accentGlyphSize, weight: .semibold))
         }
@@ -75,11 +80,21 @@ struct NotebookMenuKey: View {
             NotebookMenu(
                 session: session, chrome: chrome, gate: session.gateModel, commands: session.commandModel,
                 hostWidth: hostWidth, sizeClass: sizeClass, offersRedo: offersRedo, close: { showsMenu = false },
-                openRecoveryCopies: { handOff.requestRecoveryCopies { showsMenu = false } }
+                openRecoveryCopies: { handOff.requestRecoveryCopies { showsMenu = false } }, pageToDelete: pageToDelete
             )
-            .onDisappear { handOff.menuDidDisappear(open: openRecoveryCopies) }
+            .onDisappear {
+                handOff.menuDidDisappear(open: openRecoveryCopies)
+                session.pageDeletionPrompt.menuDidDisappear()
+            }
         }
         .notebookChromePresentation(showsMenu, chrome: chrome)
+    }
+
+    /// The page the menu offers to delete as it opens: the one in view now. A deletion asked for
+    /// from an earlier opening whose alert never opened is dropped first.
+    static func pageToDelete(openingMenuOver session: NotebookSession) -> NotebookPageDeletionTarget? {
+        session.pageDeletionPrompt.withdrawRequest()
+        return session.pageDeletionTarget()
     }
 }
 
@@ -119,6 +134,8 @@ struct NotebookMenu: View {
     /// Closes the menu, as dismissing its popover does.
     let close: () -> Void
     let openRecoveryCopies: () -> Void
+    /// The page "Delete this page…" deletes; nil while no canvas can say which page is in view.
+    var pageToDelete: NotebookPageDeletionTarget?
     @State private var showsComingLater = false
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.legibilityWeight) private var legibilityWeight
@@ -149,7 +166,8 @@ struct NotebookMenu: View {
                 section("Notebook") {
                     NotebookMenuActions(
                         session: session, gate: gate, commands: commands, offersRedo: offersRedo,
-                        addPage: addPage, openRecoveryCopies: openRecoveryCopies
+                        addPage: addPage, openRecoveryCopies: openRecoveryCopies,
+                        pageToDelete: pageToDelete, deletePage: deletePage
                     )
                 }
                 separator
@@ -183,6 +201,17 @@ struct NotebookMenu: View {
         state.inputGate.allowsMutation && state.pageCount < NotebookViewController.maximumPageCount
     }
 
+    /// The page under view can be deleted only while writing is open, no stroke is under way and
+    /// another page would remain, with the page count it was chosen from.
+    static func canDeletePage(
+        _ target: NotebookPageDeletionTarget?, gate: NotebookCanvasGateModel.State,
+        commands: NotebookCanvasCommandModel.State
+    ) -> Bool {
+        guard let target else { return false }
+        return gate.inputGate.allowsMutation && gate.pageCount > 1 && target.pageCount == gate.pageCount
+            && !commands.isUsingTool
+    }
+
     /// The row that chooses and stores `mode` as the writing view.
     func writingViewRow(
         _ mode: EditorChromeMode, layout: NotebookWritingViewRow.Layout = .init()
@@ -195,6 +224,14 @@ struct NotebookMenu: View {
     /// Adds a page at the end of the notebook and closes the menu over it.
     func addPage() {
         session.extendPaper()
+        close()
+    }
+
+    /// Asks to delete the page under view and closes the menu; an alert confirms the deletion
+    /// once the menu has gone.
+    func deletePage() {
+        guard let pageToDelete else { return }
+        session.pageDeletionPrompt.request(pageToDelete)
         close()
     }
 
@@ -474,8 +511,8 @@ struct NotebookToolbarPositionPicker: View {
     }
 }
 
-/// The notebook's own actions: Redo while the header has no room for its key, adding a page and
-/// the recovery copies.
+/// The notebook's own actions: Redo while the header has no room for its key, adding and deleting
+/// a page, and the recovery copies.
 struct NotebookMenuActions: View {
     let session: NotebookSession
     @ObservedObject var gate: NotebookCanvasGateModel
@@ -483,6 +520,13 @@ struct NotebookMenuActions: View {
     let offersRedo: Bool
     let addPage: () -> Void
     let openRecoveryCopies: () -> Void
+    var pageToDelete: NotebookPageDeletionTarget?
+    var deletePage: () -> Void = {}
+
+    /// What VoiceOver reads for the deletion row: the page it deletes.
+    static func deletionLabel(for target: NotebookPageDeletionTarget?) -> String {
+        target.map { "Delete page \($0.number)" } ?? "Delete this page"
+    }
 
     var body: some View {
         VStack(spacing: NotebookTheme.itemSpacing) {
@@ -493,17 +537,27 @@ struct NotebookMenuActions: View {
             }
             NotebookMenuRow(title: "Add page at end", symbol: "rectangle.portrait.badge.plus", action: addPage)
                 .disabled(!NotebookMenu.canAddPage(gate.state))
+            NotebookMenuRow(
+                title: "Delete this page…", symbol: "trash", isDestructive: true,
+                spokenTitle: Self.deletionLabel(for: pageToDelete), action: deletePage
+            )
+            .disabled(!NotebookMenu.canDeletePage(pageToDelete, gate: gate.state, commands: commands.state))
             NotebookMenuRow(title: "Recovery copies…", symbol: "lifepreserver", action: openRecoveryCopies)
                 .disabled(!commands.state.canOpenRecoveryCopies)
         }
     }
 }
 
-/// A plain action row of the menu.
+/// A plain action row of the menu. A destructive row draws its glyph and title in the alert tone
+/// while it is available, and the disabled tone otherwise, as every row does.
 private struct NotebookMenuRow: View {
     let title: String
     let symbol: String
+    var isDestructive = false
+    /// What VoiceOver reads instead of the title, where the title alone would leave out what the row acts on.
+    var spokenTitle: String?
     let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         Button(action: action) {
@@ -515,13 +569,27 @@ private struct NotebookMenuRow: View {
                     .font(.body)
                 Spacer(minLength: 0)
             }
+            .modifier(NotebookDestructiveTone(isActive: isDestructive && isEnabled))
             .padding(.leading, NotebookTheme.menuGlyphInset)
             .padding(.trailing, NotebookTheme.menuRowInset)
             .frame(maxWidth: .infinity, minHeight: NotebookTheme.menuRowHeight, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle())
-        .accessibilityLabel(title)
+        .accessibilityLabel(spokenTitle ?? title)
+    }
+}
+
+/// The alert tone for a destructive control, inside the key's own foreground so it takes precedence.
+private struct NotebookDestructiveTone: ViewModifier {
+    let isActive: Bool
+
+    func body(content: Content) -> some View {
+        if isActive {
+            content.foregroundStyle(NotebookTheme.alertGlyph.color)
+        } else {
+            content
+        }
     }
 }
 

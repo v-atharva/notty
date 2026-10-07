@@ -1696,7 +1696,7 @@ final class NotebookHeaderTests: XCTestCase {
                 .frame(width: width)
             ).size.height
         }
-        XCTAssertEqual(try height(offeringRedo: false), 2 * NotebookTheme.menuRowHeight + NotebookTheme.itemSpacing,
+        XCTAssertEqual(try height(offeringRedo: false), 3 * NotebookTheme.menuRowHeight + 2 * NotebookTheme.itemSpacing,
             accuracy: 0.5)
         XCTAssertEqual(try height(offeringRedo: true) - height(offeringRedo: false),
             NotebookTheme.menuRowHeight + NotebookTheme.itemSpacing, accuracy: 0.5)

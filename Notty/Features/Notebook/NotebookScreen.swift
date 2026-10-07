@@ -64,6 +64,10 @@ struct NotebookScreen: View {
             NotebookRecoveryView(session: session)
         }
         .notebookChromePresentation(showsRecoveryCopies, chrome: session.writingChrome)
+        .modifier(NotebookPageDeletionAlert(
+            prompt: session.pageDeletionPrompt, gate: session.gateModel, commands: session.commandModel,
+            chrome: session.writingChrome
+        ))
         .background {
             NotebookWindowSceneReader { scene in
                 let owner = NotebookSceneToolStore.owner(for: scene)

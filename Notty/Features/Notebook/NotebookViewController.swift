@@ -38,8 +38,14 @@ final class NotebookViewController: UIViewController {
     private var isPublishingUndoAvailability = false
     private var toolBeginSignature: InkDrawingSignature?
     private var toolBeginGeneration: UInt64?
+    /// True while the canvas takes a replaced paper's drawing, whose own change report would carry
+    /// the old page count; the replacement reports the drawing itself, with the new one.
+    private var isReplacingPaper = false
 
     var onObservation: ((NotebookCanvasObservation) -> NotebookInputGate)?
+    /// Hears the paper replaced whole, by a page deletion or its undo or redo: the new drawing and
+    /// page count, to be kept as one edit. Only a canvas given this deletes pages.
+    var onPaperReplacement: ((NotebookCanvasObservation, Int) -> NotebookInputGate)?
     var onCompletedEdit: ((PKDrawing) -> NotebookInputGate)?
     var onDetach: (() -> Void)?
     var canvasView: PKCanvasView { canvas }
@@ -77,7 +83,8 @@ final class NotebookViewController: UIViewController {
     private var isAdjustingLayout = false
     private var observesToolStore = false
     private var toolbarKeepsAccess = false
-    private var chrome = NotebookCanvasChrome.none
+    /// The room for the status bar, header and home indicator the host last measured.
+    private(set) var chrome = NotebookCanvasChrome.none
     /// The store whose toolbar the host draws over this canvas.
     private weak var overlayStore: NotebookSceneToolStore?
     private var resizeCapture: ResizeCapture?
@@ -131,6 +138,8 @@ final class NotebookViewController: UIViewController {
     /// close to the end UIKit must aim a fling for it to head past the end.
     static let endRestTolerance: CGFloat = 1
     static let endCardActionName = "End of notebook options"
+    /// The undo and redo menus' name for a page deletion.
+    static let deletePageActionName = "Delete Page"
     /// The shortest the scroll on to an added page may take, in seconds, however late it sets off.
     private static let shortestArrival: CFTimeInterval = PageUnfoldTimeline.arrivalDuration / 2_000
 
@@ -152,6 +161,12 @@ final class NotebookViewController: UIViewController {
         var step: CGFloat = 0
         /// The card was revealed, so a deceleration cut short finishes the lift.
         var hasRevealed = false
+    }
+
+    /// The paper a page deletion, its undo or its redo puts on the canvas or replaces.
+    private struct PaperState {
+        let drawing: PKDrawing
+        let pageCount: Int
     }
 
     /// The scroll that follows a page added at the user's request, from where the paper rested
@@ -527,7 +542,9 @@ final class NotebookViewController: UIViewController {
         publishUndoAvailability()
     }
 
-    private func observeDrawing(signature: InkDrawingSignature? = nil) {
+    /// - Parameter replacingPaper: true when the paper was replaced whole, so the drawing goes to
+    ///   the session with its page count as one edit.
+    private func observeDrawing(signature: InkDrawingSignature? = nil, replacingPaper: Bool = false) {
         let drawing = canvas.drawing
         let capturedAt = Date()
         let uptime = ProcessInfo.processInfo.systemUptime
@@ -545,7 +562,9 @@ final class NotebookViewController: UIViewController {
         observedGeneration = observation.generation
         lastObservation = observation
         lastDeliveredSignature = capturedSignature
-        if let onObservation {
+        if replacingPaper {
+            if let onPaperReplacement { setInputGate(onPaperReplacement(observation, pageCount)) }
+        } else if let onObservation {
             setInputGate(onObservation(observation))
         } else if let onCompletedEdit {
             setInputGate(onCompletedEdit(observation.drawing))
@@ -577,7 +596,8 @@ final class NotebookViewController: UIViewController {
     ///   its own, as when writing reaches the foot of the last page, never move the paper.
     func setPageCount(_ requestedCount: Int, bringingIntoView: Bool = false) {
         let boundedCount = min(max(requestedCount, 1), Self.maximumPageCount)
-        // Reducing the paper extent could hide existing ink.
+        // Reducing the paper extent could hide existing ink; only a page deletion, which moves
+        // the ink with it, shrinks the paper.
         guard boundedCount > pageCount else { return }
         let previousHeight = logicalHeight
         let added = boundedCount - pageCount
@@ -687,6 +707,105 @@ final class NotebookViewController: UIViewController {
     /// Whether the paper is scrolling on to a page added at the user's request.
     var isBringingAddedPageIntoView: Bool { arrival != nil }
 
+    // MARK: - Deleting a page
+
+    /// The page filling the most of the paper the user can see, between the room kept for the
+    /// header and toolbar at the top and the room for the home indicator and a bottom toolbar
+    /// below; where pages fill it equally, as whole pages do zoomed out, the one at the centre of
+    /// the view. The Notebook menu offers this page for deletion.
+    var mostVisiblePage: Int {
+        let scale = max(canvas.zoomScale, 0.001)
+        let top = (canvas.contentOffset.y + canvas.contentInset.top) / scale
+        let bottom = (canvas.contentOffset.y + canvas.bounds.height - chromeBottomInset) / scale
+        return geometry.mostVisiblePage(top: Double(top), bottom: Double(bottom), pageCount: pageCount)
+    }
+
+    /// Whether a page can be deleted now: the notebook is open for writing, no stroke is under
+    /// way, and another page would remain.
+    var canDeletePage: Bool {
+        isViewLoaded && allowsEditing && !isTornDown && inputGate.allowsMutation && !paletteSuppressed
+            && !canvas.hasActiveTool && pageCount > 1 && onPaperReplacement != nil
+    }
+
+    /// Deletes `page`, counted from zero: its ink goes and the later pages move up to close the
+    /// gap, kept as one edit through the session's saves. One undo restores the exact drawing and
+    /// page count, and redo deletes the page again; pages added in between stay.
+    ///
+    /// The canvas's undo stack is cleared before the deletion is registered on it. Its earlier
+    /// entries are PencilKit's own stroke actions, recorded against the drawing being replaced,
+    /// and the SDK does not say what they do to any other drawing; cleared, none can run against
+    /// the paper the deletion leaves, or after its undo. The strokes they covered stay in the
+    /// notebook's saved history. The canvas shares the manager along the responder chain, so any
+    /// other responder's entries would go as well, as they do on teardown; none registers there
+    /// beside the canvas, as the colour picker's fields keep their own.
+    @discardableResult
+    func deletePage(_ page: Int) -> Bool {
+        refreshUndoManager()
+        guard canDeletePage, retainedUndoManager != nil,
+              let deletion = PaperPageDeletion(page: page, pageCount: pageCount, geometry: geometry) else {
+            return false
+        }
+        // The session keeps the drawing being replaced before it is.
+        _ = captureBarrier()
+        guard canDeletePage, let manager = retainedUndoManager else { return false }
+        let before = PaperState(drawing: canvas.drawing, pageCount: pageCount)
+        let after = PaperState(drawing: deletion.apply(to: before.drawing), pageCount: deletion.remainingPageCount)
+        replacePaper(with: after)
+        manager.removeAllActions()
+        registerRestore(of: before, over: after.pageCount, in: manager)
+        publishUndoAvailability()
+        return true
+    }
+
+    /// Registers the step that puts `state` back on paper of `pageCount` pages. Run by an undo, it
+    /// registers the redo, and the other way round, from the paper as the step finds it rather
+    /// than as it was registered: pages added since may hold ink that the steps above it on the
+    /// stack bring back, so the reverse step must keep them.
+    ///
+    /// Nor does a step take away pages added since it was registered, which are not the
+    /// deletion's: it changes the page count only by the page the deletion took or its undo gave
+    /// back, within the page limit, and never restores fewer pages than `state` had.
+    private func registerRestore(of state: PaperState, over pageCount: Int, in manager: UndoManager) {
+        manager.registerUndo(withTarget: self) { [weak manager] controller in
+            guard !controller.isTornDown, let manager else { return }
+            // The session keeps the drawing being replaced before it is.
+            _ = controller.captureBarrier()
+            let replaced = PaperState(drawing: controller.canvas.drawing, pageCount: controller.pageCount)
+            let added = max(replaced.pageCount - pageCount, 0)
+            let restored = PaperState(
+                drawing: state.drawing, pageCount: min(state.pageCount + added, Self.maximumPageCount)
+            )
+            controller.replacePaper(with: restored)
+            controller.registerRestore(of: replaced, over: restored.pageCount, in: manager)
+        }
+        manager.setActionName(Self.deletePageActionName)
+    }
+
+    /// Puts `state` on the canvas in place of its paper and reports the drawing with its page
+    /// count as one edit. The paper keeps its offset, held only to its new end: after a deletion
+    /// the page that followed takes the deleted page's place on screen, an undo puts the page
+    /// back there, and deleting the last page shows the end of the one before.
+    private func replacePaper(with state: PaperState) {
+        stopArrival()
+        endMomentum = nil
+        // A frost still clearing belongs to a page that has moved or gone.
+        pageUnfold?.finish()
+        let offset = canvas.contentOffset
+        adjustingLayout {
+            isReplacingPaper = true
+            canvas.drawing = state.drawing
+            isReplacingPaper = false
+            pageCount = state.pageCount
+            updatePaperGeometry()
+            updateContentExtent()
+            canvas.setContentOffset(clampedOffset(offset), animated: false)
+        }
+        updatePaperViewport()
+        releaseEndCardOnceLeftView()
+        observeDrawing(replacingPaper: true)
+        prepareEndCardSoon()
+    }
+
     func tearDown() {
         guard !isTornDown else { return }
         _ = captureBarrier()
@@ -739,6 +858,7 @@ final class NotebookViewController: UIViewController {
         canvas.historyAvailability = nil
         onCompletedEdit = nil
         onObservation = nil
+        onPaperReplacement = nil
         onToolCompletion = nil
         onInteractionInterrupted = nil
         canPerformHistoryAction = nil
@@ -1187,6 +1307,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        guard !isReplacingPaper else { return }
         observeDrawing()
     }
 

@@ -72,6 +72,10 @@ final class NotebookSession: ObservableObject {
     let statusModel: NotebookSavePresentationModel
     let limitsModel = NotebookLimitsPresentationModel()
     let commandModel = NotebookCanvasCommandModel()
+    /// The alert that confirms a page deletion the Notebook menu asks for.
+    private(set) lazy var pageDeletionPrompt = NotebookPageDeletionPrompt { [weak self] target in
+        self?.deletePage(target) ?? false
+    }
     private var canvasControls: NotebookCanvasControls?
     private var undoAvailability = NotebookUndoAvailability.unavailable
     private var paletteSuppressed = false
@@ -289,6 +293,45 @@ final class NotebookSession: ObservableObject {
         enqueueCurrentDrawing()
     }
 
+    /// Records the canvas's paper replaced whole, as deleting a page and undoing or redoing it do:
+    /// the drawing and its page count are saved as one edit. This is the only way the page count
+    /// falls.
+    @discardableResult
+    func recordPaperReplacement(
+        _ observation: NotebookCanvasObservation, pageCount newCount: Int, ownerID: UUID
+    ) -> Bool {
+        guard loadState == .ready, activeCanvasOwner == ownerID,
+              observation.generation > latestCanvasGeneration,
+              (1...NotebookViewController.maximumPageCount).contains(newCount) else { return false }
+        // A page the notebook meant to add was measured against the paper as it was.
+        extentIntent = nil
+        pageCount = newCount
+        return recordObservation(observation, ownerID: ownerID)
+    }
+
+    /// The page the Notebook menu offers to delete: the one filling the most of the paper in view.
+    func pageDeletionTarget() -> NotebookPageDeletionTarget? {
+        guard activeCanvasOwner != nil, let page = canvasControls?.mostVisiblePage?() else { return nil }
+        return NotebookPageDeletionTarget(page: page, pageCount: pageCount)
+    }
+
+    /// Whether `target` can be deleted now: the notebook is open for writing, no stroke is under
+    /// way, and the page count is still the one the page was chosen from.
+    func canDeletePage(_ target: NotebookPageDeletionTarget) -> Bool {
+        let availability = canvasControls?.currentAvailability() ?? undoAvailability
+        return loadState == .ready && inputGate == .open && newNotebookTransition == nil && !paletteSuppressed
+            && activeCanvasOwner != nil && canvasControls?.deletePage != nil && !availability.isUsingTool
+            && pageCount > 1 && target.pageCount == pageCount && (0..<pageCount).contains(target.page)
+    }
+
+    /// Deletes the page the user confirmed, unless anything has changed since it was offered.
+    @discardableResult
+    func deletePage(_ target: NotebookPageDeletionTarget) -> Bool {
+        guard canDeletePage(target) else { return false }
+        captureWorkingInk()
+        guard canDeletePage(target), let delete = canvasControls?.deletePage else { return false }
+        return delete(target.page)
+    }
 
     func updateUndoAvailability(_ availability: NotebookUndoAvailability, ownerID: UUID) {
         guard activeCanvasOwner == ownerID else { return }
@@ -383,6 +426,11 @@ final class NotebookSession: ObservableObject {
 
     private func resetCanvasCommands() {
         canvasControls = nil
+        // The page was chosen on the canvas that goes. A canvas may go inside a view update,
+        // which must not publish.
+        if pageDeletionPrompt.target != nil {
+            Task { @MainActor [weak self] in self?.pageDeletionPrompt.withdrawRequest() }
+        }
         undoAvailability = .unavailable
         extentIntent = nil
         commandModel.update(NotebookCanvasCommandModel.State(
