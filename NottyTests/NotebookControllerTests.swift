@@ -495,7 +495,7 @@ final class NotebookControllerTests: XCTestCase {
             let fraction = CGFloat(step) / 10
             session.move(
                 to: CGSize(width: translation.width * fraction, height: translation.height * fraction),
-                resolver: resolver
+                resolver: resolver, actions: actions
             )
         }
         XCTAssertNil(defaults.writes[NotebookSceneToolStore.toolbarDefaultsKey], "moves only update the preview")
@@ -541,26 +541,16 @@ final class NotebookControllerTests: XCTestCase {
         store.attach(controller)
         store.setToolbarAvailable(true, for: controller)
         XCTAssertEqual(changes.count, 1)
-        store.setToolActive(true, for: controller)
-        XCTAssertTrue(store.isToolActive)
-        XCTAssertEqual(changes.count, 1, "a pen going down never invalidates the views that show the tools")
-        store.setToolActive(true, for: other)
-        store.setToolActive(false, for: other)
-        XCTAssertTrue(store.isToolActive, "only the owning canvas reports tool use")
-        store.setToolActive(false, for: controller)
-        XCTAssertFalse(store.isToolActive)
-        store.setToolActive(true, for: controller)
-        XCTAssertEqual(changes.count, 1, "nor does a pen coming up")
+        store.setToolbarAvailable(true, for: other)
+        XCTAssertEqual(changes.count, 1, "only the owning canvas reports availability")
         store.detach(controller)
         XCTAssertEqual(changes.count, 2)
         XCTAssertFalse(store.isToolbarAvailable)
-        XCTAssertFalse(store.isToolActive, "detaching ends the owner's tool use")
         store.detach(controller)
         store.attach(controller)
         XCTAssertEqual(changes.count, 2)
-        store.setToolActive(true, for: controller)
         store.attach(other)
-        XCTAssertFalse(store.isToolActive, "a new owner starts without tool use")
+        XCTAssertFalse(store.isToolbarAvailable, "a new owner starts unavailable")
         XCTAssertEqual(changes.count, 2)
         store.setOverlayObstruction(UIEdgeInsets(top: 0, left: 0, bottom: 80, right: 0))
         XCTAssertEqual(changes.count, 2, "the obstruction goes to the canvas, not to the toolbar's views")
@@ -880,7 +870,9 @@ final class NotebookControllerTests: XCTestCase {
         XCTAssertNotNil(NotebookViewController.squeezePreference(for: .ended), "a completed squeeze acts")
     }
 
-    func testOwningCanvasPublishesToolUseUntilTheStrokeEnds() async throws {
+    /// A stroke belongs to its canvas. A pen going down or up never invalidates the views that show
+    /// the tools, and a pause does not end the stroke in progress.
+    func testAStrokeLastsUntilItEndsWithoutInvalidatingTheToolbar() async throws {
         let store = NotebookTestFixtures.toolStore()
         let controller = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
         let window = try await present(controller)
@@ -889,19 +881,20 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         let canvas = controller.canvasView
-        XCTAssertFalse(store.isToolActive)
+        let changes = ChangeCounter(store)
+        XCTAssertFalse(controller.currentUndoAvailability.isUsingTool)
         controller.canvasViewDidBeginUsingTool(canvas)
-        XCTAssertTrue(store.isToolActive)
+        XCTAssertTrue(controller.currentUndoAvailability.isUsingTool)
+        controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertFalse(controller.currentUndoAvailability.isUsingTool)
+        XCTAssertEqual(changes.count, 0, "a pen going down or up never invalidates the views that show the tools")
+
+        controller.canvasViewDidBeginUsingTool(canvas)
         controller.setInputGate(.capacity)
-        XCTAssertTrue(store.isToolActive, "a pause does not end the stroke in progress")
+        XCTAssertTrue(controller.currentUndoAvailability.isUsingTool, "a pause does not end the stroke in progress")
         controller.setInputGate(.open)
         controller.canvasViewDidEndUsingTool(canvas)
-        XCTAssertFalse(store.isToolActive)
-
-        let outsider = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
-        store.setToolActive(true, for: outsider)
-        XCTAssertFalse(store.isToolActive, "only the owning canvas reports tool use")
-        outsider.tearDown()
+        XCTAssertFalse(controller.currentUndoAvailability.isUsingTool)
     }
 
     func testToolUseEndsWhenTheCanvasDisappearsOrIsTornDown() async throws {
@@ -913,10 +906,10 @@ final class NotebookControllerTests: XCTestCase {
             window.isHidden = true
         }
         controller.canvasViewDidBeginUsingTool(controller.canvasView)
-        XCTAssertTrue(store.isToolActive)
+        XCTAssertTrue(controller.currentUndoAvailability.isUsingTool)
         controller.beginAppearanceTransition(false, animated: false)
         controller.endAppearanceTransition()
-        XCTAssertFalse(store.isToolActive)
+        XCTAssertFalse(controller.currentUndoAvailability.isUsingTool)
 
         let replacement = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
         let replacementWindow = try await present(replacement)
@@ -925,9 +918,9 @@ final class NotebookControllerTests: XCTestCase {
             replacementWindow.isHidden = true
         }
         replacement.canvasViewDidBeginUsingTool(replacement.canvasView)
-        XCTAssertTrue(store.isToolActive)
+        XCTAssertTrue(replacement.currentUndoAvailability.isUsingTool)
         replacement.tearDown()
-        XCTAssertFalse(store.isToolActive)
+        XCTAssertFalse(replacement.currentUndoAvailability.isUsingTool)
     }
 
     func testFloatingToolbarObstructionLetsThePageEndsScrollClearWithoutMovingThePage() async throws {
@@ -1086,6 +1079,40 @@ final class NotebookControllerTests: XCTestCase {
         controller.canvasViewDidEndUsingTool(canvas)
         XCTAssertEqual(canvas.contentInset.top, 60)
         XCTAssertEqual(canvas.contentOffset.y, 200, "a page inside the smaller range stays where it is")
+    }
+
+    /// A header reaching past where the toolbar's area begins stays covered by every canvas, whatever
+    /// its gate, however little the toolbar takes; a toolbar taking more adds to where its area begins.
+    func testEveryCanvasKeepsTheWholeHeaderCovered() async throws {
+        let size = CGSize(width: 1_024, height: 1_366)
+        let chrome = NotebookCanvasChrome(top: 94, bottom: 20, canvasSize: size, coveredTop: 98)
+        let store = NotebookTestFixtures.toolStore()
+        let owner = NotebookViewController(pageCount: 3, initialDrawing: PKDrawing(), toolStore: store)
+        owner.applyChrome(chrome)
+        let window = try await present(owner)
+        defer {
+            owner.tearDown()
+            window.isHidden = true
+        }
+        XCTAssertEqual(owner.canvasView.contentInset.top, 98, "a toolbar clear of the top leaves the header covered")
+        store.setOverlayObstruction(UIEdgeInsets(top: 120, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(owner.canvasView.contentInset.top, 214)
+
+        let paused = NotebookViewController(
+            pageCount: 3, initialDrawing: PKDrawing(), toolStore: store, allowsEditing: false
+        )
+        paused.setInputGate(.readOnly)
+        paused.applyChrome(chrome)
+        paused.placeUnderToolbar(of: store)
+        let pausedWindow = try await present(paused, ownsTools: false)
+        defer {
+            paused.tearDown()
+            pausedWindow.isHidden = true
+        }
+        XCTAssertEqual(paused.canvasView.contentInset.top, 214)
+        store.setOverlayObstruction(.zero)
+        XCTAssertEqual(paused.canvasView.contentInset.top, 98, "a read-only canvas keeps the header covered too")
+        XCTAssertEqual(owner.canvasView.contentInset.top, 98)
     }
 
     func testEveryCanvasReservesTheChromeAndTheToolbarDrawnOverIt() async throws {

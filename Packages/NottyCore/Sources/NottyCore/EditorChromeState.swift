@@ -82,7 +82,8 @@ public struct EditorChromeState: Equatable, Sendable {
     private var activeTransient: UInt64?
     private var lastTransient: UInt64 = 0
     private var isToolActive = false
-    /// Notebooks open at their top, so the first scroll there is not an arrival.
+    /// Whether the page rested at its top when last reported, by scrolling or by
+    /// `pageMoved(isAtTop:)`. Until the app reports otherwise, the page is taken to start there.
     private var wasAtTop = true
     /// Net travel into the notebook since travel last restarted: how far below the highest point
     /// reached the notebook now sits.
@@ -97,9 +98,9 @@ public struct EditorChromeState: Equatable, Sendable {
     public var showsHeader: Bool { isForcedVisible || isRevealed }
 
     /// How far a header that follows the page has moved up with it: the net travel into the
-    /// notebook since the header last showed, a scroll last came to rest or a stroke began.
-    /// It stays below `hideTravel`, since reaching that hides the header. Zero while the header
-    /// is hidden or kept in place.
+    /// notebook since the header last showed, a scroll last came to rest, a stroke began or pins
+    /// last began or stopped holding it in place. It stays below `hideTravel`, since reaching
+    /// that hides the header. Zero while the header is hidden or kept in place.
     public var headerTravel: CGFloat { isRevealed && !isForcedVisible ? descent : 0 }
 
     public var showsTools: Bool {
@@ -122,9 +123,15 @@ public struct EditorChromeState: Equatable, Sendable {
         }
     }
 
+    /// A header following the page goes back in place when pinned, and stays there as the pins
+    /// clear, so travel counts afresh from each change; what scrolling asked for underneath stays.
     @discardableResult
     public mutating func setPins(_ pins: Set<EditorChromePin>) -> Bool {
-        changingVisibility { $0.pins = pins }
+        changingVisibility {
+            let wasForcedVisible = $0.isForcedVisible
+            $0.pins = pins
+            if $0.isForcedVisible != wasForcedVisible { $0.restartTravel() }
+        }
     }
 
     /// Never changes visibility, so nothing moves under the pen as a stroke starts.
@@ -163,12 +170,32 @@ public struct EditorChromeState: Equatable, Sendable {
     /// before taking each delta, so the settle-back reports nothing.
     ///
     /// Arriving at the top reveals the chrome; staying there does not, so a stroke written at
-    /// the top still leaves a clean page. A scroll-to-top tap is the user's own request: report
-    /// its arrival once it settles, with a `delta` of zero. Ignored while a tool is in use.
+    /// the top still leaves a clean page. Ignored while a tool is in use. Report a status-bar
+    /// scroll to the top through `scrolledToTop()`, and a page that something other than the
+    /// user moved through `pageMoved(isAtTop:)`.
     @discardableResult
     public mutating func userScrolled(by delta: CGFloat, isAtTop: Bool) -> Bool {
         guard !isToolActive else { return false }
         return changingVisibility { $0.scroll(by: delta, isAtTop: isAtTop) }
+    }
+
+    /// Records where the page rests after something other than the user moved it: opening below
+    /// its top, a resize, or a change in the space kept for the chrome. The next arrival at the
+    /// top counts from there. Never changes visibility.
+    public mutating func pageMoved(isAtTop: Bool) {
+        wasAtTop = isAtTop
+    }
+
+    /// The status-bar tap's scroll to the top has settled. It is the user's own request, so it
+    /// shows everything the mode can hide wherever the page rested before, and the page now rests
+    /// at the top. Ignored while a tool is in use.
+    @discardableResult
+    public mutating func scrolledToTop() -> Bool {
+        guard !isToolActive else { return false }
+        return changingVisibility {
+            $0.wasAtTop = true
+            $0.show()
+        }
     }
 
     /// The user's scrolling has come to rest. Travel short of either threshold is dropped, as a

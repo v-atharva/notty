@@ -233,6 +233,7 @@ struct NotebookKey<Label: View>: View {
     let shape: NotebookKeyStyle.Outline
     @Environment(\.isFocused) private var isFocused
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.notebookKeysShowSelection) private var showsSelection
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -245,7 +246,7 @@ struct NotebookKey<Label: View>: View {
             }
             .background {
                 NotebookKeyStyle.Background(
-                    shape: shape, isSelected: isSelected && isEnabled, isPressed: pressed,
+                    shape: shape, isSelected: isSelected && showsSelection, isPressed: pressed,
                     isFocused: isFocused && isEnabled
                 )
                 // A preset's capsule is shorter than its touch area, and a readout's cell sits
@@ -258,20 +259,37 @@ struct NotebookKey<Label: View>: View {
 
 /// A key goes down at once and comes back up briefly eased. Only its travel and its press
 /// shading animate; selection, shadows and sizes change at once.
-private enum NotebookKeyRelease {
+enum NotebookKeyRelease {
     static func animation(pressed: Bool, reduceMotion: Bool) -> Animation? {
         pressed || reduceMotion ? nil : .easeOut(duration: NotebookTheme.keyReleaseDuration)
     }
 }
 
-/// Glyph and mark colour of a key, turning to the disabled tone when the key or its rail is
-/// unavailable.
+/// Glyph and mark colour of a key, turning to the disabled tone when the key is unavailable. A key
+/// that only a writing pause disables keeps the glyph tone, as its rail dims it with the rest of
+/// its content; dimming the disabled tone as well would leave it unreadable. A key of a rail the
+/// writing view is hiding keeps its tone too, as it fades out unchanged.
 struct NotebookKeyForeground: ViewModifier {
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.notebookKeysPaused) private var isPaused
+    @Environment(\.notebookKeysHiding) private var isHiding
 
     func body(content: Content) -> some View {
-        content.foregroundStyle((isEnabled ? NotebookTheme.glyph : NotebookTheme.disabledGlyph).color)
+        let live = isEnabled || isPaused || isHiding
+        content.foregroundStyle((live ? NotebookTheme.glyph : NotebookTheme.disabledGlyph).color)
     }
+}
+
+extension EnvironmentValues {
+    /// True inside a rail or handle that is disabled only while writing is paused.
+    @Entry var notebookKeysPaused = false
+    /// True inside a rail the writing view is hiding, whose keys are disabled from the moment the
+    /// hide begins so they leave keyboard focus between strokes rather than as the fade ends.
+    @Entry var notebookKeysHiding = false
+
+    /// Whether a selected key draws its selection: while enabled, and in a rail that is disabled
+    /// only because it is hiding, so the fade shows it as it was. A paused rail draws none.
+    var notebookKeysShowSelection: Bool { isEnabled || (notebookKeysHiding && !notebookKeysPaused) }
 }
 
 /// The non-colour selection cue under a selected glyph or width dot.
@@ -467,6 +485,19 @@ struct NotebookStatusCard<Primary: View, Secondary: View>: View {
             .padding(NotebookTheme.detailPadding)
             .frame(maxWidth: NotebookTheme.statusCardMaxWidth)
             .background { NotebookPanelShell() }
+        }
+    }
+}
+
+extension View {
+    /// Centres a status card on the paper, scrolling it when a large text size makes it taller
+    /// than the screen. The padding keeps the card's shadow clear of the edges.
+    func centredOnPaper() -> some View {
+        ViewThatFits(in: .vertical) {
+            padding(NotebookTheme.detailPadding)
+            ScrollView {
+                padding(NotebookTheme.detailPadding)
+            }
         }
     }
 }

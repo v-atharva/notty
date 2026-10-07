@@ -42,7 +42,8 @@ struct NotebookUpcomingFeature: Identifiable, Hashable, Sendable {
 }
 
 /// A placeholder in the drawing toolbar: the toolbar's own control, permanently disabled, so
-/// it takes the disabled glyph tone and never shows a pressed, focused or selected state.
+/// it takes the disabled glyph tone whether or not its rail is paused or hiding, and never shows
+/// a pressed, focused or selected state.
 @MainActor
 struct NotebookUpcomingToolButton: View {
     let feature: NotebookUpcomingFeature
@@ -53,6 +54,8 @@ struct NotebookUpcomingToolButton: View {
         }
         .buttonStyle(NotebookKeyStyle())
         .disabled(true)
+        .environment(\.notebookKeysPaused, false)
+        .environment(\.notebookKeysHiding, false)
         .accessibilityLabel(feature.accessibilityLabel)
         .help(feature.accessibilityLabel)
         .accessibilityShowsLargeContentViewer {

@@ -4,10 +4,11 @@ import SwiftUI
 
 @MainActor
 struct NotebookScreen: View {
+    /// How far below the top safe area the header reaches.
+    static let headerExtent = NotebookTheme.headerTopGap + NotebookTheme.headerHeight
     /// Room the toolbar host keeps below the top safe area for the header, so a docked toolbar sits
     /// just below the header and stays put when the header leaves.
-    static let headerReservation = NotebookTheme.headerTopGap + NotebookTheme.headerHeight
-        + NotebookTheme.headerToolbarGap - EditorToolbarLayout.margin
+    static let headerReservation = headerExtent + NotebookTheme.headerToolbarGap - EditorToolbarLayout.margin
 
     @StateObject private var session: NotebookSession
 
@@ -21,6 +22,9 @@ struct NotebookScreen: View {
         self.startNewNotebook = startNewNotebook
     }
     @State private var showsRecoveryCopies = false
+    /// The window scene's tool store, resolved while the notebook opens, so the toolbar shows with
+    /// the header in the editor's first frame.
+    @State private var sceneStore: NotebookSceneToolStore?
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -31,7 +35,7 @@ struct NotebookScreen: View {
                 switch session.loadState {
                 case .loading:
                     NotebookStatusCard(loading: "Opening notebook")
-                        .padding(NotebookTheme.detailPadding)
+                        .centredOnPaper()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .failed(let failure):
                     NotebookStatusCard(title: "Couldn't open notebook", message: failure.message) {
@@ -43,7 +47,7 @@ struct NotebookScreen: View {
                             }
                         }
                     }
-                    .padding(NotebookTheme.detailPadding)
+                    .centredOnPaper()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .ready:
                     editor
@@ -60,6 +64,12 @@ struct NotebookScreen: View {
             NotebookRecoveryView(session: session)
         }
         .notebookChromePresentation(showsRecoveryCopies, chrome: session.writingChrome)
+        .background {
+            NotebookWindowSceneReader { scene in
+                let owner = NotebookSceneToolStore.owner(for: scene)
+                if sceneStore !== owner { sceneStore = owner }
+            }
+        }
         .task { await session.load() }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { session.flush() }
@@ -69,12 +79,15 @@ struct NotebookScreen: View {
 
     private var editor: some View {
         ZStack(alignment: .top) {
-            NotebookToolbarHost(extendsCanvasUnderChrome: true, topReservation: Self.headerReservation) {
+            NotebookToolbarHost(
+                store: sceneStore, extendsCanvasUnderChrome: true, topReservation: Self.headerReservation,
+                headerExtent: Self.headerExtent
+            ) {
                 NotebookCanvas(session: session)
                     .id(session.canvasGeneration)
             }
             NotebookHeaderHost(session: session, openRecoveryCopies: openRecoveryCopies)
-                .frame(height: NotebookTheme.headerTopGap + NotebookTheme.headerHeight)
+                .frame(height: Self.headerExtent)
                 .padding(.horizontal, NotebookTheme.headerSideInset)
                 // The header is read first, then the toolbar, then the page.
                 .accessibilitySortPriority(2)

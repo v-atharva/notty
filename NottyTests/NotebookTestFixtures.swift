@@ -157,6 +157,15 @@ extension NotebookTestFixtures {
         return controller.children.lazy.compactMap { navigationController(in: $0) }.first
     }
 
+    /// Waits until every block already queued on the main queue has run, such as a publisher's
+    /// delivery there.
+    @MainActor
+    static func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     /// The view a touch at `point`, in `view`'s coordinates, reaches in its window.
     @MainActor
     static func hit(_ point: CGPoint, in view: UIView) -> UIView {
@@ -195,6 +204,37 @@ extension NotebookTestFixtures {
 
 enum NotebookFixtureFailure: Error {
     case timeout
+}
+
+/// Stands in for a timed wait. Each wait stays pending, under the duration it asked for, until the
+/// test releases it, so code that waits can be stepped through without real time passing.
+actor NotebookTestClock {
+    private struct Request {
+        let duration: Duration
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var pending: [UUID: Request] = [:]
+
+    func wait(_ duration: Duration) async {
+        await withCheckedContinuation {
+            pending[UUID()] = Request(duration: duration, continuation: $0)
+        }
+    }
+
+    func requests(for duration: Duration) -> [UUID] {
+        pending.filter { $0.value.duration == duration }.map(\.key)
+    }
+
+    func release(_ id: UUID) {
+        pending.removeValue(forKey: id)?.continuation.resume()
+    }
+
+    func releaseAll() {
+        let requests = Array(pending.values)
+        pending.removeAll()
+        requests.forEach { $0.continuation.resume() }
+    }
 }
 
 /// A view controller that records when UIKit has finished showing it.

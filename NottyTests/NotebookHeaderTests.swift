@@ -181,6 +181,192 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertEqual(header.transform, .identity, "Short of hiding, the header settles back in place.")
     }
 
+    /// The space the canvas keeps can change while the user drags or the page decelerates: the
+    /// toolbar is measured again, or the window resizes. Those inset and offset writes are layout,
+    /// not scrolling. They can arrive inside a SwiftUI update, so they publish nothing; the header
+    /// and tools hold still; and the next step of the scroll counts only its own distance.
+    func testLayoutChangesMidScrollNeitherMoveTheChromeNorCountAsTravel() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let header = editor.header.headerView
+        var changes = 0
+        let chromeWatch = editor.chrome.objectWillChange.sink { changes += 1 }
+        let storeWatch = editor.store.objectWillChange.sink { changes += 1 }
+        defer {
+            chromeWatch.cancel()
+            storeWatch.cancel()
+        }
+
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 10), animated: false)
+        XCTAssertEqual(header.transform.ty, -10, accuracy: 0.01)
+
+        let obstruction = editor.store.overlayObstruction
+        let insets = canvas.contentInset
+        editor.store.setOverlayObstruction(UIEdgeInsets(top: obstruction.top + 40, left: 0, bottom: 0, right: 0))
+        XCTAssertEqual(canvas.contentInset.top, insets.top + 40, accuracy: 0.5)
+        XCTAssertEqual(header.transform.ty, -10, accuracy: 0.01, "Mid-drag, more reserved space moves nothing.")
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        editor.store.setOverlayObstruction(obstruction)
+        XCTAssertEqual(canvas.contentInset, insets)
+        XCTAssertEqual(header.transform.ty, -10, accuracy: 0.01, "Mid-deceleration, less reserved space moves nothing.")
+
+        // A canvas resized mid-deceleration keeps its page centre, which moves the page by layout.
+        let view = try XCTUnwrap(editor.controller.view)
+        for widthChange in [-34, 34] as [CGFloat] {
+            let offset = canvas.contentOffset.y
+            let travel = header.transform.ty
+            view.frame.size.width += widthChange
+            view.layoutIfNeeded()
+            XCTAssertGreaterThan(abs(canvas.contentOffset.y - offset), 10, "The resize moved the page.")
+            XCTAssertEqual(header.transform.ty, travel, accuracy: 0.01, "Layout never moves the header.")
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: canvas.contentOffset.y + 2), animated: false)
+            XCTAssertEqual(header.transform.ty, travel - 2, accuracy: 0.01,
+                "Only the user's own 2 pt count; the jump is not travel.")
+        }
+        XCTAssertFalse(editor.store.areToolsHidden)
+        XCTAssertEqual(changes, 0, "Layout publishes nothing.")
+        editor.controller.scrollViewDidEndDecelerating(canvas)
+        XCTAssertEqual(header.transform, .identity)
+    }
+
+    /// Releasing reserved space at the end of the notebook pulls the page back into range. The
+    /// pull is layout, not the user scrolling up, so mid-drag it brings back neither the header
+    /// nor the tools and publishes nothing, and the drag carries on from the page's new offset.
+    func testReleasedSpaceThatPullsThePageBackMidDragNeitherRevealsNorPublishes() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let header = editor.header.headerView
+        let obstruction = editor.store.overlayObstruction
+        let released: CGFloat = 300
+        editor.store.setOverlayObstruction(UIEdgeInsets(top: obstruction.top, left: 0, bottom: released, right: 0))
+        let end = canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        var y = canvas.contentOffset.y
+        while y < end {
+            y = min(y + 20, end)
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        XCTAssertTrue(editor.store.areToolsHidden, "Reading on hid the tools.")
+        XCTAssertEqual(header.transform.ty, -NotebookWritingChrome.fullTravel, accuracy: 0.01)
+        var changes = 0
+        let chromeWatch = editor.chrome.objectWillChange.sink { changes += 1 }
+        let storeWatch = editor.store.objectWillChange.sink { changes += 1 }
+        defer {
+            chromeWatch.cancel()
+            storeWatch.cancel()
+        }
+
+        let reading = canvas.contentOffset.y
+        editor.store.setOverlayObstruction(obstruction)
+        XCTAssertEqual(canvas.contentOffset.y, reading - released, accuracy: 1, "The release pulled the page back.")
+        XCTAssertTrue(editor.store.areToolsHidden, "The pull is not an upward scroll.")
+        XCTAssertEqual(header.transform.ty, -NotebookWritingChrome.fullTravel, accuracy: 0.01)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: canvas.contentOffset.y - 2), animated: false)
+        XCTAssertTrue(editor.store.areToolsHidden, "Only the user's own 2 pt up count.")
+        XCTAssertEqual(header.transform.ty, -NotebookWritingChrome.fullTravel, accuracy: 0.01)
+        XCTAssertEqual(changes, 0, "Layout publishes nothing.")
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+    }
+
+    /// The same release made by the toolbar itself: docking a toolbar that floated at the bottom
+    /// frees its space while SwiftUI updates, where the writing view must not publish.
+    func testDockingABottomToolbarMidDragNeitherRevealsNorPublishes() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let header = editor.header.headerView
+        var preferences = editor.store.toolbar
+        let docked = preferences.placement
+        preferences.place(.floating(CGPoint(x: 0.5, y: 1)))
+        editor.store.updateToolbar(preferences)
+        try await NotebookTestFixtures.waitUntil { editor.store.overlayObstruction.bottom > 0 }
+        let released = editor.store.overlayObstruction.bottom
+        let end = canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        var y = canvas.contentOffset.y
+        while y < end {
+            y = min(y + 20, end)
+            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        }
+        XCTAssertTrue(editor.store.areToolsHidden, "Reading on hid the tools.")
+        var changes = 0
+        let chromeWatch = editor.chrome.objectWillChange.sink { changes += 1 }
+        // The toolbar's own preferences publish; only the tools' visibility must not.
+        let toolsWatch = editor.store.$areToolsHidden.dropFirst().sink { _ in changes += 1 }
+        defer {
+            chromeWatch.cancel()
+            toolsWatch.cancel()
+        }
+
+        let reading = canvas.contentOffset.y
+        preferences.place(docked)
+        editor.store.updateToolbar(preferences)
+        try await NotebookTestFixtures.waitUntil { editor.store.overlayObstruction.bottom == 0 }
+        XCTAssertEqual(canvas.contentOffset.y, reading - released, accuracy: 1, "Docking pulled the page back.")
+        XCTAssertTrue(editor.store.areToolsHidden)
+        XCTAssertEqual(header.transform.ty, -NotebookWritingChrome.fullTravel, accuracy: 0.01)
+        XCTAssertEqual(changes, 0, "Layout publishes nothing.")
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+    }
+
+    /// Stopping a fling with a tap reports neither a drag nor the end of the deceleration. The
+    /// last finger leaving the page ends the scroll, so a header left part-way settles and takes
+    /// touches again.
+    func testATapThatStopsAFlingSettlesAHeaderLeftPartWay() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let header = editor.header.headerView
+        let observer = editor.controller.fingerLiftObserver
+        XCTAssertTrue(canvas.gestureRecognizers?.contains(observer) ?? false)
+        XCTAssertEqual(observer.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.direct.rawValue)],
+            "Apple Pencil never reaches it.")
+        XCTAssertFalse(observer.cancelsTouchesInView)
+        XCTAssertFalse(observer.delaysTouchesEnded)
+
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 10), animated: false)
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: true)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 15), animated: false)
+        XCTAssertEqual(header.transform.ty, -15, accuracy: 0.01)
+        XCTAssertFalse(header.isUserInteractionEnabled)
+
+        let finger = UITouch()
+        observer.touchesBegan([finger], with: UIEvent())
+        observer.touchesEnded([finger], with: UIEvent())
+        XCTAssertEqual(header.transform, .identity, "The header settles once the finger lifts.")
+        XCTAssertTrue(header.isUserInteractionEnabled, "Undo and the menu key take touches again.")
+        XCTAssertEqual(editor.chrome.travel, 0)
+        XCTAssertTrue(editor.chrome.state.showsHeader)
+
+        // The scroll has ended, so the page moving afterwards is not counted.
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: 60), animated: false)
+        XCTAssertEqual(header.transform, .identity)
+    }
+
+    /// The observer reports only once every finger has left, and keeps reporting for later touches.
+    func testFingerLiftObserverReportsWhenTheLastFingerLeaves() {
+        let observer = NotebookFingerLiftObserver()
+        var lifts = 0
+        observer.onLift = { lifts += 1 }
+        let first = UITouch()
+        let second = UITouch()
+        observer.touchesBegan([first], with: UIEvent())
+        observer.touchesBegan([second], with: UIEvent())
+        observer.touchesEnded([first], with: UIEvent())
+        XCTAssertEqual(lifts, 0, "A finger is still down.")
+        observer.touchesCancelled([second], with: UIEvent())
+        XCTAssertEqual(lifts, 1)
+        observer.reset()
+        observer.touchesBegan([first], with: UIEvent())
+        observer.touchesEnded([first], with: UIEvent())
+        XCTAssertEqual(lifts, 2)
+        XCTAssertTrue(observer.gestureRecognizer(observer, shouldRecognizeSimultaneouslyWith: UIPanGestureRecognizer()))
+    }
+
     func testAlwaysOnToolsScrollsTheHeaderAwayAndKeepsTheTools() async throws {
         let editor = try await mountEditor(width: 834)
         defer { editor.close() }
@@ -249,6 +435,88 @@ final class NotebookHeaderTests: XCTestCase {
         editor.controller.canvasViewDidEndUsingTool(canvas)
         XCTAssertFalse(editor.store.areToolsHidden)
         XCTAssertEqual(editor.header.headerView.alpha, 1)
+    }
+
+    /// The writing views end to end on the notebook screen, with the real header and toolbar: Focus
+    /// clears both from the page when a stroke ends and leaves the reveal tab, whose tap brings both
+    /// back; Pinned never hides anything; Always-on tools lets the header scroll away and keeps the
+    /// tools. The page's insets and offset never change with any of it.
+    func testWritingViewsHideAndRevealTheHeaderAndToolsTogetherWithoutMovingThePage() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let header = editor.header.headerView
+        let store = editor.store
+        let window = editor.window
+        let insets = canvas.contentInset
+        let shellCentre = CGPoint(x: editor.shellFrame.midX, y: editor.shellFrame.midY)
+        let reserved = window.safeAreaInsets.top + NotebookScreen.headerReservation
+        let rail = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+            .frame(for: store.toolbar.placement, in: CGRect(x: 0, y: reserved, width: window.bounds.width, height: 800))
+        let tab = CGPoint(x: rail.midX, y: rail.minY + 10)
+        let besideTab = CGPoint(x: rail.midX + 120, y: rail.midY)
+        func hit(_ point: CGPoint) -> UIView { NotebookTestFixtures.hit(point, in: window) }
+        func assertPageHeldStill(_ offset: CGPoint, _ phase: String, line: UInt = #line) {
+            XCTAssertEqual(canvas.contentInset, insets, "\(phase): insets", line: line)
+            XCTAssertEqual(canvas.contentOffset, offset, "\(phase): offset", line: line)
+        }
+        func stroke() {
+            editor.controller.canvasViewDidBeginUsingTool(canvas)
+            editor.controller.canvasViewDidEndUsingTool(canvas)
+        }
+        XCTAssertEqual(editor.chrome.mode, .focus, "Focus is the default.")
+        XCTAssertFalse(store.areToolsHidden)
+        try await NotebookTestFixtures.waitUntil { !hit(besideTab).isDescendant(of: editor.controller.view) }
+
+        let opened = canvas.contentOffset
+        stroke()
+        XCTAssertEqual(editor.chrome.travel, NotebookWritingChrome.fullTravel)
+        XCTAssertEqual(NotebookWritingChrome.fullTravel, 66)
+        XCTAssertEqual(header.alpha, 0)
+        XCTAssertFalse(header.isUserInteractionEnabled)
+        XCTAssertTrue(hit(shellCentre).isDescendant(of: editor.controller.view), "The page takes the header's place.")
+        XCTAssertTrue(store.areToolsHidden)
+        try await NotebookTestFixtures.waitUntil {
+            hit(besideTab).isDescendant(of: canvas) && !hit(tab).isDescendant(of: editor.controller.view)
+        }
+        assertPageHeldStill(opened, "Focus after a stroke")
+
+        // The reveal tab's tap.
+        NotebookToolbarActions(store: store).showTools()
+        XCTAssertFalse(store.areToolsHidden)
+        XCTAssertEqual(editor.chrome.travel, 0)
+        XCTAssertEqual(header.transform, .identity)
+        XCTAssertEqual(header.alpha, 1)
+        XCTAssertTrue(hit(shellCentre).isDescendant(of: editor.header.view), "The header takes touches again.")
+        try await NotebookTestFixtures.waitUntil { !hit(besideTab).isDescendant(of: editor.controller.view) }
+        assertPageHeldStill(opened, "Focus revealed")
+
+        editor.chrome.setMode(.pinned)
+        stroke()
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: opened.y + 150), animated: false)
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        XCTAssertEqual(header.transform, .identity, "Pinned never moves the header")
+        XCTAssertEqual(header.alpha, 1)
+        XCTAssertFalse(store.areToolsHidden, "nor hides the tools.")
+        assertPageHeldStill(CGPoint(x: opened.x, y: opened.y + 150), "Pinned")
+
+        editor.chrome.setMode(.overlay)
+        stroke()
+        XCTAssertEqual(header.alpha, 1, "Always-on tools leaves the header after a stroke")
+        XCTAssertFalse(store.areToolsHidden, "and the tools.")
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        for step in 1...20 {
+            canvas.setContentOffset(CGPoint(x: opened.x, y: opened.y + 150 + CGFloat(step) * 5), animated: false)
+        }
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        XCTAssertEqual(editor.chrome.travel, NotebookWritingChrome.fullTravel, "The header scrolls away")
+        XCTAssertEqual(header.alpha, 0)
+        XCTAssertFalse(store.areToolsHidden, "while the tools stay.")
+        XCTAssertFalse(hit(besideTab).isDescendant(of: editor.controller.view))
+        assertPageHeldStill(CGPoint(x: opened.x, y: opened.y + 250), "Always-on tools")
+        try await Task.sleep(for: .milliseconds(300))
+        assertPageHeldStill(CGPoint(x: opened.x, y: opened.y + 250), "Always-on tools, settled")
     }
 
     func testAFailedSaveKeepsTheHeaderAndToolsInSight() async throws {
@@ -377,6 +645,32 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertEqual(rig.header.alpha, 0)
     }
 
+    /// Layout that moves the page mid-scroll restarts the count from the new offset; outside a
+    /// scroll it changes nothing.
+    func testALayoutAdjustmentMidDragIsNotCountedAsTravel() async throws {
+        let rig = try await NotebookChromeRig()
+        rig.chrome.userScrollBegan(in: rig.scrollView)
+        rig.scroll(by: 10)
+        XCTAssertEqual(rig.header.transform.ty, -10, accuracy: 0.01)
+        rig.scrollView.contentOffset.y += 300
+        rig.chrome.layoutMovedPage(in: rig.scrollView)
+        XCTAssertEqual(rig.header.transform.ty, -10, accuracy: 0.01)
+        rig.scroll(by: 2)
+        XCTAssertEqual(rig.header.transform.ty, -12, accuracy: 0.01, "The 300 pt jump is not travel.")
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        rig.scrollView.contentOffset.y -= 300
+        rig.chrome.layoutMovedPage(in: rig.scrollView)
+        rig.scroll(by: -2)
+        XCTAssertEqual(rig.header.transform.ty, -10, accuracy: 0.01, "Nor is a jump back.")
+        rig.chrome.userScrollEnded()
+
+        rig.chrome.layoutMovedPage(in: rig.scrollView)
+        rig.chrome.fingersLifted()
+        rig.move(to: rig.scrollView.contentOffset.y + 100)
+        XCTAssertEqual(rig.header.transform, .identity, "Outside a scroll, neither starts one.")
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+    }
+
     /// A slow drag reverses by a point now and then. The header and the state count the same net
     /// distance, so a header that has left is never brought back when the drag ends.
     func testASlowDragsSmallReversalsKeepTheHeaderAndTheStateInAgreement() async throws {
@@ -452,6 +746,64 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertTrue(rig.chrome.state.showsHeader, "Pulling past the top reveals as any arrival there.")
     }
 
+    /// The notebook opens below the top of its scroll range, under the header and toolbar. After a
+    /// stroke has cleared the page, a status-bar tap brings the header and tools back.
+    func testTheStatusBarTapRevealsOnANotebookJustOpened() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        XCTAssertGreaterThan(canvas.contentOffset.y, -canvas.contentInset.top + 28, "The page opens below its top.")
+        editor.controller.canvasViewDidBeginUsingTool(canvas)
+        editor.controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertTrue(editor.store.areToolsHidden)
+
+        // The system scrolls the page to its top, then reports that it has settled there.
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+        editor.controller.scrollViewDidScrollToTop(canvas)
+        XCTAssertTrue(editor.chrome.state.showsHeader)
+        XCTAssertFalse(editor.store.areToolsHidden)
+
+        // At the top already, the tap is still the user's request.
+        editor.controller.canvasViewDidBeginUsingTool(canvas)
+        editor.controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertTrue(editor.store.areToolsHidden)
+        editor.controller.scrollViewDidScrollToTop(canvas)
+        XCTAssertTrue(editor.chrome.state.showsHeader)
+        XCTAssertFalse(editor.store.areToolsHidden)
+    }
+
+    /// The writing view learns where the notebook opens, so the first scroll that reaches the top
+    /// is an arrival there, however short.
+    func testTheFirstArrivalAtTheTopRevealsOnANotebookJustOpened() async throws {
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let top = -canvas.contentInset.top
+        editor.controller.canvasViewDidBeginUsingTool(canvas)
+        editor.controller.canvasViewDidEndUsingTool(canvas)
+        XCTAssertTrue(editor.store.areToolsHidden)
+
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: top + 10), animated: false)
+        editor.controller.scrollViewWillBeginDragging(canvas)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: top), animated: false)
+        editor.controller.scrollViewDidEndDragging(canvas, willDecelerate: false)
+        XCTAssertTrue(editor.chrome.state.showsHeader, "A 10 pt scroll that reaches the top is an arrival.")
+        XCTAssertFalse(editor.store.areToolsHidden)
+    }
+
+    /// A status-bar tap during a stroke waits for the pen to lift.
+    func testAStatusBarTapDuringAStrokeRevealsOnceThePenLifts() async throws {
+        let rig = try await NotebookChromeRig()
+        rig.drag(by: 200)
+        XCTAssertFalse(rig.chrome.state.showsHeader)
+        rig.chrome.toolBegan()
+        rig.chrome.scrolledToTop()
+        XCTAssertFalse(rig.chrome.state.showsHeader, "Nothing moves under the pen.")
+        rig.chrome.toolEnded()
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+        XCTAssertFalse(rig.store.areToolsHidden)
+    }
+
     /// The header fades out after 28 pt down and back in after 28 pt up, without moving.
     func testReduceMotionFadesTheHeaderWithoutMovingIt() async throws {
         let rig = try await NotebookChromeRig(reduceMotion: true)
@@ -488,21 +840,24 @@ final class NotebookHeaderTests: XCTestCase {
         rig.chrome.setPresentation(id, isPresented: false)
         XCTAssertFalse(rig.chrome.isPresenting)
 
-        // The toolbar's own popovers and sheets report through the store.
-        let panel = UUID()
-        rig.store.setToolbarPresentation(panel, isPresented: true)
-        XCTAssertTrue(rig.chrome.isPresenting)
-        XCTAssertTrue(rig.chrome.state.pins.contains(.presentation))
-        rig.store.setToolbarPresentation(panel, isPresented: false)
-        XCTAssertFalse(rig.chrome.isPresenting)
-
-        rig.store.setToolbarDragging(true)
+        // A toolbar drag reports itself from its first move until it ends.
+        let drag = NotebookToolbarDragSession()
+        let actions = NotebookToolbarActions(store: rig.store)
+        drag.move(to: CGSize(width: 0, height: 20), resolver: rig.toolbarDragResolver, actions: actions)
         XCTAssertTrue(rig.chrome.state.pins.contains(.dragging))
         rig.chrome.toolBegan()
         rig.chrome.toolEnded()
         XCTAssertFalse(rig.store.areToolsHidden, "A dragged toolbar never hides under the finger.")
-        rig.store.setToolbarDragging(false)
+        drag.move(to: CGSize(width: 0, height: 40), resolver: rig.toolbarDragResolver, actions: actions)
+        XCTAssertTrue(rig.chrome.state.pins.contains(.dragging))
+        drag.end(at: CGSize(width: 0, height: 40), resolver: rig.toolbarDragResolver, actions: actions)
+        XCTAssertFalse(rig.chrome.state.pins.contains(.dragging))
         XCTAssertTrue(rig.store.areToolsHidden, "Requests made under the pin take effect once it clears.")
+
+        drag.move(to: CGSize(width: 0, height: 20), resolver: rig.toolbarDragResolver, actions: actions)
+        XCTAssertTrue(rig.chrome.state.pins.contains(.dragging))
+        drag.cancel()
+        XCTAssertFalse(rig.chrome.state.pins.contains(.dragging), "A cancelled drag ends its pin too.")
 
         rig.gate.update(pageCount: 3, inputGate: .readOnly)
         try await NotebookTestFixtures.waitUntil { rig.chrome.state.pins.contains(.inputPaused) }
@@ -518,31 +873,146 @@ final class NotebookHeaderTests: XCTestCase {
     /// Saves catching up pause writing, usually for a moment. A brief pause never brings the
     /// header and tools over the page; one that lasts does, until writing resumes.
     func testSavesCatchingUpPinTheChromeOnlyOnceThePauseLasts() async throws {
-        let rig = try await NotebookChromeRig()
+        let clock = NotebookTestClock()
+        let rig = try await NotebookChromeRig(delay: { await clock.wait($0) })
+        do {
+            rig.chrome.toolBegan()
+            rig.chrome.toolEnded()
+            XCTAssertTrue(rig.store.areToolsHidden)
+            var shown = 0
+            let watch = rig.store.$areToolsHidden.dropFirst().sink { if !$0 { shown += 1 } }
+            defer { watch.cancel() }
+
+            rig.gate.update(pageCount: 3, inputGate: .capacity)
+            let brief = try await waitForDelay(clock, NotebookWritingChrome.catchUpPinDelay)
+            XCTAssertFalse(rig.chrome.state.pins.contains(.inputPaused), "The pause has only begun.")
+            rig.gate.update(pageCount: 3, inputGate: .open)
+            // Writing resumes before the grace runs out: the grace ends only once the resumption
+            // has been delivered.
+            await NotebookTestFixtures.drainMainQueue()
+            await clock.release(brief)
+            await NotebookTestFixtures.drainMainQueue()
+            XCTAssertTrue(rig.chrome.state.pins.isEmpty)
+            XCTAssertEqual(shown, 0, "A brief pause never flashes the tools.")
+            XCTAssertEqual(rig.header.alpha, 0)
+
+            rig.gate.update(pageCount: 3, inputGate: .capacity)
+            let lasting = try await waitForDelay(clock, NotebookWritingChrome.catchUpPinDelay)
+            XCTAssertFalse(rig.chrome.state.pins.contains(.inputPaused))
+            await clock.release(lasting)
+            try await NotebookTestFixtures.waitUntil { rig.chrome.state.pins.contains(.inputPaused) }
+            XCTAssertFalse(rig.store.areToolsHidden, "A lasting pause shows why writing stopped.")
+            XCTAssertEqual(rig.header.alpha, 1)
+            rig.gate.update(pageCount: 3, inputGate: .open)
+            try await NotebookTestFixtures.waitUntil { rig.chrome.state.pins.isEmpty }
+            XCTAssertTrue(rig.store.areToolsHidden, "Writing resumed, the page is clear again.")
+            XCTAssertEqual(NotebookWritingChrome.catchUpPinDelay, .seconds(1))
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
+        }
+    }
+
+    /// An Apple Pencil tool switch shows the tools briefly. A drag of the toolbar started meanwhile
+    /// keeps them until it ends, and the brief reveal that ran out under it leaves them up until the
+    /// next hide trigger.
+    func testADragStartedDuringABriefRevealKeepsTheToolsInSight() async throws {
+        let clock = NotebookTestClock()
+        let rig = try await NotebookChromeRig(delay: { await clock.wait($0) })
+        do {
+            rig.chrome.toolBegan()
+            rig.chrome.toolEnded()
+            rig.chrome.reveal(.transient)
+            XCTAssertFalse(rig.store.areToolsHidden)
+            let expiry = try await waitForDelay(clock, EditorChromeState.transientRevealDuration)
+
+            let drag = NotebookToolbarDragSession()
+            let actions = NotebookToolbarActions(store: rig.store)
+            drag.move(to: CGSize(width: 0, height: 20), resolver: rig.toolbarDragResolver, actions: actions)
+            await clock.release(expiry)
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertFalse(rig.store.areToolsHidden, "The brief reveal never ends under the finger.")
+
+            drag.cancel()
+            XCTAssertFalse(rig.store.areToolsHidden)
+            rig.chrome.toolBegan()
+            rig.chrome.toolEnded()
+            XCTAssertTrue(rig.store.areToolsHidden)
+            await clock.releaseAll()
+        } catch {
+            await clock.releaseAll()
+            throw error
+        }
+    }
+
+    /// The compact ink panel keeps the tools in sight, under its anchor, while it is open: no hide
+    /// trigger takes them away until it closes.
+    func testTheToolbarsInkPanelKeepsTheToolsInSightWhileOpen() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(horizontalSizeClass: .compact)
+        defer { fixture.close() }
+        let rig = try await NotebookChromeRig(store: fixture.store)
+        // An Apple Pencil gesture set to show the palette opens the panel through its own binding.
+        fixture.store.handlePencil(.showContextualPalette, from: fixture.controller)
+        try await NotebookTestFixtures.waitUntil { fixture.hosting.presentedViewController != nil }
+        try await NotebookTestFixtures.waitUntil { rig.chrome.isPresenting }
+        XCTAssertTrue(rig.chrome.state.pins.contains(.presentation))
+
+        rig.chrome.toggle()
+        XCTAssertFalse(rig.store.areToolsHidden, "The keyboard shortcut never hides the tools under the panel.")
         rig.chrome.toolBegan()
         rig.chrome.toolEnded()
-        XCTAssertTrue(rig.store.areToolsHidden)
-        var shown = 0
-        let watch = rig.store.$areToolsHidden.dropFirst().sink { if !$0 { shown += 1 } }
-        defer { watch.cancel() }
+        XCTAssertFalse(rig.store.areToolsHidden, "Nor does a stroke ending.")
 
-        rig.gate.update(pageCount: 3, inputGate: .capacity)
-        try await Task.sleep(for: .milliseconds(10))
-        XCTAssertFalse(rig.chrome.state.pins.contains(.inputPaused), "The pause has only begun.")
-        rig.gate.update(pageCount: 3, inputGate: .open)
-        try await Task.sleep(for: .milliseconds(150))
-        XCTAssertTrue(rig.chrome.state.pins.isEmpty)
-        XCTAssertEqual(shown, 0, "A brief pause never flashes the tools.")
-        XCTAssertEqual(rig.header.alpha, 0)
+        // Pausing writing closes the panel, which then stops holding the tools.
+        fixture.controller.setInputGate(.failed)
+        try await NotebookTestFixtures.waitUntil { !rig.chrome.isPresenting }
+        XCTAssertTrue(rig.store.areToolsHidden, "The hide takes effect once the panel closes.")
+    }
 
-        rig.gate.update(pageCount: 3, inputGate: .capacity)
-        try await NotebookTestFixtures.waitUntil { rig.chrome.state.pins.contains(.inputPaused) }
-        XCTAssertFalse(rig.store.areToolsHidden, "A lasting pause shows why writing stopped.")
-        XCTAssertEqual(rig.header.alpha, 1)
-        rig.gate.update(pageCount: 3, inputGate: .open)
-        try await NotebookTestFixtures.waitUntil { rig.chrome.state.pins.isEmpty }
-        XCTAssertTrue(rig.store.areToolsHidden, "Writing resumed, the page is clear again.")
-        XCTAssertEqual(NotebookWritingChrome.catchUpPinDelay, .seconds(1))
+    /// A presentation of the toolbar reports through the store while it is open, and as closed once
+    /// the view presenting it leaves.
+    func testAToolbarPresentationPinsTheChromeUntilItClosesOrItsPresenterLeaves() async throws {
+        let rig = try await NotebookChromeRig()
+        let model = PresentationModel()
+        let hosting = AppearanceTrackingHostingController(rootView: PresentingView(model: model, store: rig.store))
+        let window = try NotebookTestFixtures.window(showing: hosting, width: 400)
+        defer {
+            hosting.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        XCTAssertFalse(rig.chrome.isPresenting)
+        // A presentation opens or closes at most once a frame, so each change waits for the next.
+        func change(_ body: () -> Void) async throws {
+            try await Task.sleep(for: .milliseconds(50))
+            body()
+        }
+        try await change { model.isPresented = true }
+        try await NotebookTestFixtures.waitUntil { rig.chrome.isPresenting }
+        XCTAssertTrue(rig.chrome.state.pins.contains(.presentation))
+        try await change { model.isPresented = false }
+        try await NotebookTestFixtures.waitUntil { !rig.chrome.isPresenting }
+
+        try await change { model.isPresented = true }
+        try await NotebookTestFixtures.waitUntil { rig.chrome.isPresenting }
+        try await change { model.showsPresenter = false }
+        try await NotebookTestFixtures.waitUntil { !rig.chrome.isPresenting }
+    }
+
+    /// Escape is left to close the toolbar's own popover, as it is for the header's.
+    func testEscapeIsLeftToTheToolbarsOwnPopover() async throws {
+        let editor = try await mountEditor(width: 420, sizeClass: .compact)
+        defer { editor.close() }
+        func hasEscape() -> Bool {
+            editor.controller.canvasView.notebookKeyCommands.contains { $0.input == UIKeyCommand.inputEscape }
+        }
+        XCTAssertTrue(hasEscape())
+        editor.store.handlePencil(.showContextualPalette, from: editor.controller)
+        try await NotebookTestFixtures.waitUntil { editor.hosting.presentedViewController != nil }
+        try await NotebookTestFixtures.waitUntil { editor.chrome.isPresenting }
+        try await NotebookTestFixtures.waitUntil { !hasEscape() }
     }
 
     func testAPencilToolSwitchShowsTheToolsBriefly() async throws {
@@ -635,6 +1105,70 @@ final class NotebookHeaderTests: XCTestCase {
         XCTAssertFalse(rig.chrome.state.showsHeader)
     }
 
+    /// SwiftUI dismantles a canvas inside its update. A reveal held back by a stroke that the
+    /// teardown cuts short is carried out a turn later, never inside that update, and not while
+    /// a new stroke is under way.
+    func testARevealHeldByACancelledStrokeArrivesOnTheNextTurn() async throws {
+        let rig = try await NotebookChromeRig()
+        rig.drag(by: 100)
+        XCTAssertTrue(rig.store.areToolsHidden)
+        rig.chrome.toolBegan()
+        rig.chrome.reveal(.sticky)
+        var changes = 0
+        let watch = rig.store.objectWillChange.sink { changes += 1 }
+        rig.chrome.toolCancelled()
+        watch.cancel()
+        XCTAssertEqual(changes, 0, "The tools do not change while the canvas is dismantled.")
+        try await NotebookTestFixtures.waitUntil { !rig.store.areToolsHidden }
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+
+        rig.drag(by: 100)
+        rig.chrome.toolBegan()
+        rig.chrome.reveal(.sticky)
+        rig.chrome.toolCancelled()
+        rig.chrome.toolBegan()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(rig.store.areToolsHidden, "Nothing moves under the next stroke.")
+        rig.chrome.toolEnded()
+        XCTAssertFalse(rig.store.areToolsHidden, "The request outlasts the stroke that ended.")
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+    }
+
+    /// A pin made while the header follows the page puts it back in place. Once the pin clears,
+    /// the header follows on from there, never jumping to the distance counted before or under it.
+    func testAPinMidScrollLetsTheHeaderFollowOnFromItsPlace() async throws {
+        let rig = try await NotebookChromeRig()
+        let id = UUID()
+        rig.chrome.userScrollBegan(in: rig.scrollView)
+        rig.scroll(by: 15)
+        XCTAssertEqual(rig.header.transform.ty, -15, accuracy: 0.01)
+        rig.chrome.setPresentation(id, isPresented: true)
+        XCTAssertEqual(rig.header.transform, .identity)
+        rig.scroll(by: 5)
+        XCTAssertEqual(rig.header.transform, .identity, "A pin holds the header in place.")
+        rig.chrome.setPresentation(id, isPresented: false)
+        XCTAssertEqual(rig.header.transform, .identity)
+        rig.scroll(by: 1)
+        XCTAssertEqual(rig.header.transform.ty, -1, accuracy: 0.01)
+        XCTAssertEqual(rig.header.transform.ty, -rig.chrome.state.headerTravel, accuracy: 0.01)
+        rig.chrome.userScrollEnded()
+        XCTAssertEqual(rig.header.transform, .identity)
+    }
+
+    /// An Apple Pencil tool switch shows the tools alone for a moment; a header the page has
+    /// taken part-way up stays where it is and goes on following the page.
+    func testAToolSwitchMidScrollLeavesAFollowingHeaderWhereItIs() async throws {
+        let rig = try await NotebookChromeRig()
+        rig.chrome.userScrollBegan(in: rig.scrollView)
+        rig.scroll(by: 15)
+        rig.chrome.reveal(.transient)
+        XCTAssertEqual(rig.header.transform.ty, -15, accuracy: 0.01)
+        rig.scroll(by: 1)
+        XCTAssertEqual(rig.header.transform.ty, -16, accuracy: 0.01)
+        rig.chrome.userScrollEnded()
+        XCTAssertEqual(rig.header.transform, .identity)
+    }
+
     /// The stored writing view reaches the chrome a turn after it changes. A newer choice made in
     /// between is never undone by the older value arriving late.
     func testALateStoredModeNeverUndoesANewerChoice() async throws {
@@ -690,6 +1224,36 @@ final class NotebookHeaderTests: XCTestCase {
         }
     }
 
+    /// At accessibility text sizes the menu widens as far as the window allows and the shortcut hint
+    /// gives way, so a writing view's name wraps between its words rather than being cut off.
+    func testWritingViewNamesStayWholeAtAccessibilitySizes() {
+        XCTAssertEqual(NotebookMenu.width(for: .large, hostWidth: 834), NotebookTheme.popoverWidth)
+        XCTAssertEqual(NotebookMenu.width(for: .xxxLarge, hostWidth: 1_024), NotebookTheme.popoverWidth)
+        XCTAssertEqual(NotebookMenu.width(for: .accessibility1, hostWidth: 834), NotebookTheme.accessibilityPopoverWidth)
+        XCTAssertEqual(NotebookMenu.width(for: .accessibility5, hostWidth: 420), 380, "Split View")
+        XCTAssertEqual(NotebookMenu.width(for: .accessibility5, hostWidth: 320), NotebookTheme.popoverWidth, "Slide Over")
+        XCTAssertTrue(NotebookWritingViewRow.showsShortcutHint(at: .xxxLarge))
+        XCTAssertFalse(NotebookWritingViewRow.showsShortcutHint(at: .accessibility1))
+
+        for size in DynamicTypeSize.allCases where size.isAccessibilitySize {
+            let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
+            let body = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
+            let font = UIFont.systemFont(ofSize: body.pointSize, weight: .medium)
+            for hostWidth in [1_024, 834, 420] as [CGFloat] {
+                let row = NotebookMenu.width(for: size, hostWidth: hostWidth) - 2 * NotebookTheme.popoverPadding
+                // The glyph column and its insets, and the least gap before the trailing inset.
+                let column = row - NotebookTheme.menuGlyphInset - NotebookTheme.menuGlyphColumnWidth
+                    - 2 * NotebookTheme.menuRowInset - NotebookTheme.menuShortcutGap
+                for mode in EditorChromeMode.allCases {
+                    for word in mode.title.split(separator: " ") {
+                        let width = (String(word) as NSString).size(withAttributes: [.font: font]).width
+                        XCTAssertLessThanOrEqual(width, column, "\(word) of \(mode.title) at \(size) in \(hostWidth)")
+                    }
+                }
+            }
+        }
+    }
+
     /// Every piece of text in the selected writing view row darkens, so it keeps its contrast on the well.
     func testTheSelectedWritingViewRowDarkensAllItsText() throws {
         func hintTone(selected: Bool) throws -> CGFloat {
@@ -718,7 +1282,7 @@ final class NotebookHeaderTests: XCTestCase {
     }
 
     /// The hint sits at the row's trailing edge, centred on the row, and every glyph centres in its
-    /// column, clear of the selected row's mark.
+    /// 20 pt column and stays inside it, clear of the selected row's mark.
     func testWritingViewRowsPlaceTheirGlyphAndHintAsSpecified() throws {
         let width = NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding
         for mode in EditorChromeMode.allCases {
@@ -734,12 +1298,18 @@ final class NotebookHeaderTests: XCTestCase {
                 }
                 return points
             }
-            // Glyphs centre in a 20 pt column; even the broadest keeps 4 pt clear of the mark.
-            let glyph = inked(0..<(NotebookTheme.menuGlyphInset + NotebookTheme.menuGlyphColumnWidth + 6))
+            // Glyphs centre in a 20 pt column and keep inside it, well clear of the mark.
+            let column = NotebookTheme.menuGlyphInset..<(NotebookTheme.menuGlyphInset + NotebookTheme.menuGlyphColumnWidth)
+            let glyph = inked(0..<(column.upperBound + 6))
             let glyphStart = try XCTUnwrap(glyph.map(\.x).min(), "\(mode)")
             let glyphEnd = try XCTUnwrap(glyph.map(\.x).max(), "\(mode)")
             XCTAssertGreaterThanOrEqual(glyphStart,
-                NotebookTheme.selectionMarkInset + NotebookTheme.rowMarkSize.width + 4, "\(mode): clear of the mark")
+                NotebookTheme.selectionMarkInset + NotebookTheme.rowMarkSize.width + 8, "\(mode): clear of the mark")
+            XCTAssertGreaterThanOrEqual(glyphStart, column.lowerBound - 0.5, "\(mode): inside its column")
+            XCTAssertLessThanOrEqual(glyphEnd + 0.5, column.upperBound + 0.5, "\(mode): inside its column")
+            let glyphHeight = (glyph.map(\.y).max() ?? 0) - (glyph.map(\.y).min() ?? 0) + 0.5
+            XCTAssertGreaterThanOrEqual(max(glyphEnd + 0.5 - glyphStart, glyphHeight), 17,
+                "\(mode): about as large as the other glyphs")
             XCTAssertEqual((glyphStart + glyphEnd + 0.5) / 2,
                 NotebookTheme.menuGlyphInset + NotebookTheme.menuGlyphColumnWidth / 2, accuracy: 1.5, "\(mode)")
 
@@ -795,6 +1365,162 @@ final class NotebookHeaderTests: XCTestCase {
             accuracy: 0.5)
         XCTAssertEqual(try height(offeringRedo: true) - height(offeringRedo: false),
             NotebookTheme.menuRowHeight + NotebookTheme.itemSpacing, accuracy: 0.5)
+    }
+
+    /// A position segment places the toolbar through the toolbar's own action, then shows as
+    /// selected. Float keeps a floating toolbar where the user left it; a paused toolbar stays put.
+    func testToolbarPositionSegmentsPlaceTheToolbarAndShowAsSelected() {
+        let store = NotebookTestFixtures.toolStore()
+        let owner = NotebookViewController(pageCount: 1, initialDrawing: PKDrawing())
+        store.attach(owner)
+        store.setToolbarAvailable(true, for: owner)
+        defer { store.detach(owner) }
+        let picker = NotebookToolbarPositionPicker(store: store, hostWidth: 1_366, sizeClass: .regular)
+        let segments = NotebookToolbarPositionPicker.segments
+        XCTAssertEqual(segments.map(\.label), ["Left", "Center", "Right", "Float"])
+        for segment in segments {
+            picker.choose(segment.placement)
+            XCTAssertEqual(NotebookToolbarPositionPicker.segment(for: store.toolbar.placement)?.label, segment.label)
+        }
+        XCTAssertEqual(store.toolbar.placement, NotebookToolbarActions.floatingPlacement,
+            "Float from a dock places the toolbar where the grip's Float action does.")
+
+        let moved = EditorToolbarPlacement.floating(CGPoint(x: 0.3, y: 0.7))
+        let actions = NotebookToolbarActions(store: store)
+        XCTAssertTrue(actions.place(moved))
+        actions.setCollapsed(true)
+        picker.choose(NotebookToolbarActions.floatingPlacement)
+        XCTAssertEqual(store.toolbar.placement, moved, "Float keeps a floating toolbar where it is")
+        XCTAssertFalse(store.toolbar.isCollapsed, "and shows it in full.")
+        XCTAssertEqual(NotebookToolbarPositionPicker.segment(for: store.toolbar.placement)?.label, "Float")
+
+        picker.choose(.docked(.topLeading))
+        XCTAssertEqual(store.toolbar.placement, .docked(.topLeading))
+        store.setToolbarAvailable(false, for: owner)
+        picker.choose(.docked(.topTrailing))
+        XCTAssertEqual(store.toolbar.placement, .docked(.topLeading), "A paused toolbar keeps its place.")
+    }
+
+    /// Voice Control users name a control by the word they see. A position segment answers to its
+    /// one word as well as its full name, and a preset chip to its short title, which a swatch of
+    /// the same colour may share, as well as to its full name.
+    func testControlsAnswerToTheWordsTheyShow() {
+        for segment in NotebookToolbarPositionPicker.segments {
+            XCTAssertEqual(segment.inputLabels.first, segment.label)
+            XCTAssertTrue(segment.inputLabels.contains(segment.accessibilityLabel), segment.label)
+        }
+        for preset in EditorInkCatalog.presets {
+            let spoken = NotebookPresetChip.inputLabels(for: preset)
+            XCTAssertEqual(spoken.first, "\(NotebookPresetChip.shortTitle(for: preset)) preset")
+            XCTAssertTrue(spoken.contains(preset.name), "\(spoken)")
+            XCTAssertTrue(spoken.contains("\(preset.name) preset"), "\(spoken)")
+        }
+    }
+
+    /// Each writing view row chooses its mode and stores it with the toolbar preferences, then
+    /// shows as selected.
+    func testWritingViewRowsChooseAndStoreTheirMode() async throws {
+        let suite = NotebookTestFixtures.temporaryDefaultsSuite()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let store = NotebookSceneToolStore(identifier: suite, defaults: defaults)
+        let rig = try await NotebookChromeRig(store: store)
+        let session = NotebookSession()
+        let menu = NotebookMenu(
+            session: session, chrome: rig.chrome, gate: rig.gate, commands: session.commandModel, hostWidth: 834,
+            sizeClass: .regular, offersRedo: false, close: {}, openRecoveryCopies: {}
+        )
+        for mode in [EditorChromeMode.pinned, .overlay, .focus] {
+            XCTAssertFalse(menu.writingViewRow(mode).isSelected, "\(mode)")
+            menu.writingViewRow(mode).choose()
+            XCTAssertEqual(rig.chrome.mode, mode)
+            XCTAssertEqual(store.toolbar.chromeMode, mode)
+            let stored = EditorToolbarPreferences.decode(defaults.data(forKey: NotebookSceneToolStore.toolbarDefaultsKey))
+            XCTAssertEqual(stored.chromeMode, mode, "\(mode) is stored.")
+            XCTAssertTrue(menu.writingViewRow(mode).isSelected, "\(mode)")
+        }
+    }
+
+    /// "Add page at end" draws disabled wherever no page can be added, and choosing it adds a page
+    /// to the open notebook and closes the menu.
+    func testAddPageRowDrawsDisabledWhenNoPageFitsAndAddsAPageAndCloses() async throws {
+        let session = NotebookSession()
+        let gate = NotebookCanvasGateModel()
+        func glyphTone(pageCount: Int, gate inputGate: NotebookInputGate) throws -> CGFloat {
+            gate.update(pageCount: pageCount, inputGate: inputGate)
+            let width = NotebookTheme.popoverWidth - 2 * NotebookTheme.popoverPadding
+            let pixels = try RenderedPixels(rendering:
+                NotebookMenuActions(
+                    session: session, gate: gate, commands: session.commandModel, offersRedo: false,
+                    addPage: {}, openRecoveryCopies: {}
+                )
+                .frame(width: width)
+                .background(NotebookTheme.panelSurface.color)
+            )
+            // The row's glyph, the first row's leading column.
+            var darkest: CGFloat = 1
+            for y in stride(from: 4, to: NotebookTheme.menuRowHeight - 4, by: 0.5) {
+                for x in stride(from: NotebookTheme.menuGlyphInset, to: NotebookTheme.menuGlyphInset + 20, by: 0.5) {
+                    let pixel = pixels.rgba(at: CGPoint(x: x, y: y)).map { CGFloat($0) / 255 }
+                    darkest = min(darkest, 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2])
+                }
+            }
+            return darkest
+        }
+        func luminance(_ tone: NotebookTheme.Tone) -> CGFloat {
+            var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0
+            tone.uiColor.getRed(&red, green: &green, blue: &blue, alpha: nil)
+            return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        }
+        XCTAssertEqual(try glyphTone(pageCount: 3, gate: .open), luminance(NotebookTheme.glyph), accuracy: 0.03)
+        for (pageCount, inputGate) in [(NotebookViewController.maximumPageCount, NotebookInputGate.open), (3, .readOnly)] {
+            XCTAssertEqual(try glyphTone(pageCount: pageCount, gate: inputGate), luminance(NotebookTheme.disabledGlyph),
+                accuracy: 0.03, "\(pageCount) pages, \(inputGate)")
+        }
+
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        var closes = 0
+        let menu = NotebookMenu(
+            session: editor.session, chrome: editor.chrome, gate: editor.session.gateModel,
+            commands: editor.session.commandModel, hostWidth: 834, sizeClass: .regular, offersRedo: false,
+            close: { closes += 1 }, openRecoveryCopies: {}
+        )
+        let pages = editor.session.pageCount
+        XCTAssertTrue(NotebookMenu.canAddPage(editor.session.gateModel.state))
+        menu.addPage()
+        XCTAssertEqual(editor.session.pageCount, pages + 1, "The paper is extended.")
+        XCTAssertEqual(closes, 1, "The menu closes over the new page.")
+    }
+
+    /// The menu's "Recovery copies" row closes the menu and asks for the sheet only once the menu
+    /// has gone; the screen then opens it unless the canvas has a stroke in progress.
+    func testRecoveryCopiesPassFromTheMenuToTheirSheet() async throws {
+        let handOff = NotebookMenuHandOff()
+        var closes = 0
+        var opens = 0
+        handOff.menuDidDisappear { opens += 1 }
+        XCTAssertEqual(opens, 0, "A menu closed for anything else opens nothing.")
+        handOff.requestRecoveryCopies { closes += 1 }
+        XCTAssertEqual(closes, 1)
+        XCTAssertEqual(opens, 0, "Nothing opens while the menu is still leaving.")
+        handOff.menuDidDisappear { opens += 1 }
+        handOff.menuDidDisappear { opens += 1 }
+        XCTAssertEqual(opens, 1, "Once the menu has gone, the sheet is asked for once.")
+
+        let editor = try await mountEditor(width: 834)
+        defer { editor.close() }
+        let canvas = editor.controller.canvasView
+        let openRecoveryCopies = editor.header.header.openRecoveryCopies
+        editor.controller.canvasViewDidBeginUsingTool(canvas)
+        openRecoveryCopies()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(editor.hosting.presentedViewController, "Never over a stroke in progress.")
+        XCTAssertTrue(editor.store.isToolbarAvailable)
+        editor.controller.canvasViewDidEndUsingTool(canvas)
+
+        openRecoveryCopies()
+        try await NotebookTestFixtures.waitUntil { editor.hosting.presentedViewController != nil }
+        XCTAssertFalse(editor.store.isToolbarAvailable, "The tools pause while the recovery copies show.")
     }
 
     // MARK: - Fixtures
@@ -865,11 +1591,17 @@ final class NotebookHeaderTests: XCTestCase {
         }
 
         func close() {
+            hosting.presentedViewController?.dismiss(animated: false)
             session.flush()
             store.setToolsHidden(false)
             window.isHidden = true
             window.rootViewController = nil
         }
+    }
+
+    /// The writing view's pending wait for `duration`, once it has started one.
+    private func waitForDelay(_ clock: NotebookTestClock, _ duration: Duration) async throws -> UUID {
+        try await NotebookTestFixtures.waitForValue { await clock.requests(for: duration).first }
     }
 
     /// - Parameters:
@@ -963,9 +1695,12 @@ struct NotebookChromeRig {
     let header = UIView(frame: CGRect(x: 0, y: 0, width: 810, height: 84))
     let scrollView = UIScrollView(frame: CGRect(x: 0, y: 0, width: 834, height: 1_000))
 
+    /// - Parameter delay: stands in for the writing view's timed waits, the brief reveal and the
+    ///   catch-up grace; a short real wait unless a test steps through them itself.
     init(
         store: NotebookSceneToolStore = NotebookTestFixtures.toolStore(), reduceMotion: Bool = false,
-        assistiveTechnology: Bool = false
+        assistiveTechnology: Bool = false,
+        delay: @escaping @Sendable (Duration) async throws -> Void = { _ in try await Task.sleep(for: .milliseconds(50)) }
     ) async throws {
         self.store = store
         gate.update(pageCount: 3, inputGate: .open)
@@ -976,7 +1711,7 @@ struct NotebookChromeRig {
         chrome = NotebookWritingChrome(
             gate: gate, saves: saves, integrity: integrity,
             prefersReducedMotion: { reduceMotion }, assistiveTechnologyRunning: { assistiveTechnology },
-            delay: { _ in try await Task.sleep(for: .milliseconds(50)) }
+            delay: delay
         )
         chrome.attachHeader(header)
         // A plain scroll view reports no touches, so its programmatic offsets stand in for a drag.
@@ -987,6 +1722,13 @@ struct NotebookChromeRig {
         scrollView.contentSize = CGSize(width: 834, height: 5_000)
         scrollView.contentInset = UIEdgeInsets(top: 160, left: 0, bottom: 40, right: 0)
         scrollView.contentOffset = CGPoint(x: 0, y: 300)
+    }
+
+    /// Drags a toolbar of the standard size across the rig's page.
+    var toolbarDragResolver: NotebookToolbarDragResolver {
+        NotebookToolbarDragResolver(
+            placement: store.toolbar.placement, size: CGSize(width: 600, height: 108), usable: scrollView.bounds
+        )
     }
 
     /// A whole user drag by `distance`.
@@ -1008,5 +1750,26 @@ struct NotebookChromeRig {
     func move(to y: CGFloat) {
         scrollView.contentOffset.y = y
         chrome.userScrollMoved(in: scrollView)
+    }
+}
+
+@MainActor
+private final class PresentationModel: ObservableObject {
+    @Published var isPresented = false
+    @Published var showsPresenter = true
+}
+
+/// Stands in for a toolbar control that presents a popover or sheet, reporting it as the toolbar's
+/// own controls do.
+private struct PresentingView: View {
+    @ObservedObject var model: PresentationModel
+    let store: NotebookSceneToolStore
+
+    var body: some View {
+        if model.showsPresenter {
+            Color.clear
+                .frame(width: 44, height: 44)
+                .notebookToolbarPresentation(model.isPresented, store: store)
+        }
     }
 }

@@ -26,6 +26,14 @@ extension EditorChromeMode {
         }
     }
 
+    /// The point size that gives this mode's glyph the same optical size as the others.
+    var symbolSize: CGFloat {
+        switch self {
+        case .focus: NotebookTheme.focusGlyphSize
+        case .pinned, .overlay: NotebookTheme.headerGlyphSize
+        }
+    }
+
     /// Chosen with Control-Command and this key.
     var shortcutKey: KeyEquivalent {
         switch self {
@@ -49,7 +57,7 @@ struct NotebookMenuKey: View {
     let offersRedo: Bool
     let openRecoveryCopies: @MainActor () -> Void
     @State private var showsMenu = false
-    @State private var opensRecoveryCopies = false
+    @State private var handOff = NotebookMenuHandOff()
 
     var body: some View {
         Button { showsMenu = true } label: {
@@ -64,20 +72,32 @@ struct NotebookMenuKey: View {
         .popover(isPresented: $showsMenu) {
             NotebookMenu(
                 session: session, chrome: chrome, gate: session.gateModel, commands: session.commandModel,
-                hostWidth: hostWidth, sizeClass: sizeClass, offersRedo: offersRedo
-            ) {
-                opensRecoveryCopies = true
-                showsMenu = false
-            }
-            // The recovery sheet is presented only once the menu has gone, as one presentation
-            // cannot start while another is still leaving.
-            .onDisappear {
-                guard opensRecoveryCopies else { return }
-                opensRecoveryCopies = false
-                openRecoveryCopies()
-            }
+                hostWidth: hostWidth, sizeClass: sizeClass, offersRedo: offersRedo, close: { showsMenu = false },
+                openRecoveryCopies: { handOff.requestRecoveryCopies { showsMenu = false } }
+            )
+            .onDisappear { handOff.menuDidDisappear(open: openRecoveryCopies) }
         }
         .notebookChromePresentation(showsMenu, chrome: chrome)
+    }
+}
+
+/// Passes the recovery copies on from the notebook menu to their sheet. One presentation cannot
+/// start while another is still leaving, so the sheet is asked for only once the menu has gone.
+@MainActor
+final class NotebookMenuHandOff {
+    private var opensRecoveryCopies = false
+
+    /// The menu's "Recovery copies" row: remembers the request, then closes the menu.
+    func requestRecoveryCopies(closing close: () -> Void) {
+        opensRecoveryCopies = true
+        close()
+    }
+
+    /// The menu has gone; opens the recovery copies if the menu asked for them.
+    func menuDidDisappear(open: () -> Void) {
+        guard opensRecoveryCopies else { return }
+        opensRecoveryCopies = false
+        open()
     }
 }
 
@@ -94,9 +114,11 @@ struct NotebookMenu: View {
     let hostWidth: CGFloat
     let sizeClass: UserInterfaceSizeClass?
     let offersRedo: Bool
+    /// Closes the menu, as dismissing its popover does.
+    let close: () -> Void
     let openRecoveryCopies: () -> Void
-    @Environment(\.dismiss) private var dismiss
     @State private var showsComingLater = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         ScrollView {
@@ -104,9 +126,7 @@ struct NotebookMenu: View {
                 section("Writing view") {
                     VStack(spacing: NotebookTheme.itemSpacing) {
                         ForEach(EditorChromeMode.allCases, id: \.self) { mode in
-                            NotebookWritingViewRow(mode: mode, isSelected: chrome.mode == mode) {
-                                chrome.setMode(mode)
-                            }
+                            writingViewRow(mode)
                         }
                     }
                 }
@@ -122,11 +142,7 @@ struct NotebookMenu: View {
                 section("Notebook") {
                     NotebookMenuActions(
                         session: session, gate: gate, commands: commands, offersRedo: offersRedo,
-                        addPage: {
-                            session.extendPaper()
-                            dismiss()
-                        },
-                        openRecoveryCopies: openRecoveryCopies
+                        addPage: addPage, openRecoveryCopies: openRecoveryCopies
                     )
                 }
                 separator
@@ -135,15 +151,34 @@ struct NotebookMenu: View {
             .padding(NotebookTheme.popoverPadding)
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(width: NotebookTheme.popoverWidth)
+        .frame(width: Self.width(for: typeSize, hostWidth: hostWidth))
         .tint(NotebookTheme.controlTint.color)
         .presentationBackground(NotebookTheme.panelSurface.color)
         .presentationCompactAdaptation(.popover)
     }
 
+    /// The standard popover width, widened at accessibility text sizes as far as the window allows,
+    /// so the writing views keep their names whole.
+    static func width(for typeSize: DynamicTypeSize, hostWidth: CGFloat) -> CGFloat {
+        guard typeSize.isAccessibilitySize else { return NotebookTheme.popoverWidth }
+        let room = hostWidth - 2 * NotebookTheme.popoverWindowMargin
+        return max(NotebookTheme.popoverWidth, min(NotebookTheme.accessibilityPopoverWidth, room))
+    }
+
     /// A page can be added only while writing is open and the notebook is below its page limit.
     static func canAddPage(_ state: NotebookCanvasGateModel.State) -> Bool {
         state.inputGate.allowsMutation && state.pageCount < NotebookViewController.maximumPageCount
+    }
+
+    /// The row that chooses and stores `mode` as the writing view.
+    func writingViewRow(_ mode: EditorChromeMode) -> NotebookWritingViewRow {
+        NotebookWritingViewRow(mode: mode, isSelected: chrome.mode == mode) { chrome.setMode(mode) }
+    }
+
+    /// Adds a page at the end of the notebook and closes the menu over it.
+    func addPage() {
+        session.extendPaper()
+        close()
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -169,20 +204,26 @@ struct NotebookWritingViewRow: View {
     let choose: () -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
 
+    /// At accessibility text sizes the keyboard shortcut gives its room to the name and description;
+    /// the shortcut stays listed in the keyboard shortcut overlay.
+    static func showsShortcutHint(at typeSize: DynamicTypeSize) -> Bool {
+        !typeSize.isAccessibilitySize
+    }
+
     var body: some View {
         let secondary = (isSelected ? NotebookTheme.glyph : NotebookTheme.glyphSecondary).color
         Button(action: choose) {
             HStack(spacing: 0) {
                 Image(systemName: mode.symbol)
-                    .font(NotebookTheme.headerGlyphFont)
+                    .font(.system(size: mode.symbolSize, weight: .regular))
                     .frame(width: NotebookTheme.menuGlyphColumnWidth)
                     .padding(.trailing, NotebookTheme.menuRowInset)
+                // Larger text wraps rather than being cut off. At the standard size the longest
+                // description shrinks slightly to keep to one line beside the hint.
                 VStack(alignment: .leading, spacing: 2) {
                     Text(mode.title)
                         .font(.body.weight(.medium))
-                        .lineLimit(1)
-                    // At the standard size the longest description shrinks slightly to keep to one
-                    // line beside the hint; larger text wraps rather than being cut off.
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(mode.summary)
                         .font(.footnote)
                         .foregroundStyle(secondary)
@@ -192,11 +233,13 @@ struct NotebookWritingViewRow: View {
                 }
                 .padding(.vertical, NotebookTheme.menuRowTextPadding)
                 Spacer(minLength: NotebookTheme.menuShortcutGap)
-                Text(mode.shortcutHint)
-                    .font(.footnote)
-                    .foregroundStyle(secondary)
-                    .fixedSize()
-                    .accessibilityHidden(true)
+                if Self.showsShortcutHint(at: typeSize) {
+                    Text(mode.shortcutHint)
+                        .font(.footnote)
+                        .foregroundStyle(secondary)
+                        .fixedSize()
+                        .accessibilityHidden(true)
+                }
             }
             .padding(.leading, NotebookTheme.menuGlyphInset)
             .padding(.trailing, NotebookTheme.menuRowInset)
@@ -221,19 +264,18 @@ struct NotebookWritingViewRow: View {
 /// The four places the toolbar can sit, as segment keys. These are the grip's own placement
 /// actions made visible, so nobody has to drag.
 struct NotebookToolbarPositionPicker: View {
-    /// Where the Float segment places the toolbar, as the grip's Float action does.
-    private static let floatingStart = CGPoint(x: 0.5, y: 0.25)
-
-    private struct Segment: Identifiable {
+    struct Segment: Identifiable {
         let placement: EditorToolbarPlacement
         let symbol: String
         let label: String
         let accessibilityLabel: String
 
         var id: String { label }
+        /// What Voice Control answers to: the word the segment shows, then its full name.
+        var inputLabels: [String] { [label, accessibilityLabel] }
     }
 
-    private static let segments = [
+    static let segments = [
         Segment(
             placement: .docked(.topLeading), symbol: "rectangle.inset.topleading.filled", label: "Left",
             accessibilityLabel: "Dock top left"
@@ -247,8 +289,8 @@ struct NotebookToolbarPositionPicker: View {
             accessibilityLabel: "Dock top right"
         ),
         Segment(
-            placement: .floating(floatingStart), symbol: "rectangle.center.inset.filled", label: "Float",
-            accessibilityLabel: "Float"
+            placement: NotebookToolbarActions.floatingPlacement, symbol: "rectangle.center.inset.filled",
+            label: "Float", accessibilityLabel: "Float"
         ),
     ]
 
@@ -256,6 +298,8 @@ struct NotebookToolbarPositionPicker: View {
     let hostWidth: CGFloat
     /// The window's, which the toolbar measures with; a popover can report its own as compact.
     let sizeClass: UserInterfaceSizeClass?
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.legibilityWeight) private var legibilityWeight
 
     /// Shown before the canvas has reported its toolbar.
     static var unavailable: some View {
@@ -265,9 +309,12 @@ struct NotebookToolbarPositionPicker: View {
     var body: some View {
         let actions = NotebookToolbarActions(store: store)
         VStack(alignment: .leading, spacing: NotebookTheme.sectionSpacing) {
-            Self.segmentRow(selected: store.toolbar.placement, isEnabled: actions.isEnabled) { actions.place($0) }
-            if Self.docksShared(preferences: store.toolbar, hostWidth: hostWidth, sizeClass: sizeClass) {
-                Text("This window is too narrow to tell the docks apart; the toolbar sits in the centre.")
+            Self.segmentRow(selected: store.toolbar.placement, isEnabled: actions.isEnabled) { choose($0) }
+            if Self.docksShared(
+                preferences: store.toolbar, hostWidth: hostWidth, sizeClass: sizeClass, dynamicTypeSize: dynamicTypeSize,
+                legibilityWeight: legibilityWeight
+            ) {
+                Text("In this window the docks share one place, so the toolbar sits in the center.")
                     .font(.footnote)
                     .foregroundStyle(NotebookTheme.glyphSecondary.color)
                     .fixedSize(horizontal: false, vertical: true)
@@ -275,25 +322,43 @@ struct NotebookToolbarPositionPicker: View {
         }
     }
 
-    /// True when neighbouring docks would sit less than the least dock travel apart, so they show
-    /// as one centred slot. The stored dock stays selected.
+    /// What a segment does. Float keeps a floating toolbar where it is, as a dock segment keeps
+    /// the dock already chosen.
+    func choose(_ placement: EditorToolbarPlacement) {
+        let actions = NotebookToolbarActions(store: store)
+        if case .floating = placement, case .floating = store.toolbar.placement {
+            actions.place(store.toolbar.placement)
+        } else {
+            actions.place(placement)
+        }
+    }
+
+    /// The segment that shows as selected for `placement`.
+    static func segment(for placement: EditorToolbarPlacement) -> Segment? {
+        segments.first { matches(placement, $0.placement) }
+    }
+
+    /// Whether a docked rail in this window shares one centred slot, decided by the rail itself so
+    /// the note always agrees with what the toolbar does. The stored dock stays selected.
     static func docksShared(
-        preferences: EditorToolbarPreferences, hostWidth: CGFloat, sizeClass: UserInterfaceSizeClass?
+        preferences: EditorToolbarPreferences, hostWidth: CGFloat, sizeClass: UserInterfaceSizeClass?,
+        dynamicTypeSize: DynamicTypeSize, legibilityWeight: LegibilityWeight? = nil
     ) -> Bool {
         var docked = preferences
         docked.place(.docked(.topCenter))
-        let width = NotebookToolbarComposition(preferences: docked, horizontalSizeClass: sizeClass)
-            .toolbarSize(forHostWidth: hostWidth).width
-        let spare = hostWidth - 2 * EditorToolbarLayout.margin - width
-        return spare / 2 < NotebookToolbarComposition.minimumDockTravel - 0.5
+        return NotebookToolbarComposition(
+            preferences: docked, horizontalSizeClass: sizeClass, dynamicTypeSize: dynamicTypeSize,
+            legibilityWeight: legibilityWeight
+        ).rail(forHostWidth: hostWidth).docksShared
     }
 
     private static func segmentRow(
         selected: EditorToolbarPlacement?, isEnabled: Bool, place: @escaping (EditorToolbarPlacement) -> Void
     ) -> some View {
-        HStack(spacing: NotebookTheme.itemSpacing) {
+        let selectedID = selected.flatMap(segment(for:))?.id
+        return HStack(spacing: NotebookTheme.itemSpacing) {
             ForEach(segments) { segment in
-                let isSelected = selected.map { matches($0, segment.placement) } ?? false
+                let isSelected = segment.id == selectedID
                 Button { place(segment.placement) } label: {
                     VStack(spacing: 4) {
                         Image(systemName: segment.symbol)
@@ -313,8 +378,12 @@ struct NotebookToolbarPositionPicker: View {
                 }
                 .buttonStyle(NotebookKeyStyle(isSelected: isSelected))
                 .accessibilityLabel(segment.accessibilityLabel)
+                .accessibilityInputLabels(segment.inputLabels)
                 .accessibilityAddTraits(isSelected ? .isSelected : [])
                 .help(segment.accessibilityLabel)
+                .accessibilityShowsLargeContentViewer {
+                    Label(segment.accessibilityLabel, systemImage: segment.symbol)
+                }
             }
         }
         .disabled(!isEnabled)
@@ -418,20 +487,24 @@ struct NotebookComingLater: View {
             }
             .foregroundStyle(NotebookTheme.glyphSecondary.color)
         }
-        .disclosureGroupStyle(NotebookDisclosureStyle())
+        .disclosureGroupStyle(NotebookDisclosureStyle(title: "Coming later"))
     }
 }
 
 /// A disclosure row whose chevron takes the row's secondary glyph tone; the system style draws it
-/// in black whatever the tint or foreground style.
+/// in black whatever the tint or foreground style. The row is read by its title alone, as its glyph
+/// would otherwise be read by its symbol name first.
 private struct NotebookDisclosureStyle: DisclosureGroupStyle {
+    let title: String
+
     func makeBody(configuration: Configuration) -> some View {
-        NotebookDisclosure(configuration: configuration)
+        NotebookDisclosure(configuration: configuration, title: title)
     }
 }
 
 private struct NotebookDisclosure: View {
     let configuration: DisclosureGroupStyleConfiguration
+    let title: String
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -456,6 +529,7 @@ private struct NotebookDisclosure: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(NotebookKeyStyle())
+            .accessibilityLabel(title)
             .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
             if configuration.isExpanded {
                 configuration.content
@@ -482,7 +556,7 @@ private struct NotebookAccentKey<Label: View>: View {
 
     var body: some View {
         let pressed = isPressed && isEnabled
-        let release: Animation? = pressed || reduceMotion ? nil : .easeOut(duration: NotebookTheme.keyReleaseDuration)
+        let release = NotebookKeyRelease.animation(pressed: pressed, reduceMotion: reduceMotion)
         let face = RoundedRectangle(cornerRadius: NotebookTheme.accentKeyCornerRadius, style: .continuous)
         label
             .foregroundStyle(NotebookTheme.accentGlyph.color)

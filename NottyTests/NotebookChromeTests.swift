@@ -13,8 +13,8 @@ final class NotebookChromeTests: XCTestCase {
 
     // MARK: - Dual tones
 
-    /// Every tone with an Increase Contrast value, with both values as section 2 of the visual
-    /// spec gives them.
+    /// Every tone with an Increase Contrast value, with the standard and the Increase Contrast
+    /// components the theme is designed around.
     private static let dualTones: [(String, NotebookTheme.Tone, [CGFloat], [CGFloat])] = [
         ("paperEdge", NotebookTheme.paperEdge, [0.47, 0.40, 0.31, 0.65], [0.17, 0.16, 0.15, 1]),
         ("paperDivider", NotebookTheme.paperDivider, [0.47, 0.40, 0.31, 0.30], [0.47, 0.40, 0.31, 0.55]),
@@ -110,8 +110,9 @@ final class NotebookChromeTests: XCTestCase {
 
     // MARK: - Contrast
 
-    /// Every text pair of section 8.1 reaches 4.5:1 and every glyph and essential mark of
-    /// section 8.2 reaches 3:1, computed from the theme's own values.
+    /// Every pair of text and its background reaches 4.5:1, and every glyph and essential mark
+    /// reaches 3:1 against what lies behind it (WCAG 1.4.3 and 1.4.11), computed from the theme's
+    /// own values.
     func testChromePairsMeetTheirContrastMinimums() {
         let paper = color(NotebookTheme.paperIvory)
         let stone = color(NotebookTheme.backdropStone)
@@ -187,7 +188,7 @@ final class NotebookChromeTests: XCTestCase {
         }
     }
 
-    /// The pairs of section 8.3 that Increase Contrast exists to lift.
+    /// The pairs Increase Contrast exists to lift, under its own resolved tones.
     func testIncreaseContrastPairsMeetTheirMinimums() {
         let high = UIAccessibilityContrast.high
         let paper = color(NotebookTheme.paperIvory, high)
@@ -375,6 +376,105 @@ final class NotebookChromeTests: XCTestCase {
         assertPixel(pressedDisabled, equals: surface, "no press while disabled")
     }
 
+    /// While writing is paused the rail draws its keys in the glyph tone at its content opacity:
+    /// 3.18:1 where the shell is darkest and 4.93:1 on the flat Increase Contrast shell, so they stay
+    /// above the 3:1 a glyph needs. The opacity is recovered from the rendered glyph against the
+    /// shell right beside it, so the ratios hold to the rounding of an 8-bit render.
+    func testPausedRailGlyphsKeepTheirSpecifiedContrast() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        XCTAssertFalse(store.isToolbarAvailable, "A store no canvas owns is paused.")
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let rail = composition.rail(forHostWidth: Self.renderSize.width)
+        let toolbar = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
+            .frame(width: rail.size.width, height: rail.size.height)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .ignoresSafeArea()
+        // The first ink family's key, after the grip column and the strip's leading inset, and the
+        // plain shell in that inset beside it.
+        let key = CGRect(
+            x: NotebookToolbarComposition.gripColumnWidth + NotebookTheme.stripInsets.left, y: NotebookTheme.stripInsets.top,
+            width: NotebookTheme.controlSize, height: NotebookTheme.controlSize
+        )
+        let rows = Array(stride(from: key.minY + 4, to: key.maxY - 4, by: 0.5))
+        let glyphPoints = stride(from: key.minX + 4, to: key.maxX - 4, by: 0.5).flatMap { x in
+            rows.map { CGPoint(x: x, y: $0) }
+        }
+        let shellPoints = rows.map { CGPoint(x: key.minX - NotebookTheme.stripInsets.left / 2, y: $0) }
+        let glyph = color(NotebookTheme.glyph)
+        let cases: [(String, UIAccessibilityContrast, Double, Double, NotebookTheme.Tone)] = [
+            ("standard", .normal, NotebookTheme.disabledOpacity, 3.18, NotebookTheme.panelBottom),
+            ("Increase Contrast", .high, NotebookTheme.disabledOpacityIncreased, 4.93, NotebookTheme.panelSurface),
+        ]
+        for (name, contrast, opacity, specified, darkestShell) in cases {
+            let pixels = try await rendered(toolbar, contrast: contrast, at: glyphPoints + shellPoints)
+            let glyphPixels = pixels.prefix(glyphPoints.count)
+            let darkest = try XCTUnwrap(glyphPixels.indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
+            let drawn = pixels[darkest].prefix(3).map { Double($0) / 255 }
+            let row = try XCTUnwrap(rows.firstIndex(of: glyphPoints[darkest].y))
+            let shell = pixels[glyphPoints.count + row].prefix(3).map { Double($0) / 255 }
+            let glyphComponents = [glyph.red, glyph.green, glyph.blue]
+            let alpha = (0..<3).map { (shell[$0] - drawn[$0]) / (shell[$0] - glyphComponents[$0]) }.reduce(0, +) / 3
+            XCTAssertEqual(alpha, opacity, accuracy: 0.02, "\(name): the glyph tone at the paused opacity")
+            let background = color(darkestShell, contrast)
+            let ratio = blend(glyph, alpha, over: background).contrastRatio(against: background)
+            XCTAssertGreaterThanOrEqual(ratio, specified - 0.03, "\(name): \(ratio):1, specified \(specified):1")
+        }
+    }
+
+    /// A paused rail dims its working keys, but the planned tools' placeholders are unavailable
+    /// either way and keep their disabled tone at full strength, whatever the contrast setting.
+    func testPausedRailLeavesItsPlaceholdersInTheirDisabledTone() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        XCTAssertFalse(store.isToolbarAvailable, "A store no canvas owns is paused.")
+        let size = CGSize(width: 1_024, height: 120)
+        let composition = NotebookToolbarComposition(preferences: store.toolbar, horizontalSizeClass: .regular)
+        let rail = composition.rail(forHostWidth: size.width)
+        let toolbar = NotebookToolbar(store: store, composition: composition, rail: rail, collapse: {}) { Color.clear }
+            .frame(width: rail.size.width, height: rail.size.height)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .ignoresSafeArea()
+        func key(_ item: NotebookStripItem) throws -> CGRect {
+            let slot = try XCTUnwrap(rail.toolRow.slots.first { $0.item == item })
+            return CGRect(
+                x: NotebookToolbarComposition.gripColumnWidth + slot.minX, y: NotebookTheme.stripInsets.top,
+                width: slot.width, height: NotebookTheme.controlSize
+            )
+        }
+        let placeholder = try XCTUnwrap(NotebookUpcomingFeature.placed(.toolStrip).first)
+        let keys = [
+            (try key(.upcoming(placeholder)), NotebookTheme.disabledGlyph),
+            (try key(.eraser), NotebookTheme.glyph),
+        ]
+        let rows = Array(stride(from: keys[0].0.minY + 4, to: keys[0].0.maxY - 4, by: 0.5))
+        // The plain shell in the strip's leading inset, level with the keys; it shades only from top to bottom.
+        let shellX = NotebookToolbarComposition.gripColumnWidth + NotebookTheme.stripInsets.left / 2
+        let shellPoints = rows.map { CGPoint(x: shellX, y: $0) }
+        let keyPoints = keys.map { key, _ in
+            stride(from: key.minX + 4, to: key.maxX - 4, by: 0.5).flatMap { x in rows.map { CGPoint(x: x, y: $0) } }
+        }
+        let cases: [(String, UIAccessibilityContrast, Double)] = [
+            ("standard", .normal, NotebookTheme.disabledOpacity),
+            ("Increase Contrast", .high, NotebookTheme.disabledOpacityIncreased),
+        ]
+        for (name, contrast, pausedOpacity) in cases {
+            let pixels = try await rendered(toolbar, contrast: contrast, size: size, at: shellPoints + keyPoints.joined())
+            var start = shellPoints.count
+            var opacities: [Double] = []
+            for ((_, tone), points) in zip(keys, keyPoints) {
+                let drawn = pixels[start..<(start + points.count)]
+                let darkest = try XCTUnwrap(drawn.indices.min { luminance(pixels[$0]) < luminance(pixels[$1]) })
+                let row = try XCTUnwrap(rows.firstIndex(of: points[darkest - start].y))
+                let shell = pixels[row].prefix(3).map { Double($0) / 255 }
+                let glyph = pixels[darkest].prefix(3).map { Double($0) / 255 }
+                let toneComponents = components(color(tone, contrast)).map(Double.init)
+                opacities.append((0..<3).map { (shell[$0] - glyph[$0]) / (shell[$0] - toneComponents[$0]) }.reduce(0, +) / 3)
+                start += points.count
+            }
+            XCTAssertEqual(opacities[0], 1, accuracy: 0.03, "\(name): the placeholder in its full disabled tone")
+            XCTAssertEqual(opacities[1], pausedOpacity, accuracy: 0.02, "\(name): the working keys beside it dim")
+        }
+    }
+
     // MARK: - Status card
 
     func testStatusCardsTakeTheirSpecifiedWidths() {
@@ -407,6 +507,79 @@ final class NotebookChromeTests: XCTestCase {
         let secondary = pixels.rgba(at: CGPoint(x: x, y: secondaryY))
         XCTAssertLessThan(luminance(primary), 0.1, "The primary action is the dark key: \(primary)")
         XCTAssertGreaterThan(luminance(secondary), 0.7, "A secondary action is a light key: \(secondary)")
+    }
+
+    /// A notebook that cannot open explains why on a card. At the largest text size the card is
+    /// taller than the window, so it scrolls rather than cutting short its message or its keys.
+    func testACardTooTallForTheWindowScrollsInsteadOfTruncating() async throws {
+        let id = UUID()
+        let root = NotebookTestFixtures.root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = try NotebookStorageProbe(stored: try await NotebookTestFixtures.stored(id: id), recoveryRoot: root)
+        await probe.setLoadFailure(.unsupportedFormat)
+        let storage = await probe.storage(notebookID: id)
+        let session = NotebookSession(notebookID: id, openStorage: { storage })
+        let hosting = AppearanceTrackingHostingController(
+            rootView: NotebookScreen(session: session, startNewNotebook: {})
+                .environment(\.dynamicTypeSize, .accessibility5)
+        )
+        let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+        window.frame = CGRect(x: 0, y: 0, width: 1_194, height: 834)
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await NotebookTestFixtures.waitUntilAppeared(hosting)
+        try await NotebookTestFixtures.waitUntil {
+            if case .failed = session.loadState { return true }
+            return false
+        }
+        // The whole card is laid out, to be scrolled through.
+        try await NotebookTestFixtures.waitUntil {
+            Self.scrollViews(in: hosting.view).contains { $0.contentSize.height > $0.bounds.height + 1 }
+        }
+    }
+
+    /// The save details keep their own height where they fit, and scroll where the largest text
+    /// size makes them taller than a popover can be, so the cause and every recovery action stay whole.
+    func testSaveDetailsScrollOnlyWhereTheyOutgrowThePopover() async throws {
+        let session = NotebookSession(notebookID: UUID())
+        let model = NotebookSavePresentationModel()
+        model.update(NotebookSavePresentation(
+            status: .failed(.storageFull), inputPaused: true, performingRecovery: false, canPreserveRecovery: true,
+            canReopenSaved: true, recoveryMessage: nil, recoveryFailure: nil
+        ))
+        for (size, scrolls) in [(DynamicTypeSize.large, false), (.accessibility5, true)] {
+            let hosting = AppearanceTrackingHostingController(
+                rootView: NotebookSaveDetails(session: session, model: model)
+                    .notebookDetailPresentation()
+                    .environment(\.dynamicTypeSize, size)
+            )
+            hosting.safeAreaRegions = []
+            let window = UIWindow(windowScene: try NotebookTestFixtures.windowScene())
+            window.frame = CGRect(x: 0, y: 0, width: NotebookTheme.popoverWidth, height: 760)
+            window.rootViewController = hosting
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            hosting.view.layoutIfNeeded()
+            let scrollViews = Self.scrollViews(in: hosting.view)
+            if scrolls {
+                let scroll = try XCTUnwrap(scrollViews.first, "\(size)")
+                XCTAssertGreaterThan(scroll.contentSize.height, scroll.bounds.height, "\(size)")
+            } else {
+                XCTAssertTrue(scrollViews.isEmpty, "\(size): details that fit never scroll.")
+            }
+        }
+    }
+
+    private static func scrollViews(in view: UIView) -> [UIScrollView] {
+        (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews)
     }
 
     // MARK: - Action keys
@@ -514,8 +687,8 @@ final class NotebookChromeTests: XCTestCase {
 
     // MARK: - Status veil
 
-    /// Black status-bar text over the veil above charcoal ink, the one section 8.1 pair that
-    /// depends on the veil's opacity.
+    /// Black status-bar text over the veil above charcoal ink, the one text pair that depends on the
+    /// veil's opacity.
     func testStatusBarTextOnTheVeilOverCharcoalInkMeetsItsContrast() throws {
         let charcoal = try XCTUnwrap(EditorInkCatalog.presets.first { $0.id == "charcoal-monoline" }).color
         let veil = blend(color(NotebookTheme.paperIvory), Double(NotebookTheme.statusVeilOpacity), over: charcoal)
@@ -645,13 +818,13 @@ final class NotebookChromeTests: XCTestCase {
 
     /// The colours at `points` of `content`, hosted in a window with the given contrast.
     private func rendered<Content: View>(
-        _ content: Content, contrast: UIAccessibilityContrast, at points: [CGPoint]
+        _ content: Content, contrast: UIAccessibilityContrast, size: CGSize = NotebookChromeTests.renderSize, at points: [CGPoint]
     ) async throws -> [[UInt8]] {
         let hosting = AppearanceTrackingHostingController(rootView: content)
         hosting.traitOverrides.accessibilityContrast = contrast
         hosting.safeAreaRegions = []
-        let window = try NotebookTestFixtures.window(showing: hosting, width: Self.renderSize.width)
-        window.frame = CGRect(origin: .zero, size: Self.renderSize)
+        let window = try NotebookTestFixtures.window(showing: hosting, width: size.width)
+        window.frame = CGRect(origin: .zero, size: size)
         defer { close(window) }
         try await NotebookTestFixtures.waitUntil {
             hosting.hasAppeared && hosting.traitCollection.accessibilityContrast == contrast

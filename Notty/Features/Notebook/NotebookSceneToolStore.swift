@@ -23,9 +23,6 @@ final class NotebookSceneToolStore: ObservableObject {
     /// True while the writing view keeps the tools out of sight. The toolbar keeps its
     /// placement and preferences; only whether it shows changes.
     @Published private(set) var areToolsHidden = false
-    /// True while the owning canvas has a stroke or other tool use in progress. Not published,
-    /// so a pen going down or up never invalidates the toolbar's controls.
-    private(set) var isToolActive = false
     /// How far the toolbar reaches in from the top or bottom of the control area, the canvas
     /// less its chrome. The canvas it is drawn over adds it to the chrome as scroll space,
     /// whether or not it owns the tools, so no page end stays covered. It is handed to the
@@ -95,17 +92,11 @@ final class NotebookSceneToolStore: ObservableObject {
     /// only when it changes and the toolbar's views are not invalidated for nothing.
     private func resetOwnerState() {
         if isToolbarAvailable { isToolbarAvailable = false }
-        isToolActive = false
     }
 
     func setToolbarAvailable(_ available: Bool, for controller: NotebookViewController) {
         guard activeController === controller, isToolbarAvailable != available else { return }
         isToolbarAvailable = available
-    }
-
-    func setToolActive(_ active: Bool, for controller: NotebookViewController) {
-        guard activeController === controller else { return }
-        isToolActive = active
     }
 
     /// - Parameter followingResize: true when the toolbar was re-measured because the control
@@ -149,14 +140,28 @@ final class NotebookSceneToolStore: ObservableObject {
         areToolsHidden = hidden
     }
 
-    /// Brings hidden tools back to stay, with the header, as the reveal tab asks. Without a writing
-    /// view only the tools return.
+    /// Asks for hidden tools back, as the reveal tab and the other stand-ins do. The writing view
+    /// of the notebook shown in this scene decides: it brings the header back with the tools, to
+    /// stay until the next hide, and holds the request while a stroke is in progress. Without a
+    /// writing view the tools return at once, alone.
     func revealTools() {
         guard let writingChrome else {
             setToolsHidden(false)
             return
         }
         writingChrome.reveal(.sticky)
+    }
+
+    /// Chooses and stores the writing view, as the stand-ins for hidden tools offer to. The writing
+    /// view of the notebook shown in this scene adopts it; without one only the preference changes.
+    func chooseWritingView(_ mode: EditorChromeMode) {
+        guard let writingChrome else {
+            var preferences = toolbar
+            preferences.setChromeMode(mode)
+            updateToolbar(preferences)
+            return
+        }
+        writingChrome.setMode(mode)
     }
 
     /// Hands the writing view of the notebook now shown in this scene its reveal requests.
@@ -169,7 +174,8 @@ final class NotebookSceneToolStore: ObservableObject {
         writingChrome === chrome
     }
 
-    /// Reported by the toolbar while it is dragged, so it and the header never hide mid-drag.
+    /// Reported by the toolbar's drag from its first move to its end, so the toolbar and header
+    /// never hide mid-drag.
     func setToolbarDragging(_ dragging: Bool) {
         writingChrome?.setToolbarDragging(dragging)
     }

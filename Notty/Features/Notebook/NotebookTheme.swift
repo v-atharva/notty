@@ -60,6 +60,14 @@ enum NotebookTheme {
                 case .semibold: .semibold
                 }
             }
+
+            var fontWeight: UIFont.Weight {
+                switch self {
+                case .regular: .regular
+                case .medium: .medium
+                case .semibold: .semibold
+                }
+            }
         }
 
         enum Style: Sendable {
@@ -81,6 +89,19 @@ enum NotebookTheme {
                 case .subheadline: .subheadline
                 case .footnote: .footnote
                 case .caption: .caption
+                case .caption2: .caption2
+                }
+            }
+
+            var textStyle: UIFont.TextStyle {
+                switch self {
+                case .title3: .title3
+                case .headline: .headline
+                case .body: .body
+                case .callout: .callout
+                case .subheadline: .subheadline
+                case .footnote: .footnote
+                case .caption: .caption1
                 case .caption2: .caption2
                 }
             }
@@ -303,11 +324,13 @@ enum NotebookTheme {
 
     /// A menu row's trailing inset, and the gap between its glyph and its text.
     static let menuRowInset: CGFloat = 12
-    /// Where a menu row's glyph column starts: far enough in that the broadest glyph, Focus's
-    /// pencil and scribble, clears the selected row's mark.
+    /// Where a menu row's glyph column starts, well clear of the selected row's mark.
     static let menuGlyphInset: CGFloat = 16
     /// Every row glyph centres in a column as wide as the glyph, so titles line up across sections.
     static let menuGlyphColumnWidth: CGFloat = 20
+    /// Focus's pencil and scribble runs wide; at this size it fills the glyph column as the other
+    /// writing view glyphs do at the header glyph size, rather than spilling toward the mark.
+    static let focusGlyphSize: CGFloat = 15
     /// Room above and below a writing view row's title and description.
     static let menuRowTextPadding: CGFloat = 4
     /// Least room between a writing view's text and its shortcut hint.
@@ -346,15 +369,9 @@ enum NotebookTheme {
     /// The hairline between the rail's rows stops this far short of the strip's ends.
     static let rowDividerInset: CGFloat = 12
     static let stripInsets = UIEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
-    /// SwiftUI form of `stripInsets`.
-    static var stripEdgeInsets: EdgeInsets {
-        EdgeInsets(top: stripInsets.top, leading: stripInsets.left, bottom: stripInsets.bottom, trailing: stripInsets.right)
-    }
     /// The two ridges of the grip column.
     static let gripRidgeSize = CGSize(width: 2, height: 24)
     static let gripRidgeSpacing: CGFloat = 4
-    /// Touch region of the grip, kept apart from the tool strips.
-    static let dragHandleHitSize = CGSize(width: controlSize, height: controlSize)
     /// Hairline between the grip and the collapse key of a floating rail.
     static let gripSeparatorLength: CGFloat = 20
     /// Collapsed floating rail; it is the reveal control, so both sides are at least 44 pt.
@@ -443,6 +460,10 @@ enum NotebookTheme {
     // MARK: - Popovers, sheets and cards
 
     static let popoverWidth: CGFloat = 320
+    /// The notebook menu widens to this at accessibility text sizes, where the window allows.
+    static let accessibilityPopoverWidth: CGFloat = 480
+    /// Least room a widened popover leaves beside it at each edge of the window.
+    static let popoverWindowMargin: CGFloat = 20
     static let popoverPadding: CGFloat = 16
     /// Save, history and limit details read better with a little more room.
     static let detailPadding: CGFloat = 20

@@ -181,7 +181,7 @@ struct NotebookLibraryHost: View {
                     await model.startNewNotebook()
                 })
                 .id(session.notebookID)
-                .overlay(alignment: .top) {
+                .overlay(alignment: .bottom) {
                     if let failure = model.creationFailure {
                         selectionFailureBanner(failure)
                     }
@@ -220,8 +220,9 @@ struct NotebookLibraryHost: View {
         .task { await model.load() }
     }
 
-    /// The notice that a new notebook could not be selected. It lies over the top of the open
-    /// notebook, so it can be dismissed to uncover the controls beneath it.
+    /// The notice that a new notebook could not be selected. It lies over the bottom of the open
+    /// notebook, clear of the header and above the room kept below the last page for its "Add
+    /// page" tab, and can be dismissed to uncover the page beneath it.
     private func selectionFailureBanner(_ failure: NotebookSaveFailure) -> some View {
         HStack(spacing: 0) {
             Text("The new notebook could not be selected. \(failure.message)")
@@ -244,24 +245,12 @@ struct NotebookLibraryHost: View {
         }
         .background { NotebookPanelShell(cornerRadius: NotebookTheme.compactPanelCornerRadius) }
         .frame(maxWidth: NotebookTheme.statusCardMaxWidth)
-        .padding([.top, .horizontal], NotebookTheme.sectionSpacing)
+        .padding(.horizontal, NotebookTheme.sectionSpacing)
+        .padding(.bottom, NotebookTheme.endScrollMinimum + NotebookTheme.sectionSpacing)
     }
 
     /// Separate statements of a card's message, one per line.
     private static func lines(_ lines: String?...) -> String {
         lines.compactMap { $0 }.joined(separator: "\n")
-    }
-}
-
-private extension View {
-    /// Centres a status card on the paper, scrolling it when a large text size makes it taller
-    /// than the screen. The padding keeps the card's shadow clear of the edges.
-    func centredOnPaper() -> some View {
-        ViewThatFits(in: .vertical) {
-            padding(NotebookTheme.detailPadding)
-            ScrollView {
-                padding(NotebookTheme.detailPadding)
-            }
-        }
     }
 }

@@ -29,7 +29,8 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertEqual(resolver.placement(translation: pastTheTrailingCorner), .docked(.topTrailing))
 
         let session = NotebookToolbarDragSession()
-        session.move(to: pastTheTop, resolver: resolver)
+        let actions = NotebookToolbarActions(store: NotebookTestFixtures.toolStore())
+        session.move(to: pastTheTop, resolver: resolver, actions: actions)
         XCTAssertEqual(session.previewFrame, preview)
         XCTAssertEqual(session.targetedDock, .topCenter, "The highlighted slot matches the release result.")
     }
@@ -155,8 +156,8 @@ final class NotebookToolbarHostTests: XCTestCase {
             "A handle at either end of the shared slot docks in the centre too.")
     }
 
-    /// Where the docks share one slot, a drag shows that slot alone, filled and outlined solid as
-    /// the frame the rail lands in, with nothing beside it.
+    /// Where the docks share one slot, a drag shows that slot alone, drawn as the landing slot it
+    /// is, lightly filled and outlined solid, with nothing beside it.
     func testSharedDocksDrawOneCentredTarget() throws {
         let usable = CGRect(x: 0, y: 0, width: 834, height: 400)
         let rail = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular).rail(forHostWidth: 834)
@@ -165,15 +166,20 @@ final class NotebookToolbarHostTests: XCTestCase {
         let resolver = NotebookToolbarDragResolver(
             placement: .docked(.topTrailing), size: rail.size, usable: usable, docksShared: true
         )
-        drag.move(to: CGSize(width: 30, height: 6), resolver: resolver)
+        drag.move(
+            to: CGSize(width: 30, height: 6), resolver: resolver,
+            actions: NotebookToolbarActions(store: NotebookTestFixtures.toolStore())
+        )
         XCTAssertEqual(drag.targetedDock, .topTrailing, "The stored dock stays targeted on the shared slot.")
         let pixels = try RenderedPixels(rendering:
             NotebookDockTargets(drag: drag, slotSize: rail.size, usable: usable, docksShared: true)
                 .frame(width: usable.width, height: usable.height)
         )
         let slot = EditorToolbarLayout.frame(for: .docked(.topCenter), size: rail.size, in: usable)
+        let landing = 255 * NotebookTheme.dockSlotLandingFillOpacity
         for x in [slot.minX + 20, slot.midX, slot.maxX - 20] {
-            XCTAssertGreaterThan(pixels.rgba(at: CGPoint(x: x, y: slot.midY))[3], 100, "The slot is filled as targeted at \(x).")
+            XCTAssertEqual(Double(pixels.rgba(at: CGPoint(x: x, y: slot.midY))[3]), landing, accuracy: 3,
+                "The slot takes the landing fill, not the heavier targeted one, at \(x).")
         }
         let edge = stride(from: slot.midX - 60, through: slot.midX + 60, by: 1).map {
             pixels.rgba(at: CGPoint(x: $0, y: slot.minY + 1))
@@ -237,6 +243,7 @@ final class NotebookToolbarHostTests: XCTestCase {
             placement: .floating(CGPoint(x: 0.5, y: 0.5)), size: CGSize(width: 200, height: 60), usable: usable
         )
         let session = NotebookToolbarDragSession()
+        let actions = NotebookToolbarActions(store: NotebookTestFixtures.toolStore())
         let counter = BodyCounter()
         // A closure property, like the toolbar's own, must not make the content compare as changed.
         let content = CountedContent(counter: counter, action: { _ = counter })
@@ -256,7 +263,7 @@ final class NotebookToolbarHostTests: XCTestCase {
 
         for step in 1...10 {
             let translation = CGSize(width: CGFloat(step) * -12, height: CGFloat(step) * 7)
-            session.move(to: translation, resolver: resolver)
+            session.move(to: translation, resolver: resolver, actions: actions)
             hosting.view.layoutIfNeeded()
             try await Task.sleep(for: .milliseconds(5))
             hosting.view.layoutIfNeeded()
@@ -302,6 +309,33 @@ final class NotebookToolbarHostTests: XCTestCase {
         )
     }
 
+    /// A host given the scene's store draws the rail in the same pass as its canvas. One left to find
+    /// the scene's store itself can do so only a turn after it first shows, so its rail arrives late;
+    /// the notebook screen therefore resolves the store while the notebook opens and hands it over.
+    func testAHostGivenTheScenesStoreDrawsTheRailInItsFirstPass() async throws {
+        let scene = try NotebookTestFixtures.windowScene()
+        let owner = preserveSceneStore(for: scene)
+        owner.updateToolbar(.standard)
+        func strips(in view: UIView) -> [UIScrollView] {
+            let own = (view as? UIScrollView).map { [$0] } ?? []
+            return own + view.subviews.flatMap(strips)
+        }
+        for handsOverStore in [true, false] {
+            let hosting = AppearanceTrackingHostingController(
+                rootView: NotebookToolbarHost(store: handsOverStore ? owner : nil) { Color.clear }
+            )
+            let window = UIWindow(windowScene: scene)
+            window.frame = Self.windowFrame
+            window.rootViewController = hosting
+            window.makeKeyAndVisible()
+            defer { close(window) }
+            hosting.view.layoutIfNeeded()
+            XCTAssertEqual(strips(in: hosting.view).isEmpty, !handsOverStore, "In the first pass")
+            try await NotebookTestFixtures.waitUntilAppeared(hosting)
+            try await NotebookTestFixtures.waitUntil { strips(in: hosting.view).count == 2 }
+        }
+    }
+
     func testExpandedCanvasReservesHeaderAndHomeIndicatorApartFromTheToolbar() {
         let canvas = CGSize(width: 500, height: 900)
         // The control area in the canvas's own coordinates, below the header and above the home indicator.
@@ -310,6 +344,13 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertEqual(chrome, NotebookCanvasChrome(top: 96, bottom: 20, canvasSize: canvas))
         XCTAssertEqual(NotebookCanvasChrome(canvasSize: canvas, controlArea: nil), .none)
         XCTAssertEqual(NotebookCanvasChrome(canvasSize: .zero, controlArea: controls), .none)
+        // A header reaching past where the toolbar's area begins stays covered however little the
+        // toolbar takes.
+        XCTAssertEqual(
+            chrome.reserving(top: 62, atLeast: 66),
+            NotebookCanvasChrome(top: 158, bottom: 20, canvasSize: canvas, coveredTop: 162)
+        )
+        XCTAssertEqual(NotebookCanvasChrome.none.reserving(top: 62, atLeast: 66), .none)
 
         let usable = CGRect(origin: .zero, size: controls.size)
         let compact = CGRect(x: 12, y: 12, width: 450, height: 52)
@@ -362,7 +403,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertEqual(canvas.bounds.height, host.bounds.height, accuracy: 0.5)
 
         fixture.controller.canvasViewDidBeginUsingTool(canvas)
-        XCTAssertTrue(store.isToolActive)
+        XCTAssertTrue(fixture.controller.currentUndoAvailability.isUsingTool)
         let bounds = canvas.bounds
         let frame = fixture.canvasFrame
         let offset = canvas.contentOffset
@@ -429,8 +470,9 @@ final class NotebookToolbarHostTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { store.overlayObstruction.top > 0 && canvas.contentInset.top > 0 }
     }
 
-    /// Each placement reaches the canvas even when the next one follows within the same frame,
-    /// which a per-frame change handler would drop as an update loop.
+    /// Placements made in quick succession all reach the canvas. Each waits only until the one
+    /// before it has landed, which can be within the frame that applied it, where a change handler
+    /// would drop the next placement as an update loop.
     func testPlacementsInQuickSuccessionAllReachTheCanvas() async throws {
         let fixture = try await NotebookTestFixtures.mountToolbarHost()
         defer { fixture.close() }
@@ -549,7 +591,7 @@ final class NotebookToolbarHostTests: XCTestCase {
             XCTAssertEqual(fixture.canvasFrame.minY, 0, accuracy: 0.5)
             try await settle(host)
             let toolbar = toolbarFrame(for: store.toolbar, in: host.bounds)
-            let grip = CGPoint(x: toolbar.minX + NotebookTheme.dragHandleHitSize.width / 2, y: toolbar.midY)
+            let grip = CGPoint(x: toolbar.minX + NotebookToolbarComposition.gripColumnWidth / 2, y: toolbar.midY)
             let toolRow = CGPoint(x: toolbar.midX, y: toolbar.minY + NotebookTheme.rowHeight / 2)
             let inkRow = CGPoint(
                 x: toolbar.midX, y: toolbar.minY + NotebookTheme.rowHeight + NotebookTheme.rowSpacing + NotebookTheme.rowHeight / 2
@@ -621,7 +663,7 @@ final class NotebookToolbarHostTests: XCTestCase {
 
         XCTAssertLessThanOrEqual(tools.contentSize.width, tools.bounds.width + 0.5, "Every tool shows without paging.")
         XCTAssertEqual(ink.contentOffset.x, 0, accuracy: 0.5)
-        let scrollWidth = row.scrollWidth(containerWidth: ink.bounds.width)
+        let scrollWidth = row.contentWidth + row.trailingRoom(containerWidth: ink.bounds.width)
         XCTAssertEqual(ink.contentSize.width, scrollWidth, accuracy: 0.5, "The strip lays out the slots it measures.")
         func mask(at offset: CGFloat) -> NotebookStripMask {
             let overflow = NotebookStripOverflow(offset: offset, contentWidth: scrollWidth, containerWidth: ink.bounds.width)
@@ -695,7 +737,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         for (strip, row) in zip(strips, [rail.toolRow, try XCTUnwrap(rail.inkRow)]) {
             XCTAssertEqual(strip.contentOffset.x, 0, accuracy: 0.5)
             let width = strip.bounds.width
-            let scrollWidth = row.scrollWidth(containerWidth: width)
+            let scrollWidth = row.contentWidth + row.trailingRoom(containerWidth: width)
             XCTAssertEqual(strip.contentSize.width, scrollWidth, accuracy: 0.5)
             let mask = row.restingMask(for: NotebookStripOverflow(offset: 0, contentWidth: scrollWidth, containerWidth: width))
             let cut = try XCTUnwrap(row.slots.first { !$0.item.isDivider && $0.minX < width && $0.maxX > width })
@@ -813,6 +855,39 @@ final class NotebookToolbarHostTests: XCTestCase {
         XCTAssertFalse(fixture.strips.contains { hit.isDescendant(of: $0) })
         let glyph = CGRect(x: key.x - 10, y: key.y - 10, width: 20, height: 20)
         XCTAssertGreaterThan(darkPixelCount(try renderedWindow(fixture.window), in: glyph), 20, "The collapse key is drawn there.")
+    }
+
+    /// A collapsed handle that writing has paused dims its content like the paused rail, in the
+    /// glyph tone at the paused opacity rather than the disabled tone dimmed again.
+    func testPausedCollapsedHandleDimsItsGlyphToThePausedOpacity() async throws {
+        let store = NotebookTestFixtures.toolStore()
+        store.updateToolbar(EditorToolbarPreferences(
+            placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: true, customSwatches: []
+        ))
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(store: store)
+        defer { fixture.close() }
+        fixture.controller.setInputGate(.failed)
+        XCTAssertFalse(store.isToolbarAvailable)
+        try await settle(fixture.host)
+        let handle = toolbarFrame(for: store.toolbar, in: fixture.host.bounds)
+        XCTAssertEqual(handle.size, NotebookTheme.collapsedHandleSize)
+        let pixels = try renderedWindow(fixture.window)
+        func components(_ point: CGPoint) -> [Double] {
+            pixels.rgba(at: point).prefix(3).map { Double($0) / 255 }
+        }
+        func luminance(_ rgb: [Double]) -> Double { 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2] }
+        // The tool symbol at the handle's centre, clear of the ink bead below and after it.
+        let glyphPoints = stride(from: handle.midX - 10, to: handle.midX + 4, by: 0.5).flatMap { x in
+            stride(from: handle.midY - 10, to: handle.midY + 4, by: 0.5).map { CGPoint(x: x, y: $0) }
+        }
+        let darkest = try XCTUnwrap(glyphPoints.min { luminance(components($0)) < luminance(components($1)) })
+        let drawn = components(darkest)
+        let shell = components(CGPoint(x: handle.minX + 3, y: darkest.y))
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0
+        NotebookTheme.glyph.uiColor.getRed(&red, green: &green, blue: &blue, alpha: nil)
+        let glyph = [red, green, blue].map(Double.init)
+        let alpha = (0..<3).map { (shell[$0] - drawn[$0]) / (shell[$0] - glyph[$0]) }.reduce(0, +) / 3
+        XCTAssertEqual(alpha, NotebookTheme.disabledOpacity, accuracy: 0.03, "drawn \(drawn) on \(shell)")
     }
 
     // MARK: - Hidden tools
@@ -1102,6 +1177,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         let canvas = controller.canvasView
         let paper = controller.paperView
         let header = try headerBand(in: hosting, window: window).maxY
+        let shell = try headerShell(in: hosting, window: window)
         let footer = window.safeAreaInsets.bottom
         let portrait = window.frame
         let landscape = CGRect(x: 0, y: 0, width: portrait.height, height: portrait.width)
@@ -1117,8 +1193,10 @@ final class NotebookToolbarHostTests: XCTestCase {
         let reach = 1.5 * height
         let fraction = (reach / (portrait.height - header - footer) + reach / (landscape.height - header - footer)) / 2
         owner.updateToolbar(floating(at: fraction))
+        // The toolbar takes nothing from the top, and the canvas still keeps the whole header
+        // covered, though the toolbar's margin begins inside it.
         try await NotebookTestFixtures.waitUntil {
-            owner.overlayObstruction == .zero && abs(canvas.contentInset.top - header) < 0.5
+            owner.overlayObstruction == .zero && abs(canvas.contentInset.top - shell.maxY) < 0.5
         }
         try await settle(hosting.view)
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
@@ -1126,7 +1204,7 @@ final class NotebookToolbarHostTests: XCTestCase {
         window.frame = landscape
         try await NotebookTestFixtures.waitUntil {
             canvas.bounds.size == landscape.size && owner.overlayObstruction.top > 0
-                && canvas.contentInset.top > header + 0.5
+                && canvas.contentInset.top > shell.maxY + 0.5
         }
         try await settle(hosting.view)
         let bar = try headerBand(in: hosting, window: window)
@@ -1199,6 +1277,19 @@ final class NotebookToolbarHostTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= toolbar.maxY - 0.5 }
         XCTAssertEqual(canvas.contentOffset.y, -canvas.contentInset.top, accuracy: 0.5)
         XCTAssertEqual(canvas.drawing, drawing)
+
+        // Floating clear of the top, the toolbar takes nothing; the first line still scrolls clear of
+        // the whole header, which reaches below where the toolbar's control area begins.
+        let shell = try headerShell(in: hosting, window: window)
+        XCTAssertGreaterThan(shell.maxY, bar.maxY)
+        owner.updateToolbar(
+            EditorToolbarPreferences(placement: .floating(CGPoint(x: 0.5, y: 0.5)), isCollapsed: false, customSwatches: [])
+        )
+        try await NotebookTestFixtures.waitUntil { owner.overlayObstruction == .zero }
+        try await settle(hosting.view)
+        XCTAssertEqual(canvas.contentInset.top, shell.maxY, accuracy: 0.5, "The header stays covered.")
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: false)
+        try await NotebookTestFixtures.waitUntil { paper.contentLayer.transform.m42 >= shell.maxY - 0.5 }
     }
 
     private func verifyFullScreenPaper(preloadsNotebook: Bool) async throws {

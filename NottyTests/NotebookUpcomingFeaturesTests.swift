@@ -50,13 +50,16 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
                 let label = "\(width) \(String(describing: sizeClass)) \(preferences.placement)"
                 XCTAssertEqual(rail.showsUpcoming, shows, label)
                 let tail = rail.toolRow.slots.suffix(NotebookUpcomingFeature.placed(.toolStrip).count + 1).map(\.item)
+                let placeholders = rail.toolRow.slots.compactMap { slot -> NotebookUpcomingFeature? in
+                    if case let .upcoming(feature) = slot.item { feature } else { nil }
+                }
                 if shows {
-                    XCTAssertEqual(rail.upcomingTools.map(\.title), ["Text", "Insert", "Record audio", "Bookmark"], label)
+                    XCTAssertEqual(placeholders.map(\.title), ["Text", "Insert", "Record audio", "Bookmark"], label)
                     XCTAssertEqual(
                         tail, [.upcomingLabel] + NotebookUpcomingFeature.placed(.toolStrip).map { .upcoming($0) }, label
                     )
                 } else {
-                    XCTAssertTrue(rail.upcomingTools.isEmpty, label)
+                    XCTAssertTrue(placeholders.isEmpty, label)
                     XCTAssertFalse(rail.toolRow.slots.contains { $0.item == .upcomingLabel }, label)
                 }
             }
@@ -165,6 +168,18 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         let disabledTone = luminance(NotebookTheme.disabledGlyph.uiColor)
         XCTAssertEqual(placeholder, disabledTone, accuracy: 0.03, "The placeholder glyph uses the disabled tone.")
         XCTAssertLessThan(enabled, placeholder - 0.1, "A working tool is drawn darker than a placeholder.")
+
+        // A paused rail keeps its keys in the glyph tone; a placeholder stays disabled for good.
+        let paused = try darkestLuminance(of: NotebookUpcomingToolButton(feature: feature)
+            .environment(\.notebookKeysPaused, true))
+        XCTAssertEqual(paused, disabledTone, accuracy: 0.03, "A paused rail leaves the placeholder's tone alone.")
+        let pausedKey = try darkestLuminance(of: Button {} label: {
+            NotebookToolGlyph(symbol: feature.symbol, isSelected: false)
+        }
+        .buttonStyle(NotebookKeyStyle())
+        .disabled(true)
+        .environment(\.notebookKeysPaused, true))
+        XCTAssertEqual(pausedKey, enabled, accuracy: 0.03, "A key only the pause disables keeps the glyph tone.")
     }
 
     func testSoonCaptionIsAQuietSectionLabel() throws {
@@ -225,20 +240,39 @@ final class NotebookUpcomingFeaturesTests: XCTestCase {
         }
     }
 
-    /// Split View and narrower windows show the docks as one centred slot; the menu says so.
+    /// Split View and narrower windows show the docks as one centred slot; the menu says so exactly
+    /// where the rail shares its slot, whichever dock or floating spot is stored.
     func testToolbarPositionNotesWhenTheDocksShareOneSlot() {
-        let standard = EditorToolbarPreferences.standard
-        for width in [678.0, 834] as [CGFloat] {
-            XCTAssertTrue(
-                NotebookToolbarPositionPicker.docksShared(preferences: standard, hostWidth: width, sizeClass: .regular),
-                "\(width)"
-            )
-        }
-        for width in [1_194.0, 1_366] as [CGFloat] {
-            XCTAssertFalse(
-                NotebookToolbarPositionPicker.docksShared(preferences: standard, hostWidth: width, sizeClass: .regular),
-                "\(width)"
-            )
+        let stored: [EditorToolbarPreferences] = [
+            .standard,
+            EditorToolbarPreferences(placement: .docked(.topLeading), isCollapsed: false, customSwatches: []),
+            EditorToolbarPreferences(placement: .floating(CGPoint(x: 0.3, y: 0.7)), isCollapsed: true, customSwatches: []),
+        ]
+        let expected: [(CGFloat, Bool)] = [(834, true), (1_024, true), (678, true), (1_194, false), (1_366, false)]
+        for preferences in stored {
+            for (width, shared) in expected {
+                for typeSize in [DynamicTypeSize.large, .xxLarge] {
+                    let label = "\(width) \(typeSize) \(preferences.placement)"
+                    let noted = NotebookToolbarPositionPicker.docksShared(
+                        preferences: preferences, hostWidth: width, sizeClass: .regular, dynamicTypeSize: typeSize
+                    )
+                    var docked = preferences
+                    docked.place(.docked(.topTrailing))
+                    let rail = NotebookToolbarComposition(
+                        preferences: docked, horizontalSizeClass: .regular, dynamicTypeSize: typeSize
+                    ).rail(forHostWidth: width)
+                    XCTAssertEqual(noted, rail.docksShared, "\(label): the note follows the rail.")
+                    if typeSize == .large { XCTAssertEqual(noted, shared, label) }
+                }
+                let compact = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .compact)
+                    .rail(forHostWidth: width)
+                XCTAssertEqual(
+                    NotebookToolbarPositionPicker.docksShared(
+                        preferences: preferences, hostWidth: width, sizeClass: .compact, dynamicTypeSize: .large
+                    ),
+                    compact.docksShared, "\(width) compact"
+                )
+            }
         }
     }
 

@@ -6,6 +6,10 @@ import UIKit
 /// tool or its own preferences, whichever control or gesture fired.
 @MainActor
 struct NotebookToolbarActions {
+    /// Where Float, from the grip's actions or the notebook menu, places a docked toolbar: centred,
+    /// near the top of the page.
+    static let floatingPlacement = EditorToolbarPlacement.floating(CGPoint(x: 0.5, y: 0.25))
+
     let store: NotebookSceneToolStore
 
     var isEnabled: Bool { store.isToolbarAvailable }
@@ -201,16 +205,19 @@ struct NotebookToolbarComposition: Equatable {
     let swatches: [EditorInkColor]
     /// The text size the preset labels are set at, never above `textSizeLimit`.
     let dynamicTypeSize: DynamicTypeSize
+    /// True under Bold Text, which sets the preset labels heavier and so wider.
+    let isBoldText: Bool
 
     init(
         preferences: EditorToolbarPreferences, horizontalSizeClass: UserInterfaceSizeClass?,
-        dynamicTypeSize: DynamicTypeSize = .large
+        dynamicTypeSize: DynamicTypeSize = .large, legibilityWeight: LegibilityWeight? = nil
     ) {
         foldsInkOptions = horizontalSizeClass == .compact
         if case .floating = preferences.placement { isFloating = true } else { isFloating = false }
         isCollapsed = preferences.isCollapsed
         swatches = NotebookSwatchShelf.displayed(custom: preferences.customSwatches)
         self.dynamicTypeSize = min(dynamicTypeSize, Self.textSizeLimit)
+        isBoldText = legibilityWeight == .bold
     }
 
     var showsRevealHandle: Bool { isCollapsed }
@@ -321,7 +328,7 @@ struct NotebookToolbarComposition: Equatable {
         NotebookStripRow(items: items) { item in
             switch item {
             case .divider: Self.dividerWidth
-            case let .preset(preset): NotebookPresetChip.width(for: preset, at: dynamicTypeSize)
+            case let .preset(preset): NotebookPresetChip.width(for: preset, at: dynamicTypeSize, isBold: isBoldText)
             default: NotebookTheme.controlSize
             }
         }
@@ -343,11 +350,6 @@ struct NotebookToolbarRail: Equatable {
     /// A row wider than its strip keeps room for a trailing chevron that pages it.
     let toolRowOverflows: Bool
     let inkRowOverflows: Bool
-
-    /// The disabled placeholders that close the tool row.
-    var upcomingTools: [NotebookUpcomingFeature] {
-        showsUpcoming ? NotebookUpcomingFeature.placed(.toolStrip) : []
-    }
 }
 
 // MARK: - Strips
@@ -388,6 +390,12 @@ enum NotebookStripItem: Hashable, Identifiable {
     /// Dividers carry nothing to read or press, so they never count as a whole control shown.
     var isDivider: Bool {
         if case .divider = self { return true }
+        return false
+    }
+
+    /// A planned tool's key, which is never available.
+    var isPlaceholder: Bool {
+        if case .upcoming = self { return true }
         return false
     }
 }
@@ -444,11 +452,6 @@ struct NotebookStripRow: Equatable {
         let maximum = maximumOffset(containerWidth: containerWidth)
         guard maximum > 0 else { return 0 }
         return max(maximum + containerWidth - contentWidth, 0)
-    }
-
-    /// The width the strip scrolls through in a container, its trailing room included.
-    func scrollWidth(containerWidth: CGFloat) -> CGFloat {
-        contentWidth + trailingRoom(containerWidth: containerWidth)
     }
 
     /// Offsets the strip may rest at: either end, or with a control just clear of the leading
@@ -587,6 +590,9 @@ private struct NotebookToolStrip<Control: View>: View {
     let label: String
     let row: NotebookStripRow
     let reservesTrailingChevron: Bool
+    /// How far a paused rail dims the controls and chevrons. Placeholders are unavailable whether
+    /// or not writing is paused, so they keep their disabled tone at full strength.
+    let contentOpacity: Double
     /// Each change scrolls `revealTarget` into view just clear of the leading edge.
     var reveals: UInt64 = 0
     var revealTarget: NotebookStripItem.ID?
@@ -608,6 +614,7 @@ private struct NotebookToolStrip<Control: View>: View {
                     ForEach(row.slots) { slot in
                         control(slot.item)
                             .frame(width: slot.width, height: NotebookTheme.controlSize)
+                            .opacity(slot.item.isPlaceholder ? 1 : contentOpacity)
                     }
                 }
                 .padding(.leading, NotebookTheme.stripInsets.left)
@@ -716,6 +723,7 @@ private struct NotebookToolStrip<Control: View>: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(NotebookKeyStyle())
+        .opacity(contentOpacity)
         .accessibilityLabel(label)
         .accessibilityShowsLargeContentViewer {
             Label(label, systemImage: symbol)
@@ -729,7 +737,8 @@ private struct NotebookToolStrip<Control: View>: View {
 /// and ruler, the widths and the planned tools; the second the presets and colours, with the
 /// custom colour well fixed at its end. The grip column at the leading edge comes from the
 /// host, which owns placement; a floating rail adds its collapse key under the grip, or on the
-/// single compact row after the current-ink chip.
+/// single compact row after the current-ink chip. While writing is paused the content dims over
+/// the opaque shell, except the planned tools, which are unavailable either way.
 @MainActor
 struct NotebookToolbar<Grip: View>: View {
     @ObservedObject var store: NotebookSceneToolStore
@@ -759,19 +768,22 @@ struct NotebookToolbar<Grip: View>: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: NotebookTheme.panelCornerRadius, style: .continuous)
         let marks = NotebookInkMarks(tool: store.tool, custom: store.toolbar.customSwatches)
+        let dimming = actions.contentOpacity(for: contrast)
         HStack(spacing: 0) {
             gripColumn
                 .frame(width: NotebookToolbarComposition.gripColumnWidth)
+                .opacity(dimming)
             VStack(spacing: 0) {
-                toolRow(marks)
+                toolRow(marks, dimming: dimming)
                     .frame(height: NotebookTheme.rowHeight)
                 if let inkRow = rail.inkRow {
                     NotebookChromeDivider(axis: .horizontal)
                         .frame(height: NotebookTheme.rowSpacing)
+                        .opacity(dimming)
                     HStack(spacing: 0) {
                         NotebookToolStrip(
                             label: "Ink", row: inkRow, reservesTrailingChevron: rail.inkRowOverflows,
-                            reveals: inkRowReveals, revealTarget: firstSwatchID(in: inkRow)
+                            contentOpacity: dimming, reveals: inkRowReveals, revealTarget: firstSwatchID(in: inkRow)
                         ) { control($0, marks: marks) }
                         HStack(spacing: NotebookTheme.itemSpacing) {
                             NotebookChromeDivider(axis: .vertical)
@@ -781,16 +793,17 @@ struct NotebookToolbar<Grip: View>: View {
                         }
                         .padding(.leading, NotebookTheme.itemSpacing)
                         .padding(.trailing, NotebookTheme.stripInsets.right)
+                        .opacity(dimming)
                     }
                     .frame(height: NotebookTheme.rowHeight)
                 }
             }
         }
-        .opacity(actions.contentOpacity(for: contrast))
         .clipShape(shape)
         .background { NotebookPanelShell() }
         .contentShape(shape)
         .disabled(!actions.isEnabled)
+        .environment(\.notebookKeysPaused, !actions.isEnabled)
         .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Drawing tools")
@@ -833,11 +846,12 @@ struct NotebookToolbar<Grip: View>: View {
         }
     }
 
-    private func toolRow(_ marks: NotebookInkMarks) -> some View {
+    private func toolRow(_ marks: NotebookInkMarks, dimming: Double) -> some View {
         HStack(spacing: 0) {
-            NotebookToolStrip(label: "Tools", row: rail.toolRow, reservesTrailingChevron: rail.toolRowOverflows) {
-                control($0, marks: marks)
-            }
+            NotebookToolStrip(
+                label: "Tools", row: rail.toolRow, reservesTrailingChevron: rail.toolRowOverflows,
+                contentOpacity: dimming
+            ) { control($0, marks: marks) }
             if composition.foldsInkOptions {
                 HStack(spacing: NotebookTheme.itemSpacing) {
                     NotebookChromeDivider(axis: .vertical)
@@ -846,6 +860,7 @@ struct NotebookToolbar<Grip: View>: View {
                 }
                 .padding(.leading, NotebookTheme.itemSpacing)
                 .padding(.trailing, NotebookTheme.stripInsets.right)
+                .opacity(dimming)
             } else {
                 Color.clear.frame(width: NotebookTheme.stripInsets.right)
             }
@@ -1009,7 +1024,9 @@ private struct NotebookCurrentInkChip: View {
             NotebookInkControls(store: store)
                 .presentationCompactAdaptation(.popover)
         }
-        .onChange(of: store.isToolbarAvailable) { _, available in
+        .notebookToolbarPresentation(showsOptions, store: store)
+        // Every change arrives, however many fall within one frame, so a pause always closes it.
+        .onReceive(store.$isToolbarAvailable) { available in
             if !available { showsOptions = false }
         }
     }
@@ -1112,33 +1129,48 @@ struct NotebookPresetChip: View {
         shortTitles[preset.id] ?? preset.name
     }
 
-    /// The chip's width at a text size, which the rail's width rule counts and the chip lays out.
-    nonisolated static func width(for preset: EditorInkPreset, at size: DynamicTypeSize) -> CGFloat {
+    /// What Voice Control answers to. Users say the word the chip shows, which a swatch of the same
+    /// colour may share, so it leads as a preset; the full name follows.
+    nonisolated static func inputLabels(for preset: EditorInkPreset) -> [String] {
+        ["\(shortTitle(for: preset)) preset", preset.name, "\(preset.name) preset"]
+    }
+
+    /// The chip's width at a text size, and under Bold Text when `isBold`, which the rail's width
+    /// rule counts and the chip lays out.
+    nonisolated static func width(for preset: EditorInkPreset, at size: DynamicTypeSize, isBold: Bool = false) -> CGFloat {
         2 * NotebookTheme.presetChipPadding + NotebookTheme.presetDotDiameter + NotebookTheme.presetDotSpacing
-            + labelWidth(shortTitle(for: preset), at: size)
+            + labelWidth(shortTitle(for: preset), at: size, isBold: isBold)
     }
 
     /// The label's width in the control label face at a text size, rounded up to whole points.
-    nonisolated static func labelWidth(_ text: String, at size: DynamicTypeSize) -> CGFloat {
-        let size = min(size, NotebookToolbarComposition.textSizeLimit)
-        return measuredLabelWidths[size]?[text] ?? measureLabel(text, at: size)
+    nonisolated static func labelWidth(_ text: String, at size: DynamicTypeSize, isBold: Bool = false) -> CGFloat {
+        let setting = LabelSetting(size: min(size, NotebookToolbarComposition.textSizeLimit), isBold: isBold)
+        return measuredLabelWidths[setting]?[text] ?? measureLabel(text, in: setting)
     }
 
-    /// Every short title at every text size the rail is set at, measured once, as the rail's
+    /// A text size and whether Bold Text is on: everything a label's width depends on.
+    private struct LabelSetting: Hashable {
+        let size: DynamicTypeSize
+        let isBold: Bool
+    }
+
+    /// Every short title in every setting the rail is laid out in, measured once, as the rail's
     /// width rule asks for them on each layout.
-    nonisolated private static let measuredLabelWidths: [DynamicTypeSize: [String: CGFloat]] = {
+    nonisolated private static let measuredLabelWidths: [LabelSetting: [String: CGFloat]] = {
         let titles = EditorInkCatalog.presets.map(shortTitle)
-        let sizes = DynamicTypeSize.allCases.filter { $0 <= NotebookToolbarComposition.textSizeLimit }
-        return Dictionary(uniqueKeysWithValues: sizes.map { size in
-            (size, Dictionary(uniqueKeysWithValues: titles.map { ($0, measureLabel($0, at: size)) }))
+        let settings = DynamicTypeSize.allCases.filter { $0 <= NotebookToolbarComposition.textSizeLimit }
+            .flatMap { size in [false, true].map { LabelSetting(size: size, isBold: $0) } }
+        return Dictionary(uniqueKeysWithValues: settings.map { setting in
+            (setting, Dictionary(uniqueKeysWithValues: titles.map { ($0, measureLabel($0, in: setting)) }))
         })
     }()
 
-    /// The face takes its text style's size at the text size, as SwiftUI sets it.
-    nonisolated private static func measureLabel(_ text: String, at size: DynamicTypeSize) -> CGFloat {
-        let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
+    /// The face takes its text style's size at the text size, as SwiftUI sets it. Bold Text sets
+    /// its medium weight in bold.
+    nonisolated private static func measureLabel(_ text: String, in setting: LabelSetting) -> CGFloat {
+        let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(setting.size))
         let style = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits)
-        let font = UIFont.systemFont(ofSize: style.pointSize, weight: .medium)
+        let font = UIFont.systemFont(ofSize: style.pointSize, weight: setting.isBold ? .bold : .medium)
         return (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
     }
 
@@ -1146,7 +1178,8 @@ struct NotebookPresetChip: View {
     let isSelected: Bool
     let action: () -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.legibilityWeight) private var legibilityWeight
+    @Environment(\.notebookKeysShowSelection) private var showsSelection
 
     var body: some View {
         let title = Self.shortTitle(for: preset)
@@ -1168,7 +1201,10 @@ struct NotebookPresetChip: View {
                     .dynamicTypeSize(...NotebookToolbarComposition.textSizeLimit)
                     .lineLimit(1)
                     .fixedSize()
-                    .frame(width: Self.labelWidth(title, at: dynamicTypeSize), height: NotebookTheme.presetChipHeight)
+                    .frame(
+                        width: Self.labelWidth(title, at: dynamicTypeSize, isBold: legibilityWeight == .bold),
+                        height: NotebookTheme.presetChipHeight
+                    )
                     .overlay(alignment: .bottom) {
                         if isSelected {
                             Capsule()
@@ -1184,7 +1220,7 @@ struct NotebookPresetChip: View {
             .background {
                 // Outlined wherever the key draws no well, so a selected chip keeps its capsule
                 // while writing is paused.
-                if !(isSelected && isEnabled) {
+                if !(isSelected && showsSelection) {
                     Capsule().strokeBorder(NotebookTheme.panelLowerEdge.color, lineWidth: NotebookTheme.shellBorderWidth)
                 }
             }
@@ -1194,6 +1230,7 @@ struct NotebookPresetChip: View {
         .buttonStyle(NotebookKeyStyle(isSelected: isSelected, shape: .capsule))
         .help(preset.name)
         .accessibilityLabel("\(preset.name) preset")
+        .accessibilityInputLabels(Self.inputLabels(for: preset))
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityShowsLargeContentViewer {
             Label(preset.name, systemImage: "circle.fill")
@@ -1368,7 +1405,9 @@ private struct NotebookCustomColorWell: View {
         .onChange(of: isPicking) { _, picking in
             if !picking { pick.finish(with: actions) }
         }
-        .onChange(of: store.isToolbarAvailable) { _, available in
+        .notebookToolbarPresentation(isPicking, store: store)
+        // Every change arrives, however many fall within one frame, so a pause always closes it.
+        .onReceive(store.$isToolbarAvailable) { available in
             if !available { isPicking = false }
         }
     }

@@ -151,7 +151,7 @@ final class NotebookWritingStatusTests: XCTestCase {
     }
 
     func testSavingCaptionWaitsForDelayAndCancelledEpisodeCannotReturn() async throws {
-        let clock = WritingFeedbackClock()
+        let clock = NotebookTestClock()
         do {
             let model = NotebookSavePresentationModel(delay: { await clock.wait($0) })
             let saved = NotebookSaveStatus.saved(Date(timeIntervalSince1970: 100))
@@ -238,7 +238,7 @@ final class NotebookWritingStatusTests: XCTestCase {
     }
 
     func testSuccessExpiryCannotClearNewerFailureAndDoesNotRebuildCanvas() async throws {
-        let clock = WritingFeedbackClock()
+        let clock = NotebookTestClock()
         do {
             let (session, probe, root) = try await makeSession(
                 failure: .storageFull, feedbackDelay: { await clock.wait($0) }
@@ -299,7 +299,7 @@ final class NotebookWritingStatusTests: XCTestCase {
     }
 
     func testReopenInvalidatesPreviousFeedbackExpiryAndClearsFailure() async throws {
-        let clock = WritingFeedbackClock()
+        let clock = NotebookTestClock()
         do {
             let (session, probe, root) = try await makeSession(
                 failure: .storageFull, feedbackDelay: { await clock.wait($0) }
@@ -941,7 +941,7 @@ final class NotebookWritingStatusTests: XCTestCase {
     }
 
     private func waitForRequest(
-        _ clock: WritingFeedbackClock, duration: Duration, excluding: Set<UUID> = []
+        _ clock: NotebookTestClock, duration: Duration, excluding: Set<UUID> = []
     ) async throws -> UUID {
         do {
             return try await NotebookTestFixtures.waitForValue {
@@ -1017,35 +1017,6 @@ private final class WritingCanvasControlsProbe {
             applyPageCount: { [weak self] in self?.appliedPageCounts.append($0) },
             currentAvailability: { [weak self] in self?.availability ?? .unavailable }
         )
-    }
-}
-
-private actor WritingFeedbackClock {
-    private struct Request {
-        let duration: Duration
-        let continuation: CheckedContinuation<Void, Never>
-    }
-
-    private var pending: [UUID: Request] = [:]
-
-    func wait(_ duration: Duration) async {
-        await withCheckedContinuation {
-            pending[UUID()] = Request(duration: duration, continuation: $0)
-        }
-    }
-
-    func requests(for duration: Duration) -> [UUID] {
-        pending.filter { $0.value.duration == duration }.map(\.key)
-    }
-
-    func release(_ id: UUID) {
-        pending.removeValue(forKey: id)?.continuation.resume()
-    }
-
-    func releaseAll() {
-        let requests = Array(pending.values)
-        pending.removeAll()
-        requests.forEach { $0.continuation.resume() }
     }
 }
 

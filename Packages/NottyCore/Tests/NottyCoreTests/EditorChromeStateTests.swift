@@ -124,7 +124,8 @@ final class EditorChromeStateTests: XCTestCase {
         XCTAssertFalse(state.userScrolled(by: -300, isAtTop: false), "already shown")
     }
 
-    /// The spec's Reduce Motion rows fade the header out after 28 pt down and in after 28 pt up.
+    /// Under Reduce Motion the header fades out after 28 pt down and back in after 28 pt up, the same
+    /// distances that hide and reveal it otherwise.
     func testBothThresholdsAreTwentyEightPoints() {
         XCTAssertEqual(EditorChromeState.hideTravel, 28)
         XCTAssertEqual(EditorChromeState.revealTravel, 28)
@@ -205,6 +206,27 @@ final class EditorChromeStateTests: XCTestCase {
         XCTAssertEqual(forced.headerTravel, 0, "a pin keeps the header in place")
     }
 
+    /// A pin holds a following header in place, so once the pins clear the header follows the
+    /// page again from there rather than from the travel counted before or under them.
+    func testPinsRestartTheTravelOfAFollowingHeader() {
+        var state = EditorChromeState()
+        state.userScrolled(by: 15, isAtTop: false)
+        XCTAssertEqual(state.headerTravel, 15)
+        state.setPins([.presentation])
+        XCTAssertEqual(state.headerTravel, 0)
+        state.userScrolled(by: 5, isAtTop: false)
+        state.setPins([.presentation, .dragging])
+        XCTAssertFalse(state.setPins([]))
+        XCTAssertEqual(state.headerTravel, 0, "neither the 15 before the pin nor the 5 under it")
+        state.userScrolled(by: 1, isAtTop: false)
+        XCTAssertEqual(state.headerTravel, 1)
+
+        state.setPins([.saveProblem])
+        state.userScrolled(by: hide, isAtTop: false)
+        XCTAssertTrue(state.setPins([]), "scrolling far enough under a pin still hides once it clears")
+        assertShows(state, header: false, tools: false, handle: true)
+    }
+
     /// The bounce back from a pull past the top is not reading on, so a header following the
     /// page stays where it is.
     func testSettlingBackAtTheTopNeverMovesAFollowingHeader() {
@@ -227,17 +249,52 @@ final class EditorChromeStateTests: XCTestCase {
         assertShows(state, header: false, tools: false, handle: true)
     }
 
-    func testAFreshlyOpenedNotebookIsAlreadyAtTheTop() {
+    /// A notebook opens below the top of its scroll range, under the header and toolbar, so
+    /// reaching the top from there is an arrival.
+    func testAPageThatOpensBelowItsTopRevealsOnArrivingThere() {
         var state = EditorChromeState()
+        state.pageMoved(isAtTop: false)
         state.toolEnded()
-        XCTAssertFalse(state.userScrolled(by: -1, isAtTop: true))
-        assertShows(state, header: false, tools: false, handle: true)
+        XCTAssertTrue(state.userScrolled(by: -1, isAtTop: true))
+        assertShows(state, header: true, tools: true, handle: false)
     }
 
-    func testAScrollToTopIsReportedAsItsArrival() {
-        var state = scrolledDown(in: .overlay)
-        XCTAssertTrue(state.userScrolled(by: 0, isAtTop: true))
-        assertShows(state, header: true, tools: true, handle: false)
+    /// Layout that leaves the page at its top is no arrival, and one that moves it away from the
+    /// top makes the next return there one.
+    func testAMovedPageCountsArrivalsFromWhereItWasLeft() {
+        var atTop = scrolledDown(in: .focus)
+        atTop.pageMoved(isAtTop: true)
+        XCTAssertFalse(atTop.userScrolled(by: -1, isAtTop: true))
+        assertShows(atTop, header: false, tools: false, handle: true)
+
+        var below = EditorChromeState()
+        below.toolEnded()
+        below.pageMoved(isAtTop: false)
+        assertShows(below, header: false, tools: false, handle: true, "moving the page changes nothing by itself")
+        XCTAssertTrue(below.userScrolled(by: -1, isAtTop: true))
+    }
+
+    func testAScrollToTopRevealsWhereverThePageRested() {
+        var scrolled = scrolledDown(in: .overlay)
+        XCTAssertTrue(scrolled.scrolledToTop())
+        assertShows(scrolled, header: true, tools: true, handle: false)
+
+        // The state still takes the page to rest at the top, as nothing has reported otherwise.
+        var unreported = EditorChromeState()
+        unreported.toolEnded()
+        XCTAssertTrue(unreported.scrolledToTop())
+        assertShows(unreported, header: true, tools: true, handle: false)
+
+        XCTAssertTrue(unreported.toolEnded())
+        XCTAssertFalse(unreported.userScrolled(by: -1, isAtTop: true), "the page now rests at the top")
+        XCTAssertTrue(unreported.scrolledToTop(), "every tap is its own request")
+    }
+
+    func testAScrollToTopDuringAStrokeIsIgnored() {
+        var state = scrolledDown(in: .focus)
+        state.toolBegan()
+        XCTAssertFalse(state.scrolledToTop())
+        assertShows(state, header: false, tools: false, handle: true)
     }
 
     func testPullingDownAtTheTopRevealsLikeAnyUpwardScroll() {

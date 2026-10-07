@@ -190,15 +190,18 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         try await assertLightPaper(hosting, card: NotebookTheme.statusCardMaxWidth, primaryKey: true)
     }
 
-    /// The banner shown when a new notebook could not be selected is a light card at the top of
-    /// the screen, inset from the safe area, whatever the window's appearance. Its dismiss key
-    /// clears the notice and leaves the open notebook as it was.
-    func testSelectionFailureBannerIsALightCardInADarkWindow() async throws {
+    /// The banner shown when a new notebook could not be selected is a light card centred at the
+    /// bottom of the screen, 12 points above the room kept for the end-of-paper tab, whatever the
+    /// window's appearance. Over the notebook opened again it touches neither the header nor the
+    /// "Add page" tab, and its dismiss key clears the notice and leaves the open notebook as it was.
+    func testSelectionFailureBannerIsALightCardClearOfTheHeaderAndTheEndOfPaperTab() async throws {
         let fixture = try LibraryFixture(selectionFailure: true)
         defer { fixture.remove() }
         let oldID = NotebookSession.defaultNotebookID
         _ = try await fixture.seed(oldID)
-        try Data("damaged".utf8).write(to: fixture.noteURL(oldID).appendingPathComponent("HEAD.json"))
+        let head = fixture.noteURL(oldID).appendingPathComponent("HEAD.json")
+        let intact = try Data(contentsOf: head)
+        try Data("damaged".utf8).write(to: head)
         let model = NotebookLibraryModel(openLibrary: { fixture.library })
         await model.load()
         let session = try selectedSession(model)
@@ -224,31 +227,23 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         XCTAssertNotNil(model.creationFailure)
         let view = try XCTUnwrap(hosting.view)
         try await NotebookTestFixtures.waitUntil { view.traitCollection.userInterfaceStyle == .light }
-        view.layoutIfNeeded()
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
-            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
-        }
-        let pixels = try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 1)
+        let pixels = try render(view)
         let paper = components(of: NotebookTheme.paperIvory.uiColor).map { Int(($0 * 255).rounded()) }
-        // Down the middle of the banner's top half, from the safe area to the bleed below it.
-        let top = view.safeAreaInsets.top
-        let rows = (Int(top)..<Int(top) + 80).map {
-            pixels.rgba(at: CGPoint(x: view.bounds.midX + 60, y: CGFloat($0))).map(Int.init)
+        let lift = NotebookTheme.endScrollMinimum + NotebookTheme.sectionSpacing
+        // Up the middle of the banner, from the safe area through the banner.
+        let bottom = view.bounds.height - view.safeAreaInsets.bottom
+        let rows = (1...Int(lift) + 80).map {
+            pixels.rgba(at: CGPoint(x: view.bounds.midX + 60, y: bottom - CGFloat($0))).map(Int.init)
         }
-        let firstShell = rows.firstIndex { pixel in
-            luminance(pixel) > 0.7 && zip(pixel, paper).contains { abs($0 - $1) > 4 }
-        }
-        let inset = try XCTUnwrap(firstShell, "A light card lies at the top.")
-        XCTAssertEqual(
-            CGFloat(inset), NotebookTheme.sectionSpacing, accuracy: 3, "The banner sits 12 points below the safe area."
-        )
+        // Paper up to the shadow the card casts; the card's lower edge is darker than that shadow.
+        let shadow = try XCTUnwrap(rows.firstIndex { zip($0, paper).contains { abs($0 - $1) > 4 } }, "A card lies at the bottom.")
+        let inset = try XCTUnwrap((shadow..<min(shadow + 20, rows.count)).min { luminance(rows[$0]) < luminance(rows[$1]) })
+        XCTAssertEqual(CGFloat(inset), lift, accuracy: 3, "The banner sits 12 points above the end-of-paper room.")
         let light = rows[inset...].prefix(30).filter { luminance($0) > 0.7 }
         XCTAssertGreaterThan(light.count, 20, "The banner is light: \(rows[inset])")
 
-        // The dismiss key's glyph sits at the banner's trailing end, on a row inside its top padding.
-        let edgeRow = top + CGFloat(inset) + 3
+        // The dismiss key's glyph sits at the banner's trailing end, on a row inside its bottom padding.
+        let edgeRow = bottom - CGFloat(inset) - 3
         let maximumHalfWidth = NotebookTheme.statusCardMaxWidth / 2
         let trailing = try XCTUnwrap(
             stride(from: view.bounds.midX + maximumHalfWidth, to: view.bounds.midX, by: -1).first { x in
@@ -259,13 +254,51 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         )
         let key = NotebookTheme.controlSize
         let glyph = (Int(trailing - key * 3 / 4)..<Int(trailing - key / 4)).flatMap { x in
-            (Int(top) + inset..<Int(top) + inset + 60).map { pixels.rgba(at: CGPoint(x: x, y: $0)).map(Int.init) }
+            (Int(bottom) - inset - 60..<Int(bottom) - inset).map { pixels.rgba(at: CGPoint(x: x, y: $0)).map(Int.init) }
         }
         XCTAssertGreaterThan(glyph.filter { luminance($0) < 0.3 }.count, 5, "The banner has a dismiss key.")
 
+        // Opened again, the notebook shows its header and, at the end of the paper, its tab.
+        try intact.write(to: head)
+        await session.load()
+        var controller: NotebookViewController?
+        var header: NotebookHeaderHostController?
+        try await NotebookTestFixtures.waitUntil {
+            controller = NotebookTestFixtures.notebookController(in: hosting)
+            header = NotebookHeaderTests.headerHost(in: hosting)
+            // Once the history check is done, its readout no longer spins.
+            guard case .verified = session.integrityModel.state else { return false }
+            return session.loadState == .ready && controller?.isCanvasVisible == true
+                && header?.headerView.bounds.width ?? 0 > 0
+        }
+        let canvas = try XCTUnwrap(controller).canvasView
+        let tab = try XCTUnwrap(controller).endOfPaperTab
+        let end = canvas.contentSize.height - canvas.bounds.height + canvas.contentInset.bottom
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: end), animated: false)
+        view.layoutIfNeeded()
+        XCTAssertFalse(tab.isHidden, "The tab shows below the last page.")
+        XCTAssertNotNil(model.creationFailure, "The banner stays over the notebook opened again.")
+        let covered = try render(view)
         model.dismissCreationFailure()
         XCTAssertNil(model.creationFailure, "The dismiss key clears the notice.")
         XCTAssertTrue(try selectedSession(model) === session, "The open notebook stays.")
+        let uncovered = try render(view)
+
+        // The banner and its shadow are all the dismissal changes.
+        var banner = CGRect.null
+        for y in stride(from: CGFloat(0.5), to: view.bounds.height, by: 2) {
+            for x in stride(from: CGFloat(0.5), to: view.bounds.width, by: 2) {
+                let point = CGPoint(x: x, y: y)
+                if covered.rgba(at: point) != uncovered.rgba(at: point) {
+                    banner = banner.union(CGRect(origin: point, size: .zero))
+                }
+            }
+        }
+        XCTAssertFalse(banner.isNull, "The banner lies over the notebook.")
+        XCTAssertEqual(banner.midX, view.bounds.midX, accuracy: 3, "The banner is centred.")
+        let headerFrame = try XCTUnwrap(header).view.convert(try XCTUnwrap(header).view.bounds, to: view)
+        XCTAssertGreaterThan(banner.minY, headerFrame.maxY, "The banner is clear of the header.")
+        XCTAssertLessThan(banner.maxY, tab.convert(tab.bounds, to: view).minY, "The banner is clear of the tab.")
     }
 
     func testExistingLegacyNoteIsOpenedWithoutCreatingAnotherNotebook() async throws {
@@ -481,13 +514,7 @@ final class NotebookLibrarySelectionTests: XCTestCase {
             hosting.traitCollection.userInterfaceStyle == .light
         }
         let view = try XCTUnwrap(hosting.view)
-        view.layoutIfNeeded()
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
-            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
-        }
-        let pixels = try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 1)
+        let pixels = try render(view)
         let paper = components(of: NotebookTheme.paperIvory.uiColor).map { Int(($0 * 255).rounded()) }
         for point in [CGPoint(x: 4, y: 4), CGPoint(x: view.bounds.maxX - 4, y: view.bounds.maxY - 4)] {
             let rendered = pixels.rgba(at: point).map(Int.init)
@@ -512,6 +539,17 @@ final class NotebookLibrarySelectionTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(
             longest, Int(NotebookTheme.actionKeyHeight) - 4, "The primary action is a dark key.", file: file, line: line
         )
+    }
+
+    /// The view as drawn on screen, at one pixel per point.
+    private func render(_ view: UIView) throws -> RenderedPixels {
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        return try RenderedPixels(try XCTUnwrap(image.cgImage), scale: 1)
     }
 
     private func luminance(_ pixel: [Int]) -> Double {

@@ -1,6 +1,7 @@
 import NottyCore
 import PencilKit
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 enum NotebookInputGate: Sendable, Equatable {
     case open
@@ -84,6 +85,8 @@ final class NotebookViewController: UIViewController {
     private(set) lazy var statusVeil = NotebookStatusVeil(accessibility: paperView.accessibility)
     /// The "Add page" tab on the stone below the last page.
     let endOfPaperTab = NotebookEndOfPaperTab()
+    /// Hears the last finger leave the page, which ends a scroll the user stopped with a tap.
+    let fingerLiftObserver = NotebookFingerLiftObserver()
     /// Adds a page at the end of the notebook. Only a canvas given this shows the end-of-paper
     /// tab and keeps room below the last page for it.
     var onAddPage: (() -> Void)? {
@@ -176,6 +179,8 @@ final class NotebookViewController: UIViewController {
             pencilInteraction = interaction
         }
 
+        fingerLiftObserver.onLift = { [weak self] in self?.fingersLifted() }
+        canvas.addGestureRecognizer(fingerLiftObserver)
         view.addSubview(paperView)
         view.addSubview(canvas)
         endOfPaperTab.addTarget(self, action: #selector(addPage), for: .touchUpInside)
@@ -223,34 +228,34 @@ final class NotebookViewController: UIViewController {
             y: (canvas.contentOffset.y + previousViewportSize.height / 2) / oldScale
         )
 
-        isAdjustingLayout = true
-        paperView.frame = view.bounds
-        canvas.frame = view.bounds
-        let fitScale = newSize.width / logicalWidth
-        let maximumScale = max(3, fitScale * 4)
-        canvas.maximumZoomScale = maximumScale
-        let minimumScale = min(fitScale * 0.5, newSize.height / CGFloat(geometry.pageHeight))
-        canvas.minimumZoomScale = minimumScale
-        let requestedScale = wasWidthFitted ? fitScale : oldScale
-        let scale = min(max(requestedScale, minimumScale), maximumScale)
-        canvas.setZoomScale(scale, animated: false)
-        updateContentExtent()
-        updateInsets()
+        adjustingLayout {
+            paperView.frame = view.bounds
+            canvas.frame = view.bounds
+            let fitScale = newSize.width / logicalWidth
+            let maximumScale = max(3, fitScale * 4)
+            canvas.maximumZoomScale = maximumScale
+            let minimumScale = min(fitScale * 0.5, newSize.height / CGFloat(geometry.pageHeight))
+            canvas.minimumZoomScale = minimumScale
+            let requestedScale = wasWidthFitted ? fitScale : oldScale
+            let scale = min(max(requestedScale, minimumScale), maximumScale)
+            canvas.setZoomScale(scale, animated: false)
+            updateContentExtent()
+            updateInsets()
 
-        let proposedOffset: CGPoint
-        if hadViewport {
-            // Preserve the leading scroll edge across a resize; elsewhere keep the page centre.
-            proposedOffset = CGPoint(
-                x: logicalCenter.x * scale - newSize.width / 2,
-                y: restsAtTop ? -canvas.contentInset.top : logicalCenter.y * scale - newSize.height / 2
-            )
-        } else {
-            proposedOffset = CGPoint(x: -canvas.contentInset.left, y: 0)
+            let proposedOffset: CGPoint
+            if hadViewport {
+                // Preserve the leading scroll edge across a resize; elsewhere keep the page centre.
+                proposedOffset = CGPoint(
+                    x: logicalCenter.x * scale - newSize.width / 2,
+                    y: restsAtTop ? -canvas.contentInset.top : logicalCenter.y * scale - newSize.height / 2
+                )
+            } else {
+                proposedOffset = CGPoint(x: -canvas.contentInset.left, y: 0)
+            }
+            canvas.setContentOffset(clampedOffset(proposedOffset), animated: false)
+            previousViewportSize = newSize
+            resizeCapture = hadViewport ? capture : nil
         }
-        canvas.setContentOffset(clampedOffset(proposedOffset), animated: false)
-        previousViewportSize = newSize
-        resizeCapture = hadViewport ? capture : nil
-        isAdjustingLayout = false
         finishResizeIfSettled()
         updatePaperViewport()
         paperView.finishZoom()
@@ -304,7 +309,6 @@ final class NotebookViewController: UIViewController {
         toolStore = store
         store.attach(self)
         observesToolStore = true
-        store.setToolActive(canvas.hasActiveTool, for: self)
         applyTool(store.tool)
         updateInsets()
     }
@@ -433,16 +437,10 @@ final class NotebookViewController: UIViewController {
     private func resetActiveTool() {
         toolBeginSignature = nil
         toolBeginGeneration = nil
-        setToolActive(false)
+        canvas.hasActiveTool = false
         if let pendingTool { applyTool(pendingTool) }
         releaseHeldInsets()
         publishUndoAvailability()
-    }
-
-    /// The store is scene-wide, so only its owner's tool use is mirrored there.
-    private func setToolActive(_ active: Bool) {
-        canvas.hasActiveTool = active
-        if ownsToolStore { toolStore?.setToolActive(active, for: self) }
     }
 
     private func observeDrawing(signature: InkDrawingSignature? = nil) {
@@ -492,10 +490,10 @@ final class NotebookViewController: UIViewController {
         guard isViewLoaded else { return }
         let offset = canvas.contentOffset
         updatePaperGeometry()
-        isAdjustingLayout = true
-        updateContentExtent()
-        canvas.setContentOffset(offset, animated: false)
-        isAdjustingLayout = false
+        adjustingLayout {
+            updateContentExtent()
+            canvas.setContentOffset(offset, animated: false)
+        }
         updatePaperViewport()
     }
 
@@ -706,7 +704,7 @@ final class NotebookViewController: UIViewController {
     private func updateInsets(followingResize: Bool = false) {
         guard isViewLoaded, canvas.bounds.width > 0 else { return }
         let obstruction = toolbarObstruction
-        var top = max(chrome.top, 0) + max(obstruction.top, 0)
+        var top = max(max(chrome.top, 0) + max(obstruction.top, 0), chrome.coveredTop)
         // The end-of-paper tab needs room below the last page, clear of the home indicator.
         let chromeBottom = showsEndOfPaperTab
             ? max(chrome.bottom, view.safeAreaInsets.bottom, 0) + NotebookTheme.endScrollMinimum
@@ -720,17 +718,36 @@ final class NotebookViewController: UIViewController {
         }
         let horizontalInset = max((canvas.bounds.width - logicalWidth * canvas.zoomScale) / 2, 0)
         let insets = UIEdgeInsets(top: top, left: horizontalInset, bottom: bottom, right: horizontalInset)
-        if canvas.contentInset != insets {
-            canvas.contentInset = insets
-        }
         let indicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
-        if canvas.verticalScrollIndicatorInsets != indicatorInsets {
-            canvas.verticalScrollIndicatorInsets = indicatorInsets
+        let offset = canvas.contentOffset
+        let isNested = isAdjustingLayout
+        adjustingLayout {
+            if canvas.contentInset != insets {
+                canvas.contentInset = insets
+            }
+            if canvas.verticalScrollIndicatorInsets != indicatorInsets {
+                canvas.verticalScrollIndicatorInsets = indicatorInsets
+            }
+            if followingResize, let resizeCapture, resizeCapture.isConfirmed, resizeCapture.restedAtRevealedTop,
+               !canvas.hasActiveTool, !isAtTopOfPaper {
+                canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -top), animated: false)
+            }
         }
-        if followingResize, let resizeCapture, resizeCapture.isConfirmed, resizeCapture.restedAtRevealedTop,
-           !canvas.hasActiveTool, !isAtTopOfPaper {
-            canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -top), animated: false)
-        }
+        // The writes' own scroll events were ignored, so the paper catches up with a moved page here.
+        if !isNested, canvas.contentOffset != offset { updatePaperViewport() }
+    }
+
+    /// Makes inset, offset and zoom writes layout rather than scrolling. The scroll events they
+    /// cause move neither the paper nor the writing view, and the caller may be inside a SwiftUI
+    /// update, where the writing view must not publish. Once the outermost adjustment ends, the
+    /// writing view carries on a user scroll from wherever layout left the page.
+    private func adjustingLayout(_ changes: () -> Void) {
+        let isNested = isAdjustingLayout
+        isAdjustingLayout = true
+        changes()
+        isAdjustingLayout = isNested
+        guard !isNested else { return }
+        writingChrome?.layoutMovedPage(in: canvas)
     }
 
     /// True while the top of the first page sits at the top of the scrollable range.
@@ -757,7 +774,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         toolBeginGeneration = observedGeneration
         toolBeginSignature = try? InkDrawingSignature(canvas.drawing)
         if let toolBeginSignature { observationWork.add(toolBeginSignature.constructionWork) }
-        setToolActive(true)
+        canvas.hasActiveTool = true
         writingChrome?.toolBegan()
         publishUndoAvailability()
     }
@@ -773,7 +790,7 @@ extension NotebookViewController: PKCanvasViewDelegate {
         let beginGeneration = toolBeginGeneration
         toolBeginSignature = nil
         toolBeginGeneration = nil
-        setToolActive(false)
+        canvas.hasActiveTool = false
         writingChrome?.toolEnded()
         if let pendingTool { applyTool(pendingTool) }
         releaseHeldInsets()
@@ -821,16 +838,22 @@ extension NotebookViewController: PKCanvasViewDelegate {
         writingChrome?.userScrollEnded()
     }
 
+    /// A drag still under way, or the deceleration it started, reports its own end.
+    private func fingersLifted() {
+        guard !canvas.isDragging, !canvas.isDecelerating else { return }
+        writingChrome?.fingersLifted()
+    }
+
     func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
         writingChrome?.scrolledToTop()
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         guard !isAdjustingLayout else { return }
-        isAdjustingLayout = true
-        updateContentExtent()
-        updateInsets()
-        isAdjustingLayout = false
+        adjustingLayout {
+            updateContentExtent()
+            updateInsets()
+        }
         updatePaperViewport()
     }
 }
@@ -872,6 +895,52 @@ extension EditorPencilTapPreference {
         case .runSystemShortcut: self = .runSystemShortcut
         @unknown default: self = .ignore
         }
+    }
+}
+
+/// Reports each time the last finger leaves the canvas. It never recognises, so it takes nothing
+/// from scrolling, zooming or drawing, and it sees fingers only, never Apple Pencil.
+@MainActor
+final class NotebookFingerLiftObserver: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    var onLift: (() -> Void)?
+    private var fingers = 0
+
+    init() {
+        super.init(target: nil, action: nil)
+        cancelsTouchesInView = false
+        delaysTouchesEnded = false
+        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        delegate = self
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        fingers += touches.count
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        lift(touches)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        lift(touches)
+    }
+
+    override func reset() {
+        super.reset()
+        fingers = 0
+    }
+
+    private func lift(_ touches: Set<UITouch>) {
+        fingers -= touches.count
+        guard fingers <= 0 else { return }
+        state = .failed
+        onLift?()
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }
 

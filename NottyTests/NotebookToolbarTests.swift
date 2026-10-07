@@ -122,20 +122,18 @@ final class NotebookToolbarTests: XCTestCase {
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == true }
         store.setToolbarAvailable(false, for: owner)
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == false }
-        // A gate does not reopen within the frame that closed it, and SwiftUI treats change
-        // handlers that run twice in one frame as an update loop.
-        await DisplayFrames.next()
         store.setToolbarAvailable(true, for: owner)
         try await NotebookTestFixtures.waitUntil { probe.isEnabled == true }
     }
 
-    /// A hiding rail's keys stay live while it fades, so they never redraw in the disabled tone
-    /// mid-fade, and leave keyboard focus once it has gone.
-    func testRailKeysLeaveKeyboardFocusOnlyOnceTheRailHasFadedOut() async throws {
-        for (hiddenAmount, isEnabled) in [(0.0, true), (0.5, true), (0.999, true), (1.0, false)] {
+    /// A hiding rail's keys leave keyboard focus as the hide begins, between strokes, rather than
+    /// when the fade ends, and are live again from the first frame of a reveal.
+    func testRailKeysLeaveKeyboardFocusAsTheHideBegins() async throws {
+        for (hiddenAmount, isHidden) in [(0.0, false), (0.0, true), (0.5, true), (1.0, true), (0.5, false)] {
             let probe = EnabledProbe()
             let hosting = AppearanceTrackingHostingController(
-                rootView: EnabledProbeView(probe: probe).modifier(NotebookRailFade(hiddenAmount: hiddenAmount, offset: -8))
+                rootView: EnabledProbeView(probe: probe)
+                    .modifier(NotebookRailFade(hiddenAmount: hiddenAmount, offset: -8, isHidden: isHidden))
             )
             let window = try NotebookTestFixtures.window(showing: hosting, width: 200)
             defer {
@@ -144,8 +142,38 @@ final class NotebookToolbarTests: XCTestCase {
             }
             try await NotebookTestFixtures.waitUntilAppeared(hosting)
             try await NotebookTestFixtures.waitUntil { probe.isEnabled != nil }
-            XCTAssertEqual(probe.isEnabled, isEnabled, "\(hiddenAmount) of the way hidden")
+            XCTAssertEqual(probe.isEnabled, !isHidden, "\(hiddenAmount) of the way, heading \(isHidden ? "out" : "in")")
         }
+    }
+
+    /// Disabled as the hide begins, the keys still fade out as they were: no key is drawn again in
+    /// the disabled tone or without its selection, so the fade does no work beyond its opacity.
+    func testAHidingRailsKeysFadeOutUnchanged() throws {
+        let placeholder = try XCTUnwrap(NotebookUpcomingFeature.placed(.toolStrip).first)
+        let keys = HStack(spacing: 0) {
+            Button {} label: { NotebookToolGlyph(symbol: "pencil.tip", isSelected: true) }
+                .buttonStyle(NotebookKeyStyle(isSelected: true))
+            Button {} label: { NotebookToolGlyph(symbol: "lasso", isSelected: false) }
+                .buttonStyle(NotebookKeyStyle())
+            NotebookPresetChip(preset: EditorInkCatalog.presets[0], isSelected: true) {}
+            NotebookUpcomingToolButton(feature: placeholder)
+        }
+        func drawn(isHidden: Bool) throws -> RenderedPixels {
+            try RenderedPixels(rendering: keys.modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: isHidden)))
+        }
+        let shown = try drawn(isHidden: false)
+        XCTAssertTrue(try drawn(isHidden: true).rgba == shown.rgba, "A hiding rail's keys look as they did.")
+        XCTAssertFalse(
+            try RenderedPixels(rendering: keys.disabled(true)).rgba == shown.rgba,
+            "Disabled for any other reason, the same keys change their look."
+        )
+
+        // A paused rail keeps its paused look while it hides.
+        func paused(isHidden: Bool) throws -> RenderedPixels {
+            try RenderedPixels(rendering: keys.disabled(true).environment(\.notebookKeysPaused, true)
+                .modifier(NotebookRailFade(hiddenAmount: 0, offset: -8, isHidden: isHidden)))
+        }
+        XCTAssertTrue(try paused(isHidden: true).rgba == paused(isHidden: false).rgba)
     }
 
     func testUnavailableInkPanelDrawsEveryControlDisabled() throws {
@@ -182,7 +210,10 @@ final class NotebookToolbarTests: XCTestCase {
         let session = NotebookToolbarDragSession()
         for step in 1...5 {
             let fraction = CGFloat(step) / 5
-            session.move(to: CGSize(width: release.width * fraction, height: release.height * fraction), resolver: resolver)
+            session.move(
+                to: CGSize(width: release.width * fraction, height: release.height * fraction), resolver: resolver,
+                actions: actions
+            )
             XCTAssertTrue(session.isActive)
             XCTAssertEqual(store.toolbar.placement, .floating(CGPoint(x: 0.5, y: 0.5)))
         }
@@ -208,7 +239,7 @@ final class NotebookToolbarTests: XCTestCase {
         let resolver = NotebookToolbarDragResolver(placement: .docked(.topCenter), size: size, usable: usable)
         let session = NotebookToolbarDragSession()
         let translation = CGSize(width: 900, height: 1_200)
-        session.move(to: translation, resolver: resolver)
+        session.move(to: translation, resolver: resolver, actions: actions)
         let preview = try XCTUnwrap(session.previewFrame)
         XCTAssertTrue(usable.contains(preview), "The dragged toolbar stays inside the canvas area.")
         XCTAssertNil(session.targetedDock)
@@ -232,7 +263,7 @@ final class NotebookToolbarTests: XCTestCase {
             usable: CGRect(x: 0, y: 0, width: 900, height: 700)
         )
         let session = NotebookToolbarDragSession()
-        session.move(to: CGSize(width: 0, height: 300), resolver: resolver)
+        session.move(to: CGSize(width: 0, height: 300), resolver: resolver, actions: actions)
         session.cancel()
         XCTAssertFalse(session.isActive)
         XCTAssertNil(session.previewFrame)
@@ -240,7 +271,7 @@ final class NotebookToolbarTests: XCTestCase {
 
         store.detach(owner)
         XCTAssertFalse(actions.isEnabled)
-        session.move(to: CGSize(width: 0, height: 300), resolver: resolver)
+        session.move(to: CGSize(width: 0, height: 300), resolver: resolver, actions: actions)
         XCTAssertNil(session.end(at: CGSize(width: 0, height: 300), actions: actions))
         XCTAssertFalse(session.isActive)
         XCTAssertEqual(store.toolbar, .standard)
@@ -257,7 +288,7 @@ final class NotebookToolbarTests: XCTestCase {
         let resolver = NotebookToolbarDragResolver(placement: .docked(.topCenter), size: size, usable: usable)
         let translation = CGSize(width: 0, height: 400)
         let session = NotebookToolbarDragSession()
-        session.move(to: translation, resolver: resolver)
+        session.move(to: translation, resolver: resolver, actions: actions)
 
         // SwiftUI may reset the gesture state, which clears the preview, before it delivers onEnded.
         session.cancel()
@@ -271,7 +302,7 @@ final class NotebookToolbarTests: XCTestCase {
         let towardsLeading = CGSize(width: -180, height: 0)
         let recomputed = NotebookToolbarDragResolver(placement: .docked(.topTrailing), size: size, usable: usable)
         XCTAssertEqual(recomputed.placement(translation: towardsLeading), .docked(.topCenter))
-        session.move(to: towardsLeading, resolver: resolver)
+        session.move(to: towardsLeading, resolver: resolver, actions: actions)
         let docked = session.end(at: towardsLeading, resolver: recomputed, actions: actions)
         XCTAssertEqual(docked, .docked(.topLeading), "The resolver fixed at the start of the drag decides.")
         XCTAssertEqual(emissions.count, 2)
@@ -379,23 +410,36 @@ final class NotebookToolbarTests: XCTestCase {
         XCTAssertTrue(store.toolbar.isCollapsed, "A paused toolbar keeps its preferences.")
     }
 
-    func testStandInsOfferTheToolsFirstThenTheWritingViewsChoices() {
+    /// The stand-ins offer the tools back first, then each writing view, which the notebook shown in
+    /// the scene adopts and stores.
+    func testStandInsOfferTheToolsFirstThenEachWritingView() async throws {
         let (store, owner) = availableStore()
         defer { store.detach(owner) }
-        var chosen: [String] = []
-        let choices = ["Focus", "Pinned", "Always-on tools"].map { name in
-            NotebookToolsRevealAction(name: name) { chosen.append(name) }
-        }
-        let offered = NotebookToolsRevealAction.standInActions(for: store, animation: nil, adding: choices)
-        XCTAssertEqual(offered.map(\.name), ["Show tools and title", "Focus", "Pinned", "Always-on tools"])
+        let rig = try await NotebookChromeRig(store: store)
+        let offered = NotebookToolsRevealAction.standInActions(for: store, animation: nil)
+        XCTAssertEqual(offered.map(\.name), [
+            "Show tools and title", "Writing view: Focus", "Writing view: Pinned", "Writing view: Always-on tools",
+        ])
+        XCTAssertEqual(NotebookToolsRevealAction.showTools(from: store, animation: nil).name, offered[0].name)
 
-        store.setToolsHidden(true)
+        rig.chrome.toolBegan()
+        rig.chrome.toolEnded()
+        XCTAssertTrue(store.areToolsHidden)
         offered[0].perform()
         XCTAssertFalse(store.areToolsHidden, "The first action is the one every stand-in's tap performs.")
-        XCTAssertEqual(NotebookToolsRevealAction.showTools(from: store, animation: nil).name, offered[0].name)
+        XCTAssertTrue(rig.chrome.state.showsHeader)
+
         offered[2].perform()
+        XCTAssertEqual(rig.chrome.mode, .pinned)
+        XCTAssertEqual(store.toolbar.chromeMode, .pinned, "The choice is stored.")
+        offered[3].perform()
+        XCTAssertEqual(rig.chrome.mode, .overlay)
         offered[1].perform()
-        XCTAssertEqual(chosen, ["Pinned", "Focus"], "Each choice performs its own action.")
+        XCTAssertEqual(store.toolbar.chromeMode, .focus)
+
+        let bare = NotebookTestFixtures.toolStore()
+        NotebookToolsRevealAction.standInActions(for: bare, animation: nil)[2].perform()
+        XCTAssertEqual(bare.toolbar.chromeMode, .pinned, "Without a writing view the choice is stored alone.")
     }
 
     func testPencilRevealRequestExpandsTheMountedCollapsedToolbar() async throws {
@@ -502,6 +546,24 @@ final class NotebookToolbarTests: XCTestCase {
         fixture.store.handlePencil(.showContextualPalette, from: fixture.controller)
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertNil(fixture.hosting.presentedViewController, "A paused toolbar does not open its ink panel.")
+    }
+
+    /// Writing can pause, resume and pause again in quick succession. Every change reaches the
+    /// compact ink panel, so it closes and stays closed while writing is paused.
+    func testInkPanelClosesWhenWritingPausesAgainInQuickSuccession() async throws {
+        let fixture = try await NotebookTestFixtures.mountToolbarHost(horizontalSizeClass: .compact)
+        defer { fixture.close() }
+        fixture.store.handlePencil(.showContextualPalette, from: fixture.controller)
+        try await NotebookTestFixtures.waitUntil { fixture.hosting.presentedViewController != nil }
+        // Each change on a turn of its own, all within a frame or two.
+        for gate in [NotebookInputGate.failed, .open, .failed, .open, .failed] {
+            fixture.controller.setInputGate(gate)
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertFalse(fixture.store.isToolbarAvailable)
+        try await NotebookTestFixtures.waitUntil { fixture.hosting.presentedViewController == nil }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(fixture.hosting.presentedViewController, "The panel stays closed while writing is paused.")
     }
 
     func testMountedCollapsedToolbarShowsOnlyTheRevealHandle() async throws {
@@ -964,7 +1026,8 @@ final class NotebookToolbarTests: XCTestCase {
 
         for (label, row, width) in rows {
             let maximum = row.maximumOffset(containerWidth: width)
-            let scrollWidth = row.scrollWidth(containerWidth: width)
+            // The strip pads its content with the trailing room, so this is the width it scrolls through.
+            let scrollWidth = row.contentWidth + row.trailingRoom(containerWidth: width)
             XCTAssertEqual(scrollWidth - width, maximum, accuracy: 0.001, label)
             let end = NotebookStripOverflow(offset: maximum, contentWidth: scrollWidth, containerWidth: width)
             XCTAssertTrue(end.hidesLeading, label)
@@ -984,9 +1047,9 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Rail width rule
 
-    /// The rail at every regular-width window the spec measures, with 0, 2, 4 and 8 custom colours,
-    /// at the default text size and at the rail's xxLarge limit. Larger chips widen the ink row by
-    /// 47 points there, which is what moves the eleven-inch landscape rail apart from its limit.
+    /// The rail in the 11-inch and 12.9-inch iPads' regular-width windows, with 0, 2, 4 and 8 custom
+    /// colours, at the default text size and at the rail's xxLarge limit. Larger chips widen the ink
+    /// row by 47 points there, which is what moves the eleven-inch landscape rail apart from its limit.
     func testRailWidthFollowsTheDockAndPlannedToolRules() {
         struct Case {
             let width: CGFloat
@@ -1047,7 +1110,7 @@ final class NotebookToolbarTests: XCTestCase {
             XCTAssertEqual(rail.size.height, 2 * NotebookTheme.rowHeight + NotebookTheme.rowSpacing, label)
             XCTAssertEqual(rail.docksShared, test.docksShared, label)
             XCTAssertEqual(rail.showsUpcoming, test.showsUpcoming, label)
-            XCTAssertEqual(rail.upcomingTools.isEmpty, !test.showsUpcoming, label)
+            XCTAssertEqual(rail.toolRow.slots.contains { $0.item.isPlaceholder }, test.showsUpcoming, label)
             XCTAssertEqual(
                 rail.toolRow.slots.contains { $0.item == .upcomingLabel }, test.showsUpcoming,
                 "\(label): the planned tools show as a whole group or not at all."
@@ -1112,16 +1175,43 @@ final class NotebookToolbarTests: XCTestCase {
     func testPresetChipsUseShortLabelsThatFitTheirMeasuredWidth() {
         XCTAssertEqual(EditorInkCatalog.presets.map(NotebookPresetChip.shortTitle), ["Sepia", "Charcoal", "Graphite", "Ochre"])
         for size in [DynamicTypeSize.large, .xxLarge] {
-            for preset in EditorInkCatalog.presets {
-                let title = NotebookPresetChip.shortTitle(for: preset)
-                let text = UIHostingController(rootView: Text(title).font(NotebookTheme.controlLabel.font).fixedSize()
-                    .environment(\.dynamicTypeSize, size))
-                let rendered = text.sizeThatFits(in: CGSize(width: 1_000, height: 1_000)).width
-                let measured = NotebookPresetChip.labelWidth(title, at: size)
-                XCTAssertGreaterThanOrEqual(measured, rendered - 0.01, "\(title) at \(size)")
-                XCTAssertLessThan(measured, rendered + 1, "\(title) at \(size)")
+            for weight in [LegibilityWeight.regular, .bold] {
+                for preset in EditorInkCatalog.presets {
+                    let title = NotebookPresetChip.shortTitle(for: preset)
+                    let text = UIHostingController(rootView: Text(title).font(NotebookTheme.controlLabel.font).fixedSize()
+                        .environment(\.dynamicTypeSize, size).environment(\.legibilityWeight, weight))
+                    let rendered = text.sizeThatFits(in: CGSize(width: 1_000, height: 1_000)).width
+                    let measured = NotebookPresetChip.labelWidth(title, at: size, isBold: weight == .bold)
+                    XCTAssertGreaterThanOrEqual(measured, rendered - 0.01, "\(title) at \(size), \(weight)")
+                    XCTAssertLessThan(measured, rendered + 1, "\(title) at \(size), \(weight)")
+                }
             }
         }
+    }
+
+    /// Bold Text sets the preset labels wider. The rail counts the wider chips, and each chip lays
+    /// itself out at exactly the width counted for it.
+    func testBoldTextWidensThePresetChipsTheRailCounts() throws {
+        let charcoal = try XCTUnwrap(EditorInkCatalog.presets.first { $0.id == "charcoal-monoline" })
+        XCTAssertGreaterThan(
+            NotebookPresetChip.labelWidth("Charcoal", at: .large, isBold: true),
+            NotebookPresetChip.labelWidth("Charcoal", at: .large, isBold: false)
+        )
+        for preset in EditorInkCatalog.presets {
+            let chip = try RenderedPixels(rendering: NotebookPresetChip(preset: preset, isSelected: preset == charcoal) {}
+                .environment(\.legibilityWeight, .bold))
+            XCTAssertEqual(chip.size.width, NotebookPresetChip.width(for: preset, at: .large, isBold: true), preset.id)
+        }
+        let regular = NotebookToolbarComposition(preferences: .standard, horizontalSizeClass: .regular)
+        let bold = NotebookToolbarComposition(
+            preferences: .standard, horizontalSizeClass: .regular, legibilityWeight: .bold
+        )
+        let boldChips = EditorInkCatalog.presets.map { NotebookPresetChip.width(for: $0, at: .large, isBold: true) }
+        let regularChips = EditorInkCatalog.presets.map { NotebookPresetChip.width(for: $0, at: .large) }
+        XCTAssertEqual(
+            bold.inkRow(EditorInkCatalog.swatches).contentWidth - regular.inkRow(EditorInkCatalog.swatches).contentWidth,
+            boldChips.reduce(0, +) - regularChips.reduce(0, +), accuracy: 0.01, "The ink row counts the wider chips."
+        )
     }
 
     /// The compact ink panel is presented outside the rail's text-size limit, so each chip keeps
@@ -1229,7 +1319,7 @@ final class NotebookToolbarTests: XCTestCase {
 
         let toolbar = NotebookToolbarComposition(preferences: fixture.store.toolbar, horizontalSizeClass: .regular)
             .frame(for: fixture.store.toolbar.placement, in: host.bounds)
-        let grip = CGPoint(x: toolbar.minX + NotebookTheme.dragHandleHitSize.width / 2, y: toolbar.midY)
+        let grip = CGPoint(x: toolbar.minX + NotebookToolbarComposition.gripColumnWidth / 2, y: toolbar.midY)
         let target = fixture.hit(grip)
         XCTAssertFalse(target.isDescendant(of: fixture.controller.view), "The grip never passes touches to the canvas.")
         XCTAssertFalse(strips.contains { target.isDescendant(of: $0) }, "Dragging the grip never scrolls a strip.")
@@ -1289,9 +1379,12 @@ final class NotebookToolbarTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    /// A strip's scroll state at `offset`, as the strip reports it.
+    /// A strip's scroll state at `offset`, as the strip reports it: its content padded with the
+    /// trailing room.
     private func stripOverflow(of row: NotebookStripRow, at offset: CGFloat, in width: CGFloat) -> NotebookStripOverflow {
-        NotebookStripOverflow(offset: offset, contentWidth: row.scrollWidth(containerWidth: width), containerWidth: width)
+        NotebookStripOverflow(
+            offset: offset, contentWidth: row.contentWidth + row.trailingRoom(containerWidth: width), containerWidth: width
+        )
     }
 
     private func rendered(_ window: UIWindow) throws -> RenderedPixels {
@@ -1411,30 +1504,6 @@ final class NotebookToolbarTests: XCTestCase {
 private final class EmissionCounter {
     var count = 0
     var subscription: AnyCancellable?
-}
-
-/// Waits for the display to refresh.
-@MainActor
-private final class DisplayFrames: NSObject {
-    private var link: CADisplayLink?
-    private var resume: (() -> Void)?
-
-    static func next() async {
-        let frames = DisplayFrames()
-        await withCheckedContinuation { continuation in
-            frames.resume = { continuation.resume() }
-            let link = CADisplayLink(target: frames, selector: #selector(refreshed))
-            link.add(to: .main, forMode: .common)
-            frames.link = link
-        }
-    }
-
-    @objc private func refreshed() {
-        link?.invalidate()
-        link = nil
-        resume?()
-        resume = nil
-    }
 }
 
 /// Records the enabled state the toolbar passes down to the controls it contains.
