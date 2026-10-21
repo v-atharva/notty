@@ -6,21 +6,11 @@ import XCTest
 
 @MainActor
 final class NotebookTypographyTests: XCTestCase {
-    private static let bundledFaces = [
-        "BerkeleyMono-Medium",
-        "BerkeleyMono-SemiBold",
-    ]
-
-    func testBerkeleyMonoFacesShipInTheAppBundle() {
-        for face in Self.bundledFaces {
-            XCTAssertNotNil(Bundle.main.url(forResource: face, withExtension: "ttf"), "\(face).ttf is missing from the app bundle")
+    func testPublicAppDoesNotBundleProprietaryFonts() {
+        XCTAssertNil(Bundle.main.object(forInfoDictionaryKey: "UIAppFonts"))
+        for face in ["BerkeleyMono-Medium", "BerkeleyMono-SemiBold"] {
+            XCTAssertNil(Bundle.main.url(forResource: face, withExtension: "ttf"))
         }
-    }
-
-    func testOnlyTheFacesTheThemeUsesAreBundled() {
-        XCTAssertNil(Bundle.main.url(forResource: "BerkeleyMono-Regular", withExtension: "ttf"))
-        let registered = Bundle.main.object(forInfoDictionaryKey: "UIAppFonts") as? [String]
-        XCTAssertEqual(registered, Self.bundledFaces.map { "\($0).ttf" })
     }
 
     func testStatusBarTextIsDarkOnTheEdgeToEdgePaper() async throws {
@@ -70,23 +60,16 @@ final class NotebookTypographyTests: XCTestCase {
         XCTAssertEqual(mounted?.canvasView.traitCollection.userInterfaceStyle, .light)
     }
 
-    func testBerkeleyMonoFacesAreRegisteredAtLaunch() {
-        for face in Self.bundledFaces {
-            let font = UIFont(name: face, size: 17)
-            XCTAssertEqual(font?.fontName, face, "\(face) is not registered through UIAppFonts")
-        }
-    }
-
-    func testNoteTitleIsSemiBoldBerkeleyMono() {
+    func testNoteTitleUsesTheMonospacedFallback() {
         let resolved = resolve(NotebookTheme.noteTitle.font, at: .large)
-        XCTAssertEqual(postScriptName(of: resolved), "BerkeleyMono-SemiBold")
+        XCTAssertFalse(postScriptName(of: resolved).hasPrefix("BerkeleyMono"))
         XCTAssertEqual(resolved.pointSize, NotebookTheme.noteTitle.pointSize, accuracy: 0.01)
         XCTAssertTrue(resolved.isMonospaced)
     }
 
     func testWordmarkSharesTheTitleTypewriterFace() {
         let resolved = resolve(NotebookTheme.wordmark.font, at: .large)
-        XCTAssertEqual(postScriptName(of: resolved), "BerkeleyMono-Medium")
+        XCTAssertFalse(postScriptName(of: resolved).hasPrefix("BerkeleyMono"))
         XCTAssertEqual(resolved.pointSize, NotebookTheme.wordmark.pointSize, accuracy: 0.01)
         XCTAssertTrue(resolved.isMonospaced)
     }
@@ -97,13 +80,13 @@ final class NotebookTypographyTests: XCTestCase {
         let accessibility = resolve(NotebookTheme.noteTitle.font, at: .accessibility3)
         XCTAssertLessThan(small.pointSize, standard.pointSize)
         XCTAssertGreaterThan(accessibility.pointSize, standard.pointSize)
-        XCTAssertEqual(postScriptName(of: accessibility), "BerkeleyMono-SemiBold", "Scaling keeps the face")
+        XCTAssertEqual(postScriptName(of: accessibility), postScriptName(of: standard), "Scaling keeps the face")
     }
 
-    func testLighterBerkeleyMonoWeightResolvesThroughTheTheme() {
+    func testLighterTypewriterWeightResolvesThroughTheFallback() {
         let label = NotebookTheme.Typeface(postScriptName: "BerkeleyMono-Medium", pointSize: 13, style: .footnote, weight: .medium)
         let standard = resolve(label.font, at: .large)
-        XCTAssertEqual(postScriptName(of: standard), "BerkeleyMono-Medium")
+        XCTAssertTrue(standard.isMonospaced)
         XCTAssertEqual(standard.pointSize, label.pointSize, accuracy: 0.01)
         XCTAssertGreaterThan(resolve(label.font, at: .accessibility3).pointSize, standard.pointSize)
     }
